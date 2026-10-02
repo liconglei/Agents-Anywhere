@@ -13,7 +13,7 @@ back to the backend.
 ```text
 connector/
   runtime_protocol/  AgentRuntime, RuntimeProvider, RuntimeHostClient contracts
-  runtimes/          Codex, Claude and DSH RuntimeProvider/AgentRuntime packages
+  runtimes/          Codex, Claude, DSH and OpenCode RuntimeProvider/AgentRuntime packages
   server/            Backend auth, ingest, RPC channel, request dispatch, host mapping
   core/              Connector config, JSON-RPC, runtime owner, runtime config storage
   local/             Local filesystem, shell, and terminal backends
@@ -135,7 +135,7 @@ atomic file transactions and legacy migration.
 
 ## Runtime Discovery
 
-The default providers are Codex, Claude and DSH. The connector reports attached runtime
+The default providers are Codex, Claude, DSH and OpenCode. The connector reports attached runtime
 capabilities to the server. Codex is discovered through the official
 `openai-codex` SDK package; the connector does not use a Codex CLI/app-server
 path or IPC switch as an active runtime surface. If Claude Code is not on
