@@ -8,7 +8,9 @@ Session model:
   ``session_id`` and ``external_session_id`` (single-instance runtime).
 - Turns are driven by ``POST /session/{id}/prompt_async``; the global SSE
   stream reports progress and ``session.idle`` marks turn completion.
-- Timeline snapshots are rebuilt from ``GET /session/{id}/message``.
+- Timeline: ``message.part.delta`` / ``message.part.updated`` are streamed into
+  the platform timeline live (throttled, one stable item id per opencode part);
+  ``GET /session/{id}/message`` rebuilds the authoritative snapshot at turn end.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
@@ -183,6 +186,15 @@ STREAM_FAILURE_RECOVERY_THRESHOLD = 3
 SERVE_RESTART_INITIAL_BACKOFF_S = 1.0
 SERVE_RESTART_MAX_BACKOFF_S = 30.0
 PORT_ADOPTION_WAIT_S = 15.0
+
+# Streaming: opencode pushes ``message.part.delta`` per token chunk, so the
+# buffer is flushed at most this often per part. Fast enough to read as a
+# typewriter, slow enough that a 300-token answer does not turn into 300
+# timeline upserts.
+STREAM_FLUSH_INTERVAL_S = 0.25
+# Part types the live timeline maps; ``step-start``/``step-finish``/``patch``
+# are internal markers (a step-finish finalizes the message's streamed text).
+_STREAM_CONTENT_PART_TYPES = frozenset({"text", "reasoning", "tool"})
 # A live-but-unhealthy child within this window is still booting; recovery
 # waits instead of killing and respawning it. opencode cold starts (especially
 # npx-launched on Windows) routinely exceed 60s, so a tight grace creates a
@@ -269,6 +281,54 @@ def _permission_selection_id(preset: str) -> str:
     """Selection id the platform stores for one permission preset."""
 
     return protocol_selection_id("opencode", "permission", {"permission_id": preset})
+
+
+@dataclass(slots=True)
+class _StreamedPart:
+    """One opencode part being streamed into the platform timeline."""
+
+    part: dict[str, Any]
+    message_id: str
+    text: str = ""
+    dirty: bool = False
+    revision: int = 1
+    flushed_at: float = 0.0
+    order_seq: int = 0
+
+
+@dataclass(slots=True)
+class _StreamSession:
+    """Streaming buffers for one native session."""
+
+    parts: dict[str, _StreamedPart] = field(default_factory=dict)
+    order: dict[str, int] = field(default_factory=dict)
+    next_order_seq: int = 1
+    parents: dict[str, str] = field(default_factory=dict)
+    roles: dict[str, str] = field(default_factory=dict)
+    # Last text published per part. A part whose buffer was dropped (turn end,
+    # ``step-finish``) must not restart from empty when opencode sends another
+    # delta for it, or the client sees the answer shrink to its last chunk.
+    published: dict[str, str] = field(default_factory=dict)
+    # The SSE loop and the watchdog can both finalize the same part; this keeps
+    # them from publishing it twice with different statuses.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+# The per-session id maps above grow with the conversation and are kept for the
+# whole session (a part that opencode emits after ``session.idle`` still needs
+# its recorded order and turn id). A long session would otherwise accumulate
+# them without bound, so drop the oldest entries once they pass this size — an
+# old part is long since replaced by the turn-end snapshot, and if it ever
+# streams again it simply gets a fresh slot.
+_STREAM_STATE_MAX_ENTRIES = 4000
+_STREAM_TRIMED_MAPS = ("order", "parents", "roles", "published")
+
+
+def _trim_stream_state(session: _StreamSession) -> None:
+    for name in _STREAM_TRIMED_MAPS:
+        mapping: dict[str, Any] = getattr(session, name)
+        while len(mapping) > _STREAM_STATE_MAX_ENTRIES:
+            mapping.pop(next(iter(mapping)))
 
 
 def _permission_preset_from_selection(selection_id: str | None) -> str | None:
@@ -382,6 +442,10 @@ class OpenCodeRuntime(AgentRuntime):
         # permission presets — the remaining primary agents (compaction,
         # summary, title) are opencode internals.
         self._primary_agents: dict[str | None, dict[str, dict[str, Any]]] = {}
+        # Live timeline streaming, keyed by native session: the in-flight parts
+        # plus the message parent ids needed to resolve turn_id. Without this the
+        # client only sees the turn's output when it ends.
+        self._stream_sessions: dict[str, _StreamSession] = {}
 
     def _native_id(self, session_id: str, external_session_id: str | None) -> str:
         if external_session_id:
@@ -1580,6 +1644,9 @@ class OpenCodeRuntime(AgentRuntime):
         # Build/Plan is the agent this turn runs as; opencode remembers it on
         # the session, so the picker can read the mode back after a restart.
         agent = await self._permission_mode_for_turn(native_id, selections)
+        # Line the streamed items up with the orderSeq the turn-end snapshot
+        # will assign them (see _seed_stream_order).
+        await self._seed_stream_order(native_id)
         parts: tuple[dict[str, object], ...] = ()
         if attachments and session_id:
             materialized = await materialize_opencode_attachments(
@@ -2190,11 +2257,15 @@ class OpenCodeRuntime(AgentRuntime):
         if was_tracked:
             self._recently_ended[native_id] = "interrupted" if interrupted else "completed"
         elif self._recently_ended.get(native_id) is not None:
+            await self._finish_streaming_parts(platform_id, native_id)
             await self._publish_timeline_safe(platform_id, native_id)
             self._pending_messages.unresolve(native_id)
             await self._flush_unended_turns()
             return
         outcome = self._recently_ended.get(native_id, "completed")
+        # Final live state (items flip from ``running`` to ``done``) before the
+        # snapshot, which restates the same item ids from the message list.
+        await self._finish_streaming_parts(platform_id, native_id)
         await self._publish_timeline_safe(platform_id, native_id)
         self._pending_messages.unresolve(native_id)
         await self._report_turn_end(platform_id, native_id, outcome)
@@ -2376,8 +2447,356 @@ class OpenCodeRuntime(AgentRuntime):
             await self._handle_question_closed(platform_id, props)
         elif etype == "session.error":
             await self._handle_session_error(platform_id, native_id, props)
-        # message.part.delta / message.part.updated / session.diff: live
-        # updates are covered by snapshot rebuilds at turn end (session.idle).
+        elif etype == "message.updated":
+            # Tracked for three things: the assistant message's turn id (its user
+            # message lives in ``parentID``), its role — so the user's own parts
+            # are never streamed back as an assistant message — and completion,
+            # which finalizes the streamed text.
+            info = props.get("info") or {}
+            message_id = str(info.get("id") or "")
+            if message_id:
+                session = self._stream(native_id)
+                role = str(info.get("role") or "")
+                if role:
+                    session.roles[message_id] = role
+                parent_id = str(info.get("parentID") or "")
+                if parent_id:
+                    session.parents[message_id] = parent_id
+                if (info.get("time") or {}).get("completed"):
+                    await self._finalize_message_parts(platform_id, native_id, message_id)
+        elif etype == "message.part.delta":
+            await self._guard_stream_event(
+                platform_id, native_id, self._handle_part_delta, platform_id, native_id, props
+            )
+        elif etype == "message.part.updated":
+            await self._guard_stream_event(
+                platform_id, native_id, self._handle_part_update, platform_id, native_id, props
+            )
+        elif etype == "message.part.removed":
+            # The buffer goes away immediately; the platform item stays until the
+            # next complete snapshot (there is no remove notification).
+            self._stream(native_id).parts.pop(str(props.get("partID") or ""), None)
+
+    def _streams_session(self, native_id: str) -> bool:
+        """True when this session is one the platform shows.
+
+        ``/global/event`` carries every opencode instance's events, including
+        sessions the user opened in the opencode TUI or web UI. Streaming those
+        would burn an ingest notification per throttle window for an item the
+        Server cannot resolve (their platform session id is unknown), so they are
+        skipped. Sessions we own are known through the directory map (filled
+        while discovering sessions) or the platform<->native bindings.
+        """
+
+        return (
+            native_id in self._session_dirs
+            or native_id in self._platform_to_native
+            or native_id in self._native_to_platform
+        )
+
+    async def _guard_stream_event(
+        self,
+        platform_id: str,
+        native_id: str,
+        handler: Any,
+        *args: Any,
+    ) -> None:
+        """Run one streaming handler; never let a payload kill the SSE loop.
+
+        An exception escaping ``_handle_event`` reaches the transport-level
+        handler, which reconnects the stream and can end up respawning serve and
+        reporting the runtime unreachable. A malformed ``message.part.*`` payload
+        must cost one dropped update, nothing more. Sessions the platform does not
+        show are skipped entirely (see ``_streams_session``).
+        """
+
+        if not self._streams_session(native_id):
+            return
+        try:
+            await handler(*args)
+        except Exception as exc:  # noqa: BLE001 - one bad event, one lost update
+            logger.warning(
+                "opencode stream event failed: platform={} native={} error={}",
+                platform_id,
+                native_id,
+                exc,
+            )
+
+    async def _seed_stream_order(self, native_id: str) -> None:
+        """Continue the timeline ordering where the last snapshot left off.
+
+        Streamed items must land on the ``orderSeq`` the turn-end snapshot will
+        give them: the platform orders a timeline by ``orderSeq`` (and pages
+        with it), and the snapshot numbers items by their position in the
+        flattened message list. A per-turn counter starting at 1 therefore
+        collided with the previous turn's items — the client's ordering put the
+        new turn's streamed text on top of the old one and the final answer
+        never showed where it belonged. Seed from the current item count before
+        prompting, reserving one slot for the incoming user message.
+        """
+
+        session = self._stream(native_id)
+        try:
+            messages = await self._client.list_messages(
+                native_id, self._directory_for(native_id)
+            )
+            base = len(timeline.map_messages_to_timeline(native_id, messages))
+        except Exception as exc:  # noqa: BLE001 - ordering hint only, never fatal
+            # Deliberately broad: this sits on the pre-prompt path and a bad
+            # response here must not swallow the user's message. Without the
+            # seed the turn still streams, just with orderSeq values that the
+            # turn-end snapshot renumbers.
+            logger.debug(
+                "opencode stream order seed skipped: native={} error={}", native_id, exc
+            )
+            return
+        # ``base`` items already exist (0..base-1); the incoming user message
+        # takes slot ``base``, so the first streamed part is ``base + 1`` — the
+        # same slot the turn-end snapshot will give it.
+        session.next_order_seq = max(session.next_order_seq, base + 1)
+
+    def _stream(self, native_id: str) -> _StreamSession:
+        session = self._stream_sessions.get(native_id)
+        if session is None:
+            session = _StreamSession()
+            self._stream_sessions[native_id] = session
+        return session
+
+    def _streamed_part(
+        self,
+        session: _StreamSession,
+        part_id: str,
+        message_id: str,
+        part: dict[str, Any] | None = None,
+    ) -> _StreamedPart | None:
+        """Get or create the buffer for one part; ``None`` for user parts.
+
+        A part is dropped when its message is known to be the user's: the user
+        message is already on screen (optimistic echo plus the turn-end
+        snapshot), so streaming it back would duplicate or relabel it.
+        """
+
+        if not part_id:
+            return None
+        if session.roles.get(message_id) == "user":
+            return None
+        entry = session.parts.get(part_id)
+        if entry is None:
+            order_seq = session.order.setdefault(part_id, session.next_order_seq)
+            session.next_order_seq = max(session.next_order_seq, order_seq + 1)
+            entry = _StreamedPart(
+                # A delta carries no part object, so seed the minimum the item
+                # mapper needs (it keys off the part id) and resume from what was
+                # last published: a delta that arrives after the buffer was
+                # dropped must extend the answer, not replace it with its tail.
+                part=dict(part) if part else {"id": part_id, "type": "text"},
+                message_id=message_id,
+                text=session.published.get(part_id, ""),
+                order_seq=order_seq,
+            )
+            session.parts[part_id] = entry
+        elif part is not None:
+            entry.part = dict(part)
+        return entry
+
+    async def _handle_part_delta(
+        self,
+        platform_id: str,
+        native_id: str,
+        props: dict[str, Any],
+    ) -> None:
+        """Append one streamed chunk to its part and flush on the throttle.
+
+        opencode 1.18.34 sends ``{sessionID, messageID, partID, field, delta}``
+        with no ``part`` object (the published SDK type is stale). ``field`` is
+        the part field the chunk belongs to; only text-like fields are mapped.
+        A text part is announced by a ``message.part.updated`` with empty text
+        before its first delta, so an unknown buffer still lands on a text item
+        and is corrected when the real part arrives.
+        """
+
+        if str(props.get("field") or "text") != "text":
+            return
+        delta = props.get("delta")
+        if not isinstance(delta, str) or not delta:
+            return
+        session = self._stream(native_id)
+        entry = self._streamed_part(
+            session,
+            str(props.get("partID") or ""),
+            str(props.get("messageID") or ""),
+        )
+        if entry is None:
+            return
+        entry.text += delta
+        if native_id not in self._active_turns:
+            # Same as a late ``message.part.updated``: the turn is over, so this
+            # is final content. Publishing it as ``running`` would leave a
+            # spinner on a finished answer with nobody left to clear it.
+            await self._publish_streamed_part(
+                platform_id, native_id, session, entry, streaming=False
+            )
+            session.parts.pop(str(props.get("partID") or ""), None)
+            return
+        entry.dirty = True
+        await self._flush_stream(platform_id, native_id, session)
+
+    async def _handle_part_update(
+        self,
+        platform_id: str,
+        native_id: str,
+        props: dict[str, Any],
+    ) -> None:
+        """Publish a part opencode restated: created, changed or completed.
+
+        ``message.part.updated`` carries the whole part, so it is trusted over
+        the accumulated deltas — a dropped chunk cannot leave the client with a
+        truncated answer. Flushed immediately: these events carry the
+        transitions the client renders (tool running → done, text finished).
+        """
+
+        part = props.get("part")
+        if not isinstance(part, dict):
+            return
+        part_type = str(part.get("type") or "")
+        part_id = str(part.get("id") or "")
+        message_id = str(part.get("messageID") or "")
+        session = self._stream(native_id)
+        if part_type in _STREAM_CONTENT_PART_TYPES:
+            entry = self._streamed_part(session, part_id, message_id, part)
+            if entry is None:
+                return
+            if part_type in {"text", "reasoning"}:
+                text = part.get("text")
+                if isinstance(text, str):
+                    entry.text = text
+            if native_id not in self._active_turns:
+                # The turn already ended: opencode emits the final assistant
+                # message and its parts *after* ``session.idle``. Buffering them
+                # would leave the answer stuck in ``running`` forever, so publish
+                # it as done.
+                await self._publish_streamed_part(
+                    platform_id, native_id, session, entry, streaming=False
+                )
+                session.parts.pop(part_id, None)
+                return
+            entry.dirty = True
+            await self._flush_stream(platform_id, native_id, session, force=True)
+            return
+        if part_type == "step-finish":
+            # The assistant stopped writing text for this message: publish what
+            # was streamed as ``done`` so it stops rendering as in-flight while
+            # the turn continues with tools. Other internal parts (step-start,
+            # patch, file) say nothing about completion and are ignored.
+            await self._finalize_message_parts(platform_id, native_id, message_id)
+
+    async def _finalize_message_parts(
+        self, platform_id: str, native_id: str, message_id: str
+    ) -> None:
+        """Publish the streamed text of one message as ``done`` and drop it."""
+
+        if not message_id:
+            return
+        session = self._stream_sessions.get(native_id)
+        if session is None:
+            return
+        async with session.lock:
+            for part_id in [
+                part_id
+                for part_id, entry in session.parts.items()
+                if entry.message_id == message_id
+            ]:
+                entry = session.parts.pop(part_id)
+                await self._publish_streamed_part(
+                    platform_id, native_id, session, entry, streaming=False
+                )
+
+    async def _publish_streamed_part(
+        self,
+        platform_id: str,
+        native_id: str,
+        session: _StreamSession,
+        entry: _StreamedPart,
+        *,
+        streaming: bool,
+    ) -> None:
+        turn_id = session.parents.get(entry.message_id) or entry.message_id or None
+        item = timeline.map_streaming_part(
+            native_id,
+            entry.part,
+            text=entry.text,
+            turn_id=turn_id,
+            revision=entry.revision,
+            streaming=streaming,
+        )
+        if item is None:
+            # Nothing mappable yet (opencode announces a text part with empty
+            # text). The revision only advances for items the client can see,
+            # so the platform does not see a gap it cannot match.
+            return
+        entry.revision += 1
+        if entry.text:
+            session.published[entry.part.get("id") or ""] = entry.text
+        try:
+            await self.host.timeline_item_upsert(
+                item.to_platform_item(platform_id, entry.order_seq)
+            )
+        except Exception as exc:  # noqa: BLE001 - a lost update must be visible
+            logger.warning(
+                "opencode streamed item push failed: item={} revision={} error={}",
+                item.id,
+                entry.revision,
+                exc,
+            )
+
+    async def _flush_stream(
+        self,
+        platform_id: str,
+        native_id: str,
+        session: _StreamSession,
+        *,
+        force: bool = False,
+    ) -> None:
+        now = asyncio.get_running_loop().time()
+        # Held across the awaits so the watchdog's turn-end finalization cannot
+        # publish a part as ``done`` while this loop still has it queued as
+        # ``running`` (the Server keeps the last write).
+        async with session.lock:
+            for entry in list(session.parts.values()):
+                if not entry.dirty:
+                    continue
+                if not force and now - entry.flushed_at < STREAM_FLUSH_INTERVAL_S:
+                    continue
+                entry.dirty = False
+                entry.flushed_at = now
+                await self._publish_streamed_part(
+                    platform_id, native_id, session, entry, streaming=True
+                )
+
+    async def _finish_streaming_parts(self, platform_id: str, native_id: str) -> None:
+        """Publish the final state of every streamed part before the snapshot.
+
+        The turn-end snapshot rebuilds from ``GET /session/{id}/message`` and
+        reuses the same item ids, so this only has to make the last live state
+        visible (``done`` instead of ``running``) and drop the buffers.
+
+        The session object itself is kept: its ``next_order_seq`` must survive
+        into the next turn. opencode also emits the final assistant message and
+        its parts *after* ``session.idle``, so those late parts arrive with no
+        active turn and are published straight through as ``done`` (see
+        ``_handle_part_update``).
+        """
+
+        session = self._stream_sessions.get(native_id)
+        if session is None:
+            return
+        async with session.lock:
+            for entry in list(session.parts.values()):
+                await self._publish_streamed_part(
+                    platform_id, native_id, session, entry, streaming=False
+                )
+            session.parts.clear()
+        _trim_stream_state(session)
 
     async def _handle_permission_asked(
         self, platform_id: str, native_id: str, props: dict[str, Any]
