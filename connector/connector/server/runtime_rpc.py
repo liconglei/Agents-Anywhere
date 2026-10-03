@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, ClassVar
 
+from connector.logging import logger
 from connector.runtime_protocol import (
     AgentRuntime,
     RuntimeHostClient,
@@ -91,6 +92,18 @@ class RuntimeRpcHandler:
         return method in self.METHODS
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        session_id = params.get("sessionId")
+        if isinstance(session_id, str) and session_id:
+            # Diagnostic: reveals the runtime identity the Server has bound to
+            # this session, side by side with what the Connector pushes back.
+            logger.info(
+                "runtime rpc inbound: method={} session={} external={} runtime={} runtimeId={}",
+                method,
+                session_id,
+                params.get("externalSessionId"),
+                params.get("runtime"),
+                params.get("runtimeId"),
+            )
         if method == "runtime.discover":
             return await self.discover_runtimes(params)
         if method == "runtime.configSchema":

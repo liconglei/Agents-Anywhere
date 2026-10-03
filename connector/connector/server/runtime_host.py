@@ -140,6 +140,16 @@ class ConnectorRuntimeHost(RuntimeHostClient):
             "selections": selection_values,
             "metadata": instance_metadata,
         }
+        # Diagnostic: pairs with the inbound "runtime rpc inbound" log so a
+        # runtime-identity mismatch between push and binding is directly visible.
+        logger.info(
+            "session state push: session={} external={} status={} runtime={} runtimeId={}",
+            session_id,
+            external_session_id,
+            status,
+            runtime,
+            payload.get("runtimeId"),
+        )
         await self._notify_server("session.state.updated", _drop_none(payload))
 
     async def session_source_update(
