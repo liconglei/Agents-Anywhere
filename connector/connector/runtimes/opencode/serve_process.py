@@ -36,13 +36,22 @@ _OUTPUT_TAIL_LINES = 80
 
 PortInUseMarkers = ("EADDRINUSE", "address already in use", "already listening")
 
-# opencode keeps its own log file open without file sharing, which makes the
-# log the single-instance lock: a second instance dies during boot, sometimes
-# with a native fastfail and zero output. Surfacing that beats a bare crash
-# code, and the message doubles as the user-facing hint.
+# Log to stderr instead of the shared, exclusively-opened opencode.log — see
+# ``resolve_serve_command``. ``ServeProcess`` drains stderr into its ring
+# buffer and echoes it into failure messages, so nothing is lost.
+SERVE_LOG_FLAGS: tuple[str, ...] = ("--print-logs", "--log-level", "INFO")
+
+# opencode keeps its own log file open while any instance runs (TUI, CLI or
+# serve). It used to be treated as a single-instance lock that made a second
+# ``serve`` die during boot, sometimes with a native fastfail and zero output.
+# On 1.18.34 that is not the case any more — a second ``opencode serve`` starts
+# and answers health while another instance holds the log — so this is now only
+# a diagnostic: the runtime probes for a serve to adopt, spawns anyway, and
+# attaches the hint below to a spawn that actually died. Surfacing it beats a
+# bare crash code, and it doubles as the user-facing hint.
 LOCK_HOLD_HINT = (
-    "另一个 opencode 实例正在运行并持有单实例日志锁 "
-    "(<data>/opencode/log/opencode.log)，连接器无法再启动第二个 serve。"
+    "另一个 opencode 实例正在运行并持有 opencode 日志文件 "
+    "(<data>/opencode/log/opencode.log)，刚启动的 serve 因此退出。"
     "请关闭其它 opencode TUI/serve 会话（包括 CherryStudio 等内置实例），"
     "或将 serverUrl 指向已运行实例的地址。"
 )
@@ -77,11 +86,13 @@ def opencode_log_path(environment: dict[str, str]) -> str:
 
 
 def is_serve_log_lock_held(environment: dict[str, str]) -> bool:
-    """True when a live process holds opencode's single-instance log lock.
+    """True when any live opencode process holds its log file open.
 
-    Blocking (one CreateFileW probe); event-loop callers must run this in a
-    thread. Only Windows exposes share-mode conflicts, so other platforms
-    report False and rely on the spawn result itself.
+    Advisory only (see ``LOCK_HOLD_HINT``): on serve 1.18.34 this file is not
+    an exclusive single-instance lock, so the probe must never be used to skip
+    spawning — only to explain a spawn that failed. Blocking (one CreateFileW
+    probe); event-loop callers must run this in a thread. Only Windows exposes
+    share-mode conflicts, so other platforms report False.
     """
 
     if sys.platform != "win32":
@@ -206,6 +217,14 @@ def resolve_serve_command(
 
     Falls back to ``npx`` when the system binary is missing or fails the
     version check (same semantics as the codex binary selection).
+
+    ``--print-logs`` is mandatory, not cosmetic: without it serve opens
+    ``<data>/opencode/log/opencode.log`` exclusively, so it dies during boot
+    with ``Unknown: FileSystem.open`` whenever any other opencode process (a
+    TUI, the CLI, CherryStudio's embedded instance) holds that file. With
+    ``--print-logs`` the child logs to stderr instead — which
+    ``ServeProcess`` already drains into its ring buffer — and coexists with a
+    running TUI.
     """
 
     env = environment or os.environ
@@ -222,7 +241,15 @@ def resolve_serve_command(
                 probe_elapsed,
                 candidate,
             )
-            return [candidate, "serve", "--hostname", hostname, "--port", str(port)]
+            return [
+                candidate,
+                "serve",
+                *SERVE_LOG_FLAGS,
+                "--hostname",
+                hostname,
+                "--port",
+                str(port),
+            ]
         reason = f"system opencode failed version check: {error}"
         logger.warning(
             "{} after {:.2f}s; falling back to npx path={}",
@@ -236,7 +263,16 @@ def resolve_serve_command(
 
     npx = find_executable_on_path("npx", path_value)
     if npx is not None:
-        return [npx, "opencode", "serve", "--hostname", hostname, "--port", str(port)]
+        return [
+            npx,
+            "opencode",
+            "serve",
+            *SERVE_LOG_FLAGS,
+            "--hostname",
+            hostname,
+            "--port",
+            str(port),
+        ]
     raise RuntimeError(f"opencode executable not found on PATH (and no npx fallback): {reason}")
 
 

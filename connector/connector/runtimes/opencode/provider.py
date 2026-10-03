@@ -126,9 +126,15 @@ class OpenCodeProvider(RuntimeProvider):
             runtime=self.runtime,
             revision=OPENCODE_CONFIG_SCHEMA_REVISION,
             schema=provider_config.opencode_config_schema(),
-            ui_schema={
-                "order": ["serverUrl", "apiKey", "apiUser", "requestTimeoutSeconds"],
-            },
+ui_schema={
+                    "order": [
+                        "serverUrl",
+                        "apiKey",
+                        "apiUser",
+                        "requestTimeoutSeconds",
+                        "autoStart",
+                    ],
+                },
             defaults=provider_config.default_config_values(),
         )
 

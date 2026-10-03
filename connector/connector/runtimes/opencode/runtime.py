@@ -22,31 +22,162 @@ from urllib.parse import urlparse
 
 from connector.logging import logger
 from connector.runtime_protocol import (
+    CAPABILITY_CATALOG_EFFORT,
     CAPABILITY_CATALOG_MODEL,
+    CAPABILITY_CATALOG_PERMISSION,
+    CAPABILITY_RUNTIME_ATTACHMENT,
+    CAPABILITY_SESSION_COMMANDS,
+    CAPABILITY_SESSION_INTERACTION_APPROVAL,
     CAPABILITY_SESSION_INTERRUPT,
     CAPABILITY_SESSION_SEND_MESSAGE,
+    CAPABILITY_SESSION_STEER,
     AgentRuntime,
+    PreparedSessionTimelineSync,
     RuntimeCapability,
     RuntimeCapabilitySet,
+    RuntimeCommand,
+    RuntimeCommandResult,
     RuntimeConfig,
     RuntimeIdentity,
     RuntimeModelCatalog,
     RuntimeModelItem,
     RuntimeOperationResult,
+    RuntimePermissionCatalog,
+    RuntimePermissionItem,
+    RuntimeReasoningItem,
     RuntimeTimelineSnapshot,
     RuntimeUnavailableError,
     SessionMeta,
+    SessionNotice,
     SessionSourceState,
     SessionState,
 )
 from connector.runtime_protocol.host import RuntimeHostClient
 from connector.runtimes.opencode import provider_config, serve_process, timeline
+from connector.runtimes.opencode.attachments import materialize_opencode_attachments
 from connector.runtimes.opencode.pending_messages import (
     OpenCodePendingClientMessageRegistry,
 )
 from connector.runtimes.opencode.sdk.client import OpenCodeClient, OpenCodeClientError
+from connector.server.protocol import protocol_selection_id
 
 MODEL_SELECTION_KEY = "model"
+PERMISSION_SELECTION_KEY = "permission"
+# opencode permission mode presets exposed to the platform. opencode ships
+# ``build`` (default; read-write, tools run per configured permission rules)
+# and ``plan`` (read-only; ``edit`` tools are denied) as the two ``primary``
+# agents users switch between; the other primary agents (``compaction``,
+# ``summary``, ``title``) are opencode internals, not user-selectable modes.
+#
+# opencode has no separate "mode" field — the mode *is* the primary agent that
+# runs the turn, so a selection is applied by sending ``agent: <preset>`` on the
+# prompt (``POST /session/{id}/prompt_async``). opencode persists the agent on
+# the session record, which is also how the current mode is read back.
+#
+# Do NOT try to switch modes by PATCHing ``{"permission": [...]}`` onto the
+# session (that looks like the obvious API): on serve 1.18.34 the array is
+# *appended* to the session's existing rules instead of replacing it, so
+# switching Plan → Build leaves Plan's ``edit * deny`` behind (read-only Build)
+# and grows the ruleset on every switch. The mode therefore applies from the
+# next turn, like the model selection.
+PERMISSION_PRESET_BUILD = "build"
+PERMISSION_PRESET_PLAN = "plan"
+_PERMISSION_PRESETS: tuple[str, ...] = (PERMISSION_PRESET_BUILD, PERMISSION_PRESET_PLAN)
+_PERMISSION_PRESET_LABELS: dict[str, str] = {
+    PERMISSION_PRESET_BUILD: "Build",
+    PERMISSION_PRESET_PLAN: "Plan",
+}
+_PERMISSION_PRESET_DESCRIPTIONS: dict[str, str] = {
+    PERMISSION_PRESET_BUILD: (
+        "Default mode. Tools run based on configured permission rules (read-write)."
+    ),
+    PERMISSION_PRESET_PLAN: (
+        "Plan mode. Edit tools are denied; only plan files may be written (read-only)."
+    ),
+}
+# opencode's ``GET /command`` only returns user-defined skills; the built-in
+# slash commands the web UI shows (``/model``, ``/compact``, ``/fork``,
+# ``/share``, ``/undo``) are front-end only. The connector re-injects the
+# subset that maps to a real opencode backend capability so the platform slash
+# menu offers them alongside skills. Pure-GUI commands (``/new``, ``/open``,
+# ``/terminal``, ``/mcp``, ``/export``) are intentionally NOT listed: they
+# have no backend API and must be handled by the client itself.
+#
+# ``metadata.ui`` follows the platform command-UI contract: ``selector`` makes
+# the client open its own picker (the same settings drawer as the model
+# button) instead of calling execute — this is how ``/model`` behaves like the
+# browser's command. ``execute`` commands run through the runtime.
+_OPENCODE_BUILTIN_COMMANDS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "model",
+        "title": "切换模型",
+        "description": "打开模型选择器,后续对话使用新模型",
+        "accepts_args": False,
+        "metadata": {"ui": {"kind": "selector", "target": "model"}},
+    },
+    {
+        "name": "compact",
+        "title": "压缩会话",
+        "description": "压缩会话上下文以释放上下文窗口",
+        "accepts_args": False,
+        "metadata": {
+            "ui": {
+                "kind": "execute",
+                "allowedStatuses": ["idle", "error"],
+                "acceptsMultiline": False,
+            }
+        },
+    },
+    {
+        "name": "fork",
+        "title": "复制会话",
+        "description": "从当前会话的最新消息创建分叉会话",
+        "accepts_args": False,
+        "metadata": {
+            "ui": {
+                "kind": "execute",
+                "allowedStatuses": ["idle", "error"],
+                "acceptsMultiline": False,
+            }
+        },
+    },
+    {
+        "name": "share",
+        "title": "分享会话",
+        "description": "为当前会话创建可分享链接",
+        "accepts_args": False,
+        "metadata": {
+            "ui": {
+                "kind": "execute",
+                "allowedStatuses": ["idle", "error"],
+                "acceptsMultiline": False,
+            }
+        },
+    },
+    {
+        "name": "undo",
+        "title": "撤销最近消息",
+        "description": "撤销最近一条模型回复",
+        "accepts_args": False,
+        "metadata": {
+            "ui": {
+                "kind": "execute",
+                "allowedStatuses": ["idle", "error"],
+                "acceptsMultiline": False,
+            }
+        },
+    },
+)
+_OPENCODE_BUILTIN_COMMAND_NAMES = frozenset(
+    command["name"] for command in _OPENCODE_BUILTIN_COMMANDS
+)
+_BUILTIN_UI = {command["name"]: command["metadata"] for command in _OPENCODE_BUILTIN_COMMANDS}
+# opencode's session.summarize needs the model that writes the summary; when
+# nothing was picked for the platform session, fall back to the model of the
+# most recent assistant message.
+_COMPACT_MODEL_FALLBACK_ERROR = (
+    "当前会话还没有用过模型，无法确定压缩用模型；请先用 /model 选择模型或发送一条消息"
+)
 # Reconnect failures tolerated by the event loop before a recovery pass runs.
 STREAM_FAILURE_RECOVERY_THRESHOLD = 3
 SERVE_RESTART_INITIAL_BACKOFF_S = 1.0
@@ -69,6 +200,93 @@ def _iso_ms(ms: float | None) -> str | None:
     if not ms:
         return None
     return datetime.fromtimestamp(ms / 1000, tz=UTC).isoformat()
+
+
+def _capability_flag(capabilities: Mapping[str, Any] | None, name: str) -> bool:
+    """Return a capabilities flag as a real bool (opencode serves ``{}`` when unset)."""
+    if not capabilities:
+        return False
+    return capabilities.get(name) is True
+
+
+def _reasoning_items(
+    model_key: str,
+    variants: Mapping[str, Mapping[str, Any] | None] | None,
+) -> tuple[RuntimeReasoningItem, ...]:
+    """Build reasoning items from an opencode model's ``variants`` map.
+
+    opencode expresses reasoning levels as ``variants`` on each model, e.g.
+    ``{"low": {"reasoningEffort": "low"}, "high": {"reasoningEffort": "high"}}``.
+    Each variant key becomes a selectable reasoning item; ``off`` maps to the
+    ``none`` reasoning effort (matches the variant's ``reasoningEffort`` field).
+    """
+    if not variants:
+        return ()
+    result: list[RuntimeReasoningItem] = []
+    for variant_key, variant in variants.items():
+        if not isinstance(variant, Mapping):
+            continue
+        reasoning_id = variant.get("reasoningEffort")
+        if not isinstance(reasoning_id, str) or not reasoning_id:
+            # Fall back to the variant key (e.g. "off") rather than dropping the
+            # entry — opencode lets users switch variants by key, so the
+            # selection still needs to be representable.
+            reasoning_id = variant_key
+        result.append(
+            RuntimeReasoningItem(
+                id=reasoning_id,
+                title=_reasoning_label(reasoning_id),
+                selection_id=protocol_selection_id(
+                    "opencode",
+                    "model",
+                    {"model_id": model_key, "reasoning_id": reasoning_id},
+                ),
+                metadata={"source": "opencode.provider/variants", "variant": variant_key},
+            )
+        )
+    return tuple(result)
+
+
+def _reasoning_label(reasoning_id: str) -> str:
+    return {
+        "low": "Low",
+        "medium": "Medium",
+        "high": "High",
+        "xhigh": "Extra high",
+        "max": "Max",
+        "none": "None",
+        "off": "Off",
+    }.get(reasoning_id, reasoning_id)
+
+
+def _permission_preset_label(preset: str) -> str:
+    """Human label for a preset; unknown presets fall back to their agent name."""
+
+    return _PERMISSION_PRESET_LABELS.get(preset, preset)
+
+
+def _permission_selection_id(preset: str) -> str:
+    """Selection id the platform stores for one permission preset."""
+
+    return protocol_selection_id("opencode", "permission", {"permission_id": preset})
+
+
+def _permission_preset_from_selection(selection_id: str | None) -> str | None:
+    """Resolve a platform permission selection id back to an opencode preset.
+
+    ``protocol_selection_id`` is a one-way hash, so the id is resolved by
+    re-encoding every known preset and comparing (the codex and claude
+    adapters decode their selection ids the same way). ``None`` means "no
+    permission selection" (the picker shows the catalog default) or an id this
+    runtime does not know, which callers must not silently treat as Build.
+    """
+
+    if not selection_id:
+        return None
+    for preset in _PERMISSION_PRESETS:
+        if _permission_selection_id(preset) == selection_id:
+            return preset
+    return None
 
 
 class OpenCodeRuntime(AgentRuntime):
@@ -149,6 +367,21 @@ class OpenCodeRuntime(AgentRuntime):
         # assigned platform id separate from the native ``ses_...`` id.
         self._platform_to_native: dict[str, str] = {}
         self._native_to_platform: dict[str, str] = {}
+        # Pending interaction notices (permission requests, questions) keyed by
+        # platform session id -> notice_id -> SessionNotice. Cleared when the
+        # corresponding ``permission.replied`` / question reply arrives.
+        self._notices: dict[str, dict[str, SessionNotice]] = {}
+        # Per-platform model selection applied to the next prompt. opencode
+        # only accepts a model reference at prompt time, so a selection change
+        # mid-session is stored here and injected on the next turn.
+        self._selections: dict[str, dict[str, str | None]] = {}
+        # opencode ``primary`` agents, keyed by name, populated lazily from
+        # ``GET /agent``. Keyed by project directory (agents resolve per project
+        # config and opencode answers relative to the requested directory);
+        # ``None`` is the serve cwd. Only ``build`` and ``plan`` are offered as
+        # permission presets — the remaining primary agents (compaction,
+        # summary, title) are opencode internals.
+        self._primary_agents: dict[str | None, dict[str, dict[str, Any]]] = {}
 
     def _native_id(self, session_id: str, external_session_id: str | None) -> str:
         if external_session_id:
@@ -398,22 +631,31 @@ class OpenCodeRuntime(AgentRuntime):
             hint = self._auth_hint_message(exc)
             if hint is not None:
                 raise RuntimeError(hint) from exc
-        # Another live opencode instance (TUI, foreign serve, CherryStudio, or
-        # a dying orphan serve from a previous connector) holds the
-        # single-instance log lock: any spawn we attempt dies during boot,
-        # often with a native fastfail and zero output. Wait briefly for that
-        # instance to answer health (adopt) or release the lock (re-spawn),
-        # instead of burning start attempts on doomed spawns.
+        # Another opencode process (TUI, CLI, a foreign serve, CherryStudio, or a
+        # dying orphan serve from a previous connector) holds opencode's log
+        # file open. Our spawn logs to stderr instead of taking that file
+        # (``SERVE_LOG_FLAGS``), so the holder no longer dooms it — but the
+        # holder may still be a serve worth adopting. Probe briefly, then spawn
+        # anyway; only a serve we cannot authenticate to (401) is a case
+        # spawning cannot work around. A spawn that does die keeps
+        # ``LOCK_HOLD_HINT`` attached to the failure.
         if await asyncio.to_thread(serve_process.is_serve_log_lock_held, self._serve_env):
-            logger.warning("opencode auto-start: opencode.log lock held elsewhere; not spawning")
+            logger.warning(
+                "opencode auto-start: opencode.log held by another opencode process; "
+                "probing for a serve to adopt"
+            )
             adopted, last_exc = await self._adoption_wait()
             if adopted:
                 logger.info("opencode auto-start: adopted external serve on port {}", port)
                 return
-            if await asyncio.to_thread(serve_process.is_serve_log_lock_held, self._serve_env):
-                hint = self._auth_hint_message(last_exc) or serve_process.LOCK_HOLD_HINT
+            # A live serve we cannot authenticate to is the one case spawning
+            # cannot work around.
+            hint = self._auth_hint_message(last_exc)
+            if hint is not None:
                 raise RuntimeError(hint) from last_exc
-            logger.info("opencode auto-start: log lock released; proceeding to spawn")
+            logger.info(
+                "opencode auto-start: no serve answered; spawning despite the log holder"
+            )
         if self._cached_serve_command is None:
             self._cached_serve_command = await asyncio.to_thread(
                 serve_process.resolve_serve_command,
@@ -599,10 +841,26 @@ class OpenCodeRuntime(AgentRuntime):
     async def get_runtime_capabilities(self) -> RuntimeCapabilitySet:
         return RuntimeCapabilitySet(
             runtime="opencode",
-            revision=1,
+            revision=5,
             capabilities=(
                 RuntimeCapability(
                     capability_id=CAPABILITY_CATALOG_MODEL,
+                    scope="runtime",
+                    runtime="opencode",
+                ),
+                RuntimeCapability(
+                    capability_id=CAPABILITY_CATALOG_EFFORT,
+                    scope="runtime",
+                    runtime="opencode",
+                ),
+                RuntimeCapability(
+                    # Build/Plan presets, read from ``GET /agent``.
+                    capability_id=CAPABILITY_CATALOG_PERMISSION,
+                    scope="runtime",
+                    runtime="opencode",
+                ),
+                RuntimeCapability(
+                    capability_id=CAPABILITY_RUNTIME_ATTACHMENT,
                     scope="runtime",
                     runtime="opencode",
                 ),
@@ -627,7 +885,7 @@ class OpenCodeRuntime(AgentRuntime):
 
         return RuntimeCapabilitySet(
             runtime="opencode",
-            revision=1,
+            revision=5,
             session_id=session_id,
             capabilities=(
                 RuntimeCapability(
@@ -638,6 +896,57 @@ class OpenCodeRuntime(AgentRuntime):
                 ),
                 RuntimeCapability(
                     capability_id=CAPABILITY_SESSION_INTERRUPT,
+                    scope="session",
+                    runtime="opencode",
+                    session_id=session_id,
+                ),
+                RuntimeCapability(
+                    capability_id=CAPABILITY_SESSION_STEER,
+                    scope="session",
+                    runtime="opencode",
+                    session_id=session_id,
+                ),
+                RuntimeCapability(
+                    capability_id=CAPABILITY_SESSION_INTERACTION_APPROVAL,
+                    scope="session",
+                    runtime="opencode",
+                    session_id=session_id,
+                ),
+                RuntimeCapability(
+                    capability_id=CAPABILITY_SESSION_COMMANDS,
+                    scope="session",
+                    runtime="opencode",
+                    session_id=session_id,
+                ),
+                # Catalog/attachment facts are declared runtime-scoped, but the
+                # Server only projects a session's effective capabilities from
+                # entries that also appear in this session-scoped set. Without
+                # these mirrors, ``catalog.model`` / ``catalog.effort`` resolve
+                # to unsupported and the client disables the model and
+                # reasoning selectors even though the catalogs carry data.
+                RuntimeCapability(
+                    capability_id=CAPABILITY_CATALOG_MODEL,
+                    scope="session",
+                    runtime="opencode",
+                    session_id=session_id,
+                ),
+                RuntimeCapability(
+                    capability_id=CAPABILITY_CATALOG_EFFORT,
+                    scope="session",
+                    runtime="opencode",
+                    session_id=session_id,
+                ),
+                RuntimeCapability(
+                    # Build/Plan mirror. Per-call approvals still flow through
+                    # ``session.interaction.approval``; this only drives the
+                    # mode selector.
+                    capability_id=CAPABILITY_CATALOG_PERMISSION,
+                    scope="session",
+                    runtime="opencode",
+                    session_id=session_id,
+                ),
+                RuntimeCapability(
+                    capability_id=CAPABILITY_RUNTIME_ATTACHMENT,
                     scope="session",
                     runtime="opencode",
                     session_id=session_id,
@@ -655,16 +964,35 @@ class OpenCodeRuntime(AgentRuntime):
         items: list[RuntimeModelItem] = []
         for key, model in models.items():
             provider_id, _, model_id = key.partition("/")
+            # Skip non-chat models (embeddings, image generators, guards, …).
+            # opencode serve reports capabilities per model; chat-capable
+            # models expose ``toolcall`` and text output.
+            capabilities = model.get("capabilities") or {}
+            if not (
+                _capability_flag(capabilities, "toolcall")
+                and _capability_flag(
+                    (capabilities.get("output") or {}), "text"
+                )
+            ):
+                continue
             title = str(model.get("name") or model_id)
             if query and query.lower() not in key.lower():
                 continue
             context = (model.get("limit") or {}).get("context")
+            reasoning_items = _reasoning_items(key, model.get("variants") or {})
             items.append(
                 RuntimeModelItem(
                     id=key,
                     title=f"{title} ({provider_id})",
-                    selection_id=key,
+                    selection_id=None
+                    if reasoning_items
+                    else protocol_selection_id(
+                        "opencode",
+                        "model",
+                        {"model_id": key, "reasoning_id": None},
+                    ),
                     description=f"context {context}" if context else None,
+                    reasoning_items=reasoning_items,
                     metadata={"providerID": provider_id, "modelID": model_id},
                 )
             )
@@ -694,6 +1022,148 @@ class OpenCodeRuntime(AgentRuntime):
                             models[f"{provider_id}/{model_id}"] = model
                 self._models = models
             return self._models
+
+    async def list_permission_catalog(
+        self,
+        query: str | None = None,
+        limit: int = 100,
+    ) -> RuntimePermissionCatalog:
+        """Expose opencode's Build and Plan permission mode presets.
+
+        opencode ships two ``primary`` agents users switch between:
+        ``build`` (default; read-write — tools run per configured
+        permission rules) and ``plan`` (read-only — ``edit`` tools are
+        denied, only plan files may be written). The remaining primary
+        agents (``compaction``, ``summary``, ``title``) are opencode
+        internals, so they are not offered as modes.
+
+        Which agents exist is resolved from ``GET /agent`` (cached per project
+        directory), so a preset is only offered when this opencode install
+        really has it. The selection itself is applied as the agent of the
+        next prompt — see ``_permission_mode_for_turn``.
+        """
+
+        agents = await self._load_primary_agents()
+        items: list[RuntimePermissionItem] = []
+        for name in _PERMISSION_PRESETS:
+            if name not in agents:
+                continue
+            items.append(
+                RuntimePermissionItem(
+                    id=name,
+                    title=_permission_preset_label(name),
+                    selection_id=_permission_selection_id(name),
+                    description=_PERMISSION_PRESET_DESCRIPTIONS[name],
+                    default=name == PERMISSION_PRESET_BUILD,
+                    metadata={
+                        "source": "opencode.agent",
+                        "agent": name,
+                        # Native mapping, mirroring the codex/claude adapters:
+                        # Build/Plan *is* the opencode primary agent that runs
+                        # the turn.
+                        "runtimeSettings": {"agent": name},
+                        "selectionEffect": "next_turn",
+                    },
+                )
+            )
+        if query:
+            lowered = query.casefold()
+            items = [
+                entry for entry in items
+                if lowered in entry.id.casefold() or lowered in entry.title.casefold()
+            ]
+        return RuntimePermissionCatalog(
+            runtime="opencode", revision=5, permissions=tuple(items[:limit])
+        )
+
+    async def _load_primary_agents(
+        self, directory: str | None = None
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch and cache the ``primary`` agents of one project directory."""
+
+        cached = self._primary_agents.get(directory)
+        if cached is not None:
+            return cached
+        try:
+            agents = await self._client.list_agents(directory=directory)
+        except OpenCodeClientError as exc:
+            logger.warning(
+                "opencode list_agents failed: directory={} error={}", directory, exc
+            )
+            self._primary_agents[directory] = {}
+            return self._primary_agents[directory]
+        result: dict[str, dict[str, Any]] = {}
+        for agent in agents:
+            if not isinstance(agent, Mapping):
+                continue
+            name = agent.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            if agent.get("mode") != "primary":
+                continue
+            result[name] = dict(agent)
+        self._primary_agents[directory] = result
+        return result
+
+    async def _permission_mode_for_turn(
+        self,
+        native_id: str,
+        selections: Mapping[str, str | None] | None,
+    ) -> str | None:
+        """Resolve the opencode agent the next turn must run as.
+
+        opencode switches Build/Plan per prompt (and remembers the agent on the
+        session), so there is nothing to push here — the returned agent name is
+        what ``prompt_async`` carries. ``None`` means "leave opencode's own
+        default alone": a session the platform never put a mode on keeps the
+        mode the user picked in the opencode TUI.
+
+        The preset must exist in this project, because serve accepts an unknown
+        agent name silently and then runs no turn at all. A mode the platform
+        selected wins over opencode's own ``plan_exit`` tool, which asks to
+        leave Plan mode mid-turn: the platform keeps sending the selected agent
+        until the user changes the picker.
+        """
+
+        raw = (selections or {}).get(PERMISSION_SELECTION_KEY)
+        preset = _permission_preset_from_selection(raw)
+        if raw and preset is None:
+            logger.warning(
+                "opencode unknown permission selection: session={} selection={}",
+                self._platform_id(native_id),
+                raw,
+            )
+            return None
+        if preset is None:
+            return None
+        agents = await self._load_primary_agents(self._directory_for(native_id))
+        if not agents:
+            # No directory-scoped answer (serve cwd, or an unreachable
+            # ``GET /agent``): fall back to the project the runtime booted in.
+            agents = await self._load_primary_agents(None)
+        if preset not in agents:
+            logger.warning(
+                "opencode permission preset not installed: session={} preset={}",
+                self._platform_id(native_id),
+                preset,
+            )
+            return None
+        return preset
+
+    def _permission_mode_from_session(self, session: Mapping[str, Any]) -> str | None:
+        """Map the agent opencode recorded on a session back to a preset.
+
+        ``session["agent"]`` is what the opencode web UI and TUI show as the
+        current mode, and it survives a connector restart (unlike the
+        connector's in-memory selection). A session that never ran a turn, or
+        one last driven by another agent (a subagent, or ``compaction``), has
+        no mode to report.
+        """
+
+        agent = session.get("agent")
+        if isinstance(agent, str) and agent in _PERMISSION_PRESETS:
+            return agent
+        return None
 
     # ------------------------------------------------------------------ #
     # sessions
@@ -729,6 +1199,19 @@ class OpenCodeRuntime(AgentRuntime):
                 )
             )
         return tuple(metas)
+
+    async def list_complete_session_inventory(
+        self,
+        page_size: int = 100,
+        force: bool = False,
+    ) -> tuple[SessionMeta, ...]:
+        """opencode's ``GET /session`` returns every session in one call.
+
+        No server-side pagination exists, so a single fetch is the full
+        inventory; ``page_size`` only caps the returned slice.
+        """
+
+        return await self.list_sessions(limit=page_size, force=force)
 
     async def get_session_snapshot(
         self,
@@ -766,6 +1249,16 @@ class OpenCodeRuntime(AgentRuntime):
         with suppress(Exception):
             await self._publish_timeline(session_id, external_session_id)
         return True
+
+    async def prepare_session_timeline_sync(
+        self,
+        session_id: str,
+        external_session_id: str | None = None,
+    ) -> PreparedSessionTimelineSync:
+        """Pre-build the snapshot so the connector avoids a second fetch."""
+
+        snapshot = await self.get_session_snapshot(session_id, external_session_id)
+        return PreparedSessionTimelineSync(snapshot=snapshot)
 
     async def _publish_timeline(
         self, session_id: str, external_session_id: str | None
@@ -823,7 +1316,61 @@ class OpenCodeRuntime(AgentRuntime):
             external_session_id=native_id,
             runtime="opencode",
             status=runtime_status,
+            selections=await self._session_selections(session_id, native_id),
         )
+
+    async def _session_selections(
+        self, session_id: str, native_id: str
+    ) -> dict[str, str | None]:
+        """Report the model and permission selections the pickers should display.
+
+        The in-memory selection wins (it is what the next turn will use);
+        after a connector restart it is empty, so fall back to what the
+        opencode session itself records: ``model`` for the model picker and
+        ``permission`` (matched against the agent rulesets) for the
+        Build/Plan picker. Without the model fallback the picker button renders
+        empty and ``/model`` looks broken even though switching works; without
+        the permission fallback a restarted connector always shows Build.
+        """
+
+        selections: dict[str, str | None] = dict(self._selections.get(session_id) or {})
+        need_model = not selections.get(MODEL_SELECTION_KEY)
+        need_permission = not selections.get(PERMISSION_SELECTION_KEY)
+        if not (need_model or need_permission):
+            return selections
+        try:
+            session = await self._client.get_session(native_id)
+        except OpenCodeClientError:
+            return selections
+        if not isinstance(session, dict):
+            return selections
+        if need_model:
+            model = session.get("model")
+            if isinstance(model, dict):
+                provider_id = model.get("providerID")
+                model_id = model.get("id")
+                if (
+                    isinstance(provider_id, str)
+                    and isinstance(model_id, str)
+                    and provider_id
+                    and model_id
+                ):
+                    selections[MODEL_SELECTION_KEY] = f"{provider_id}/{model_id}"
+        if need_permission:
+            preset = self._permission_mode_from_session(session)
+            if preset is not None:
+                selections[PERMISSION_SELECTION_KEY] = _permission_selection_id(preset)
+        return selections
+
+    async def get_session_notices(
+        self,
+        session_id: str,
+        external_session_id: str | None = None,
+    ) -> tuple[SessionNotice, ...]:
+        """Return pending interaction notices (approval requests, questions)."""
+
+        _ = external_session_id
+        return tuple(self._notices.get(session_id, {}).values())
 
     # ------------------------------------------------------------------ #
     # turns
@@ -840,7 +1387,7 @@ class OpenCodeRuntime(AgentRuntime):
         client_message_id: str | None = None,
         runtime_options: Mapping[str, Any] | None = None,
     ) -> RuntimeOperationResult:
-        _ = attachments, runtime_options
+        _ = runtime_options
         try:
             session = await self._client.create_session(title, directory=cwd)
         except OpenCodeClientError as exc:
@@ -851,6 +1398,12 @@ class OpenCodeRuntime(AgentRuntime):
         self._remember_directory(
             native_id, str(session.get("directory") or cwd) if session.get("directory") or cwd else None
         )
+        # Persist the selections the session was created with. Without this the
+        # pickers have nothing to show for a brand-new session (the opencode
+        # session record carries neither the model nor the permission mode yet)
+        # and a later ``start_turn`` would drop the model again.
+        if selections:
+            self._selections[session_id] = dict(selections)
         self._pending_messages.register(
             native_session_id=native_id,
             client_message_id=client_message_id,
@@ -867,7 +1420,9 @@ class OpenCodeRuntime(AgentRuntime):
             cwd=session.get("directory"),
             ordering_time=_iso_ms((session.get("time") or {}).get("created")),
         )
-        await self._start_turn(native_id, content, selections)
+        await self._start_turn(
+            native_id, content, selections, session_id=session_id, attachments=attachments
+        )
         return RuntimeOperationResult(
             ok=True,
             # Contract key is camelCase (same as codex/claude/dsh). A snake_case
@@ -890,9 +1445,13 @@ class OpenCodeRuntime(AgentRuntime):
         client_message_id: str | None = None,
         cwd: str | None = None,
     ) -> RuntimeOperationResult:
-        _ = attachments
         native_id = self._adopt_session_binding(session_id, external_session_id)
         self._remember_directory(native_id, cwd)
+        # Persist selections so a later model change applies to subsequent
+        # turns even if the caller does not re-send them.
+        if selections:
+            self._selections[session_id] = dict(selections)
+        effective = selections or self._selections.get(session_id)
         self._pending_messages.register(
             native_session_id=native_id,
             client_message_id=client_message_id,
@@ -905,10 +1464,108 @@ class OpenCodeRuntime(AgentRuntime):
             native_id,
         )
         try:
-            await self._start_turn(native_id, content, selections)
+            await self._start_turn(
+                native_id, content, effective, session_id=session_id, attachments=attachments
+            )
         except OpenCodeClientError as exc:
             logger.warning("opencode start_turn failed: native={} error={}", native_id, exc)
             return RuntimeOperationResult(ok=False, code="turn_failed", message=str(exc))
+        return RuntimeOperationResult(ok=True)
+
+    async def steer_turn(
+        self,
+        session_id: str,
+        external_session_id: str | None,
+        content: str,
+        attachments: tuple = (),
+        client_message_id: str | None = None,
+    ) -> RuntimeOperationResult:
+        """Steer the active turn.
+
+        opencode has no dedicated steer endpoint; sending a new message via
+        ``prompt_async`` while a turn is busy interrupts the current turn and
+        resumes with the new input (verified against 1.18.34). When the
+        session is idle this behaves identically to ``start_turn``.
+        """
+
+        native_id = self._adopt_session_binding(session_id, external_session_id)
+        self._pending_messages.register(
+            native_session_id=native_id,
+            client_message_id=client_message_id,
+            text=content,
+        )
+        try:
+            await self._start_turn(
+                native_id,
+                content,
+                self._selections.get(session_id),
+                session_id=session_id,
+                attachments=attachments,
+            )
+        except OpenCodeClientError as exc:
+            logger.warning("opencode steer_turn failed: native={} error={}", native_id, exc)
+            return RuntimeOperationResult(ok=False, code="steer_failed", message=str(exc))
+        return RuntimeOperationResult(ok=True)
+
+    async def update_session_selections(
+        self,
+        session_id: str,
+        external_session_id: str | None,
+        selections: Mapping[str, str | None],
+    ) -> RuntimeOperationResult:
+        """Store model/permission selections and mirror them onto the session.
+
+        opencode accepts a model reference per prompt, so the model selection
+        is applied to the next ``start_turn`` / ``steer_turn`` call. Pushing it
+        to ``POST /api/session/{id}/model`` as well keeps the opencode-side
+        session record (and the web UI, and other platform clients) in sync
+        with what the platform picker shows.
+
+        The permission selection (Build/Plan) is validated here and applied by
+        the next prompt, because opencode has no endpoint to switch the mode
+        after the fact. Reporting ok does not mean the mode already changed:
+        like the model, it takes effect on the next turn.
+        """
+
+        raw_permission = selections.get(PERMISSION_SELECTION_KEY)
+        if raw_permission and _permission_preset_from_selection(raw_permission) is None:
+            return RuntimeOperationResult(
+                ok=False,
+                code="opencode_invalid_selection",
+                message=f"Unsupported OpenCode permission selection: {raw_permission}",
+            )
+        self._selections[session_id] = dict(selections)
+        native_id: str | None = None
+        raw = selections.get(MODEL_SELECTION_KEY)
+        if isinstance(raw, str) and "/" in raw:
+            native_id = self._adopt_session_binding(session_id, external_session_id)
+            provider_id, _, model_id = raw.partition("/")
+            if provider_id and model_id:
+                try:
+                    await self._client.switch_session_model(
+                        native_id,
+                        model_id,
+                        provider_id,
+                        directory=self._directory_for(native_id),
+                    )
+                except OpenCodeClientError as exc:
+                    # Non-fatal: the next prompt still carries the model ref.
+                    logger.warning(
+                        "opencode selection push failed: native={} error={}",
+                        native_id,
+                        exc,
+                    )
+        if raw_permission:
+            if native_id is None:
+                native_id = self._adopt_session_binding(session_id, external_session_id)
+            mode = await self._permission_mode_for_turn(native_id, selections)
+            logger.info(
+                "opencode permission mode selected: platform={} native={} mode={}",
+                session_id,
+                native_id,
+                mode or "opencode-default",
+            )
+        logger.info("opencode selections updated: platform={} selections={}", session_id, dict(selections))
         return RuntimeOperationResult(ok=True)
 
     async def _start_turn(
@@ -916,13 +1573,33 @@ class OpenCodeRuntime(AgentRuntime):
         native_id: str,
         content: str,
         selections: Mapping[str, str | None] | None,
+        session_id: str | None = None,
+        attachments: tuple = (),
     ) -> None:
         model = self._model_ref(selections)
+        # Build/Plan is the agent this turn runs as; opencode remembers it on
+        # the session, so the picker can read the mode back after a restart.
+        agent = await self._permission_mode_for_turn(native_id, selections)
+        parts: tuple[dict[str, object], ...] = ()
+        if attachments and session_id:
+            materialized = await materialize_opencode_attachments(
+                self.host, session_id, tuple(attachments)
+            )
+            parts = tuple(item.to_part() for item in materialized)
+            if len(materialized) != len(attachments):
+                logger.warning(
+                    "opencode turn attachment partial: platform={} requested={} materialized={}",
+                    session_id,
+                    len(attachments),
+                    len(materialized),
+                )
         logger.info(
-            "opencode turn start: platform={} native={} model={}",
+            "opencode turn start: platform={} native={} model={} agent={} attachments={}",
             self._platform_id(native_id),
             native_id,
             (model or {}).get("modelID"),
+            agent,
+            len(parts),
         )
         idle_before = self._idle_seq.get(native_id, 0)
         # Mark the turn active BEFORE awaiting prompt_async. If serve emits
@@ -933,7 +1610,12 @@ class OpenCodeRuntime(AgentRuntime):
         self._active_turns.add(native_id)
         self._pushed_idle.discard(native_id)
         await self._client.prompt_async(
-            native_id, content, model=model, directory=self._directory_for(native_id)
+            native_id,
+            content,
+            model=model,
+            agent=agent,
+            directory=self._directory_for(native_id),
+            extra_parts=parts,
         )
         idle_after = self._idle_seq.get(native_id, 0)
         if idle_after != idle_before:
@@ -985,6 +1667,380 @@ class OpenCodeRuntime(AgentRuntime):
             with suppress(Exception):
                 await self._reconcile_active_turns()
         return RuntimeOperationResult(ok=True)
+
+    async def list_commands(
+        self,
+        session_id: str,
+        external_session_id: str | None = None,
+        query: str | None = None,
+        limit: int = 50,
+    ) -> tuple[RuntimeCommand, ...]:
+        native_id = self._native_id(session_id, external_session_id)
+        # ``GET /command`` is directory-scoped and answers 503 without one, so
+        # the session's own workspace must be passed or the user's skills and
+        # commands never show up in the slash menu.
+        return await self._list_runtime_commands(query, limit, self._directory_for(native_id))
+
+    async def list_runtime_commands(
+        self,
+        limit: int = 100,
+    ) -> tuple[RuntimeCommand, ...]:
+        # No session context here: opencode answers for the serve cwd, and a
+        # project-less cwd has no commands (503) — only the builtins remain.
+        return await self._list_runtime_commands(None, limit, None)
+
+    async def _list_runtime_commands(
+        self, query: str | None, limit: int, directory: str | None
+    ) -> tuple[RuntimeCommand, ...]:
+        items: list[RuntimeCommand] = []
+        # Built-in slash commands first — they are the user's primary entry
+        # points (``/model``, ``/compact`` ...) and must survive any limit
+        # truncation that would otherwise drop them once skills fill the list.
+        for spec in _OPENCODE_BUILTIN_COMMANDS:
+            name = str(spec["name"])
+            title = str(spec["title"])
+            if query and query.lower() not in name.lower() and query.lower() not in title.lower():
+                continue
+            items.append(
+                RuntimeCommand(
+                    id=name,
+                    title=title,
+                    description=str(spec["description"]),
+                    category="builtin",
+                    scope="session",
+                    accepts_args=bool(spec["accepts_args"]),
+                    metadata={
+                        "source": "builtin",
+                        "builtin": True,
+                        **dict(spec["metadata"]),
+                    },
+                )
+            )
+            if len(items) >= limit:
+                return tuple(items)
+        try:
+            commands = await self._client.list_commands(directory=directory)
+        except OpenCodeClientError as exc:
+            logger.warning(
+                "opencode list_commands failed: directory={} error={}", directory, exc
+            )
+            return tuple(items)
+        seen = {cmd.id for cmd in items}
+        for cmd in commands:
+            if not isinstance(cmd, dict):
+                continue
+            name = str(cmd.get("name") or "")
+            if not name or name in seen:
+                continue
+            if query and query.lower() not in name.lower():
+                continue
+            items.append(
+                RuntimeCommand(
+                    id=name,
+                    title=name,
+                    description=cmd.get("description") or None,
+                    aliases=tuple(cmd.get("hints") or ()),
+                    category=cmd.get("source"),
+                    scope="session",
+                    accepts_args=True,
+                    metadata={"source": cmd.get("source"), "template": cmd.get("template")},
+                )
+            )
+            if len(items) >= limit:
+                break
+        return tuple(items)
+
+    async def execute_command(
+        self,
+        session_id: str,
+        command: str,
+        external_session_id: str | None = None,
+        raw: str | None = None,
+        args: tuple[str, ...] = (),
+    ) -> RuntimeCommandResult:
+        native_id = self._adopt_session_binding(session_id, external_session_id)
+        directory = self._directory_for(native_id)
+        arguments = raw if raw is not None else " ".join(args)
+        # Built-in slash commands map to dedicated opencode endpoints, not
+        # ``POST /session/{id}/command`` (which only runs user-defined skills).
+        builtin = command.lstrip("/")
+        if builtin in _OPENCODE_BUILTIN_COMMAND_NAMES:
+            return await self._execute_builtin_command(
+                session_id, native_id, builtin, arguments, directory, command
+            )
+        try:
+            await self._client.execute_command(
+                native_id, command, arguments, directory
+            )
+        except OpenCodeClientError as exc:
+            logger.warning("opencode execute_command failed: {}", exc)
+            return RuntimeCommandResult(command=command, ok=False, code="command_failed", message=str(exc))
+        return RuntimeCommandResult(command=command, ok=True)
+
+    @staticmethod
+    def _command_ok(
+        command: str, text: str, **extra: Any
+    ) -> RuntimeCommandResult:
+        """A completed command with display text for the client's toast."""
+
+        return RuntimeCommandResult(
+            command=command,
+            ok=True,
+            result={"text": text, "executionState": "completed", **extra},
+        )
+
+    async def _execute_builtin_command(
+        self,
+        session_id: str,
+        native_id: str,
+        builtin: str,
+        arguments: str,
+        directory: str | None,
+        command: str,
+    ) -> RuntimeCommandResult:
+        """Dispatch a built-in slash command to its dedicated opencode endpoint."""
+
+        try:
+            if builtin == "model":
+                # The platform drives ``/model`` through its own selector
+                # (``metadata.ui.kind == "selector"``), so this branch only
+                # runs for API-level callers that still pass an argument.
+                model_ref = arguments.strip()
+                if not model_ref:
+                    return RuntimeCommandResult(
+                        command=command,
+                        ok=False,
+                        code="missing_argument",
+                        message="usage: /model <provider>/<model_id>",
+                    )
+                # Accept ``provider/model`` or a bare ``model`` id (then we
+                # cannot pick a provider and must reject).
+                if "/" in model_ref:
+                    provider_id, model_id = model_ref.split("/", 1)
+                else:
+                    return RuntimeCommandResult(
+                        command=command,
+                        ok=False,
+                        code="invalid_argument",
+                        message=(
+                            "opencode requires <provider>/<model_id>, e.g. "
+                            "local/qwen3.8-27b"
+                        ),
+                    )
+                variant = None
+                if "|" in model_id:
+                    model_id, variant = model_id.split("|", 1)
+                await self._client.switch_session_model(
+                    native_id, model_id, provider_id, variant=variant, directory=directory
+                )
+                self._selections.setdefault(session_id, {})[MODEL_SELECTION_KEY] = (
+                    f"{provider_id}/{model_id}"
+                )
+                return self._command_ok(command, f"已切换模型为 {provider_id}/{model_id}")
+            elif builtin == "compact":
+                model = await self._resolve_model_for_compact(session_id, native_id)
+                if model is None:
+                    return RuntimeCommandResult(
+                        command=command,
+                        ok=False,
+                        code="model_required",
+                        message=_COMPACT_MODEL_FALLBACK_ERROR,
+                    )
+                provider_id, model_id = model
+                await self._client.summarize_session(
+                    native_id, provider_id, model_id, directory=directory
+                )
+                return self._command_ok(command, "会话已压缩")
+            elif builtin == "fork":
+                forked = await self._client.fork_session(
+                    native_id, message_id=arguments.strip() or None, directory=directory
+                )
+                new_id = (forked or {}).get("id")
+                text = f"已创建分叉会话 {new_id}" if new_id else "已创建分叉会话"
+                return self._command_ok(command, text)
+            elif builtin == "share":
+                shared = await self._client.share_session(native_id, directory=directory)
+                url = ((shared or {}).get("share") or {}).get("url")
+                text = f"分享链接: {url}" if url else "会话已创建分享链接"
+                return self._command_ok(command, text, **({"url": url} if url else {}))
+            elif builtin == "undo":
+                # /undo accepts an optional messageID arg; without one, the
+                # client auto-resolves the latest model message. ``False``
+                # means "no recent model message to revert" — treat as a
+                # no-op success rather than an error.
+                reverted = await self._client.revert_latest_message(
+                    native_id,
+                    message_id=arguments.strip() or None,
+                    directory=directory,
+                )
+                if not reverted:
+                    return RuntimeCommandResult(
+                        command=command,
+                        ok=True,
+                        code="nothing_to_undo",
+                        message="没有可撤销的模型消息",
+                    )
+                return self._command_ok(command, "已撤销最近一条模型消息")
+            else:
+                return RuntimeCommandResult(
+                    command=command,
+                    ok=False,
+                    code="unknown_command",
+                    message=f"builtin command {builtin!r} not implemented",
+                )
+        except OpenCodeClientError as exc:
+            logger.warning("opencode builtin {} failed: {}", builtin, exc)
+            return RuntimeCommandResult(
+                command=command, ok=False, code="command_failed", message=str(exc)
+            )
+
+    async def _resolve_model_for_compact(
+        self, session_id: str, native_id: str
+    ) -> tuple[str, str] | None:
+        """Pick the model opencode should use to write the session summary.
+
+        Order: the platform session's picked model, then the model recorded on
+        the opencode session itself, then the model of the latest assistant
+        message. Returns ``None`` when the session never used a model.
+        """
+
+        raw = (self._selections.get(session_id) or {}).get(MODEL_SELECTION_KEY)
+        if isinstance(raw, str) and "/" in raw:
+            provider_id, _, model_id = raw.partition("/")
+            if provider_id and model_id:
+                return provider_id, model_id
+        try:
+            session = await self._client.get_session(native_id)
+        except OpenCodeClientError:
+            session = {}
+        model = session.get("model") if isinstance(session, dict) else None
+        if isinstance(model, dict):
+            provider_id = model.get("providerID")
+            model_id = model.get("id")
+            if isinstance(provider_id, str) and isinstance(model_id, str) and provider_id and model_id:
+                return provider_id, model_id
+        try:
+            messages = await self._client.list_messages(
+                native_id, directory=self._directory_for(native_id)
+            )
+        except OpenCodeClientError:
+            return None
+        for message in reversed(messages):
+            info = message.get("info") if isinstance(message, dict) else None
+            if not isinstance(info, dict) or info.get("role") != "assistant":
+                continue
+            provider_id = info.get("providerID")
+            model_id = info.get("modelID")
+            if isinstance(provider_id, str) and isinstance(model_id, str) and provider_id and model_id:
+                return provider_id, model_id
+        return None
+
+    async def respond_interaction(
+        self,
+        session_id: str,
+        notice_id: str,
+        action_id: str,
+        input_data: Mapping[str, Any] | None = None,
+    ) -> RuntimeOperationResult:
+        """Resolve a pending approval or question notice.
+
+        Permission actions map to opencode's reply vocabulary:
+        ``approve`` → ``once``, ``approve_for_session`` → ``always``,
+        ``reject`` → ``reject``.
+        """
+
+        notices = self._notices.get(session_id, {})
+        notice = notices.get(notice_id)
+        if notice is None:
+            return RuntimeOperationResult(
+                ok=False, code="notice_not_found", message=f"notice {notice_id} not found"
+            )
+        interaction_type = notice.interaction_type
+        context = notice.context or {}
+        native_id = self._native_id(session_id, context.get("externalSessionId"))
+        directory = self._directory_for(native_id)
+        try:
+            if interaction_type == "approval":
+                permission_id = str(context.get("permissionId") or "")
+                response = self._permission_response_for_action(action_id)
+                if not permission_id or response is None:
+                    return RuntimeOperationResult(
+                        ok=False,
+                        code="invalid_approval",
+                        message=f"cannot resolve permission response for action={action_id}",
+                    )
+                await self._client.reply_permission(
+                    native_id, permission_id, response, directory=directory
+                )
+            elif interaction_type == "question":
+                question_id = str(context.get("questionId") or "")
+                reply = str((input_data or {}).get("reply") or "").strip()
+                if not question_id:
+                    return RuntimeOperationResult(
+                        ok=False, code="invalid_question", message="question id missing"
+                    )
+                # Dismissing the card is a real opencode action; answering with
+                # an empty string is not (opencode rejects an empty label).
+                if reply in {"cancel", "dismiss", "reject", "-"}:
+                    await self._client.reject_question(
+                        native_id, question_id, directory=directory
+                    )
+                else:
+                    if not reply:
+                        return RuntimeOperationResult(
+                            ok=False,
+                            code="empty_reply",
+                            message="a question reply cannot be empty",
+                        )
+                    await self._client.reply_question(
+                        native_id, question_id, reply, directory=directory
+                    )
+            else:
+                return RuntimeOperationResult(
+                    ok=False,
+                    code="unsupported_interaction",
+                    message=f"interaction type {interaction_type} not supported",
+                )
+        except OpenCodeClientError as exc:
+            logger.warning("opencode respond_interaction failed: {}", exc)
+            return RuntimeOperationResult(ok=False, code="reply_failed", message=str(exc))
+        # Mark the notice resolved and drop it from the pending set.
+        notices.pop(notice_id, None)
+        with suppress(Exception):
+            await self.host.notice_upsert(
+                SessionNotice(
+                    notice_id=notice.notice_id,
+                    session_id=session_id,
+                    runtime="opencode",
+                    type=notice.type,
+                    title=notice.title,
+                    message=notice.message,
+                    severity=notice.severity,
+                    status="resolved",
+                    interaction_type=notice.interaction_type,
+                )
+            )
+        # The approval was blocking: without an explicit state update the
+        # platform session stays in ``waiting_approval`` for the rest of the
+        # turn (the client keeps the composer blocked) even though opencode has
+        # resumed. Only a tracked turn is pushed back to ``running`` — an
+        # untracked one would be pushed idle by the idle handler.
+        if native_id in self._active_turns:
+            with suppress(Exception):
+                await self.host.session_state_update(
+                    session_id, "opencode", status="running", external_session_id=native_id
+                )
+        return RuntimeOperationResult(ok=True)
+
+    @staticmethod
+    def _permission_response_for_action(action_id: str) -> str | None:
+        if action_id in {"approve", "approved"}:
+            return "once"
+        if action_id in {"approve_for_session", "approved_for_session"}:
+            return "always"
+        if action_id in {"reject", "decline", "cancel"}:
+            return "reject"
+        return None
 
     # ------------------------------------------------------------------ #
     # SSE event loop
@@ -1305,5 +2361,262 @@ class OpenCodeRuntime(AgentRuntime):
                     cwd=info.get("directory"),
                     ordering_time=_iso_ms((info.get("time") or {}).get("updated")),
                 )
+        elif etype in {"permission.asked", "permission.v2.asked"}:
+            await self._handle_permission_asked(platform_id, native_id, props)
+        elif etype in {"permission.replied", "permission.v2.replied"}:
+            await self._handle_permission_replied(platform_id, native_id, props)
+        elif etype in {"question.asked", "question.v2.asked"}:
+            await self._handle_question_asked(platform_id, native_id, props)
+        elif etype in {
+            "question.replied",
+            "question.v2.replied",
+            "question.rejected",
+            "question.v2.rejected",
+        }:
+            await self._handle_question_closed(platform_id, props)
+        elif etype == "session.error":
+            await self._handle_session_error(platform_id, native_id, props)
         # message.part.delta / message.part.updated / session.diff: live
         # updates are covered by snapshot rebuilds at turn end (session.idle).
+
+    async def _handle_permission_asked(
+        self, platform_id: str, native_id: str, props: dict[str, Any]
+    ) -> None:
+        """Surface a permission request as an approval notice.
+
+        Both V1 (``permission.asked``) and V2 (``permission.v2.asked``) carry
+        the same fields under ``properties``; V1 names the action
+        ``permission`` while V2 calls it ``action``.
+        """
+
+        permission_id = str(props.get("id") or "")
+        if not permission_id:
+            return
+        action = props.get("permission") or props.get("action") or "tool"
+        patterns = props.get("patterns") or props.get("resources") or []
+        if isinstance(patterns, list):
+            detail = ", ".join(str(p) for p in patterns[:5])
+        else:
+            detail = str(patterns)
+        notice_id = f"notice_opencode_perm_{permission_id}"
+        notice = SessionNotice(
+            notice_id=notice_id,
+            session_id=platform_id,
+            runtime="opencode",
+            type="interaction",
+            title=f"OpenCode 请求权限: {action}",
+            message=detail or None,
+            severity="warning",
+            interaction_type="approval",
+            blocking={"scope": "session", "targetId": platform_id},
+            response_required=True,
+            source={"permissionId": permission_id},
+            context={
+                "permissionId": permission_id,
+                "externalSessionId": native_id,
+                "action": action,
+                "patterns": patterns,
+            },
+            actions=(
+                {"actionId": "approve", "label": "允许本次", "style": "primary"},
+                {"actionId": "approve_for_session", "label": "始终允许", "style": "secondary"},
+                {"actionId": "reject", "label": "拒绝", "style": "danger"},
+            ),
+            metadata={"source": "opencode.permission"},
+        )
+        self._notices.setdefault(platform_id, {})[notice_id] = notice
+        logger.info(
+            "opencode permission asked: platform={} native={} perm={} action={}",
+            platform_id,
+            native_id,
+            permission_id,
+            action,
+        )
+        with suppress(Exception):
+            await self.host.session_state_update(
+                platform_id,
+                "opencode",
+                status="waiting_approval",
+                external_session_id=native_id,
+            )
+        with suppress(Exception):
+            await self.host.notice_upsert(notice)
+
+    async def _handle_permission_replied(
+        self, platform_id: str, native_id: str, props: dict[str, Any]
+    ) -> None:
+        permission_id = str(props.get("id") or "")
+        if not permission_id:
+            return
+        notice_id = f"notice_opencode_perm_{permission_id}"
+        notices = self._notices.get(platform_id, {})
+        notice = notices.pop(notice_id, None)
+        if notice is None:
+            return
+        logger.info(
+            "opencode permission replied: platform={} native={} perm={}",
+            platform_id,
+            native_id,
+            permission_id,
+        )
+        with suppress(Exception):
+            await self.host.notice_upsert(
+                SessionNotice(
+                    notice_id=notice.notice_id,
+                    session_id=platform_id,
+                    runtime="opencode",
+                    type=notice.type,
+                    title=notice.title,
+                    message=notice.message,
+                    severity=notice.severity,
+                    status="resolved",
+                    interaction_type=notice.interaction_type,
+                )
+            )
+
+    async def _handle_question_asked(
+        self, platform_id: str, native_id: str, props: dict[str, Any]
+    ) -> None:
+        """Surface a question the model asked mid-turn as a blocking notice.
+
+        opencode asks with a list of questions, each carrying selectable
+        ``options``. The platform notice offers a free-text reply (which
+        opencode accepts as a one-label answer), so the option labels go into
+        the notice body — otherwise the user cannot tell what they are being
+        asked to pick.
+        """
+
+        question_id = str(props.get("id") or "")
+        if not question_id:
+            return
+        questions = props.get("questions") or []
+        text = str(props.get("question") or "")
+        options: list[str] = []
+        first_options: list[str] = []
+        if isinstance(questions, list) and questions:
+            first = questions[0]
+            if isinstance(first, Mapping):
+                text = str(
+                    first.get("question") or first.get("text") or first.get("prompt") or text
+                )
+                first_options = [
+                    str(option.get("label") or option)
+                    for option in (first.get("options") or ())
+                    if isinstance(option, (Mapping, str))
+                ]
+            else:
+                text = str(first)
+        if isinstance(questions, list):
+            for question in questions:
+                if isinstance(question, Mapping):
+                    options.extend(
+                        str(option.get("label") or option)
+                        for option in (question.get("options") or ())
+                        if isinstance(option, (Mapping, str))
+                    )
+        body = text
+        if first_options:
+            body = f"{text}\n可选回复: {' / '.join(first_options)}"
+        notice_id = f"notice_opencode_que_{question_id}"
+        notice = SessionNotice(
+            notice_id=notice_id,
+            session_id=platform_id,
+            runtime="opencode",
+            type="interaction",
+            title="OpenCode 向你提问",
+            message=body or None,
+            severity="info",
+            interaction_type="question",
+            blocking={"scope": "session", "targetId": platform_id},
+            response_required=True,
+            source={"questionId": question_id},
+            context={
+                "questionId": question_id,
+                "externalSessionId": native_id,
+                "options": options,
+            },
+            actions=(
+                {"actionId": "reply", "label": "回复", "style": "primary"},
+            ),
+            metadata={"source": "opencode.question"},
+        )
+        self._notices.setdefault(platform_id, {})[notice_id] = notice
+        logger.info(
+            "opencode question asked: platform={} native={} que={}",
+            platform_id,
+            native_id,
+            question_id,
+        )
+        # A question blocks the turn just like a permission request, so the
+        # platform session must leave "running" or the client keeps waiting on a
+        # turn that is actually waiting on the user.
+        with suppress(Exception):
+            await self.host.session_state_update(
+                platform_id,
+                "opencode",
+                status="waiting_approval",
+                external_session_id=native_id,
+            )
+        with suppress(Exception):
+            await self.host.notice_upsert(notice)
+
+    async def _handle_question_closed(
+        self, platform_id: str, props: dict[str, Any]
+    ) -> None:
+        """Resolve a question notice opencode closed itself (answered/rejected).
+
+        The turn can end (or the question be dismissed) without the platform
+        ever answering; without this the approval card stays on screen forever.
+        """
+
+        question_id = str(props.get("id") or "")
+        if not question_id:
+            return
+        notices = self._notices.get(platform_id, {})
+        notice = notices.pop(f"notice_opencode_que_{question_id}", None)
+        if notice is None:
+            return
+        logger.info(
+            "opencode question closed: platform={} que={}", platform_id, question_id
+        )
+        with suppress(Exception):
+            await self.host.notice_upsert(
+                SessionNotice(
+                    notice_id=notice.notice_id,
+                    session_id=platform_id,
+                    runtime="opencode",
+                    type=notice.type,
+                    title=notice.title,
+                    message=notice.message,
+                    severity=notice.severity,
+                    status="resolved",
+                    interaction_type=notice.interaction_type,
+                )
+            )
+
+    async def _handle_session_error(
+        self, platform_id: str, native_id: str, props: dict[str, Any]
+    ) -> None:
+        error = props.get("error") or {}
+        code = error.get("code") if isinstance(error, dict) else None
+        message = error.get("message") if isinstance(error, dict) else str(error)
+        logger.warning(
+            "opencode session.error: platform={} native={} code={} message={}",
+            platform_id,
+            native_id,
+            code,
+            message,
+        )
+        with suppress(Exception):
+            await self.host.session_state_update(
+                platform_id,
+                "opencode",
+                status="error",
+                external_session_id=native_id,
+                error={"code": code, "message": message} if code or message else None,
+            )
+        # A session error normally ends the turn; reconcile so the platform
+        # session does not stay "running".
+        if native_id in self._active_turns:
+            self._recently_ended[native_id] = "error"
+            await self._finish_turn(native_id)
