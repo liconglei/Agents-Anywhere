@@ -30,6 +30,7 @@ from connector.runtimes.opencode.provider import OpenCodeProvider
 from connector.runtimes.opencode.runtime import (
     PERMISSION_SELECTION_KEY,
     OpenCodeRuntime,
+    _StreamSession,
 )
 from connector.runtimes.opencode.sdk.client import (
     OpenCodeClient,
@@ -447,6 +448,8 @@ class FakeHost:
         self.attachment_downloads: list[tuple[str, str]] = []
         self.attachment_bytes: dict[str, bytes] = {}
         self.notices: list[Any] = []
+        # Live timeline pushes (streaming) vs full snapshot rebuilds.
+        self.item_upserts: list[Any] = []
 
     async def timeline_sync(
         self, session_id: str, runtime: str, items: tuple, external_session_id: str | None = None, complete: bool = False
@@ -473,6 +476,9 @@ class FakeHost:
 
     async def notice_upsert(self, notice: Any) -> None:
         self.notices.append(notice)
+
+    async def timeline_item_upsert(self, item: Any) -> None:
+        self.item_upserts.append(item)
 
     async def attachment_download(self, session_id: str, file_id: str) -> Any:
         from connector.runtime_protocol import RuntimeAttachmentContent
@@ -2571,6 +2577,599 @@ def test_client_accepts_empty_204_without_content_type() -> None:
         await client.close()
 
     asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
+# live streaming (payloads captured from serve 1.18.34)
+# --------------------------------------------------------------------------- #
+
+USER_MESSAGE_ID = "msg_user_1"
+ASSISTANT_MESSAGE_ID = "msg_asst_1"
+TEXT_PART_ID = "prt_text_1"
+TOOL_PART_ID = "prt_tool_1"
+
+
+def _user_message_event() -> dict[str, Any]:
+    return {
+        "type": "message.updated",
+        "properties": {
+            "sessionID": "ses_x",
+            "info": {"id": USER_MESSAGE_ID, "role": "user", "time": {"created": 1_000}},
+        },
+    }
+
+
+def _assistant_message_event() -> dict[str, Any]:
+    return {
+        "type": "message.updated",
+        "properties": {
+            "sessionID": "ses_x",
+            "info": {
+                "id": ASSISTANT_MESSAGE_ID,
+                "parentID": USER_MESSAGE_ID,
+                "role": "assistant",
+                "mode": "build",
+                "time": {"created": 2_000},
+            },
+        },
+    }
+
+
+def _text_part_event(text: str = "") -> dict[str, Any]:
+    """``message.part.updated`` restates the whole part (no ``delta``)."""
+
+    return {
+        "type": "message.part.updated",
+        "properties": {
+            "sessionID": "ses_x",
+            "part": {
+                "id": TEXT_PART_ID,
+                "messageID": ASSISTANT_MESSAGE_ID,
+                "sessionID": "ses_x",
+                "type": "text",
+                "text": text,
+            },
+            "time": 2_100,
+        },
+    }
+
+
+def _delta_event(delta: str, part_id: str = TEXT_PART_ID) -> dict[str, Any]:
+    """``message.part.delta`` has no ``part`` object — ids + field + delta."""
+
+    return {
+        "type": "message.part.delta",
+        "properties": {
+            "sessionID": "ses_x",
+            "messageID": ASSISTANT_MESSAGE_ID,
+            "partID": part_id,
+            "field": "text",
+            "delta": delta,
+        },
+    }
+
+
+def _tool_part_event(status: str) -> dict[str, Any]:
+    return {
+        "type": "message.part.updated",
+        "properties": {
+            "sessionID": "ses_x",
+            "part": {
+                "id": TOOL_PART_ID,
+                "messageID": ASSISTANT_MESSAGE_ID,
+                "sessionID": "ses_x",
+                "type": "tool",
+                "tool": "bash",
+                "callID": "call_1",
+                "state": {
+                    "status": status,
+                    "input": {"command": "ls"},
+                    "output": "file.txt" if status == "completed" else "",
+                },
+            },
+        },
+    }
+
+
+def _texts(host: FakeHost) -> list[str]:
+    return [str((item.content or {}).get("text") or "") for item in host.item_upserts]
+
+
+def test_streaming_deltas_publish_the_answer_as_it_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reported bug: reasoning and the answer only appeared at turn end.
+
+    opencode streams ``message.part.delta`` per chunk; the connector ignored
+    them and rebuilt the whole timeline from ``session.idle``, so the client
+    showed nothing until the turn was already over.
+    """
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "STREAM_FLUSH_INTERVAL_S", 0.0)
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    runtime._active_turns.add("ses_x")
+    # The SSE stream is process-wide; only sessions the platform shows are
+    # streamed, so mark this one as owned.
+    runtime._remember_directory("ses_x", "/work")
+
+    async def run() -> None:
+        await _drain(
+            runtime,
+            [
+                _user_message_event(),
+                _assistant_message_event(),
+                _text_part_event(),
+                _delta_event("Bridge"),
+                _delta_event(" between"),
+                _delta_event(" machines"),
+            ],
+        )
+        assert _texts(host) == ["Bridge", "Bridge between", "Bridge between machines"]
+        item = host.item_upserts[-1]
+        assert item.type == "message" and item.role == "assistant"
+        assert item.status == "running"
+        # The streamed item must carry the id the turn-end snapshot will use for
+        # the same part, or the client renders the answer twice.
+        assert item.id == TEXT_PART_ID
+        assert item.turn_id == USER_MESSAGE_ID
+        assert item.revision == 3
+        assert len(host.item_upserts) == 3  # one upsert per delta, no extra
+
+        # ``step-finish`` means the model stopped writing: the text flips to
+        # done and leaves the buffer, without waiting for the turn to end.
+        await _drain(runtime, [{"type": "message.part.updated", "properties": {
+            "sessionID": "ses_x",
+            "part": {
+                "id": "prt_step_finish",
+                "messageID": ASSISTANT_MESSAGE_ID,
+                "sessionID": "ses_x",
+                "type": "step-finish",
+            },
+        }}])
+        assert host.item_upserts[-1].status == "done"
+        assert _texts(host)[-1] == "Bridge between machines"
+
+    asyncio.run(run())
+
+
+def test_streaming_deltas_are_throttled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 300-chunk answer must not become 300 timeline upserts."""
+
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "STREAM_FLUSH_INTERVAL_S", 60.0)
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    runtime._active_turns.add("ses_x")
+    # The SSE stream is process-wide; only sessions the platform shows are
+    # streamed, so mark this one as owned.
+    runtime._remember_directory("ses_x", "/work")
+
+    async def run() -> None:
+        await _drain(
+            runtime,
+            [
+                _user_message_event(),
+                _assistant_message_event(),
+                _text_part_event(),
+                *[_delta_event(f"w{i}") for i in range(20)],
+            ],
+        )
+        # The placeholder part update is not flushable (empty text), and the
+        # whole burst stays inside one throttle window.
+        assert host.item_upserts == []
+        # A part update forces the flush, carrying everything accumulated.
+        await _drain(runtime, [_text_part_event("w0w1w2w3")])
+        assert len(host.item_upserts) == 1
+        assert _texts(host) == ["w0w1w2w3"]
+
+    asyncio.run(run())
+
+
+def test_streaming_never_republishes_the_user_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "STREAM_FLUSH_INTERVAL_S", 0.0)
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        user_part = _text_part_event("hello")
+        user_part["properties"]["part"]["messageID"] = USER_MESSAGE_ID
+        user_part["properties"]["part"]["id"] = "prt_user_1"
+        await _drain(
+            runtime,
+            [
+                _user_message_event(),
+                user_part,
+                {
+                    "type": "message.part.delta",
+                    "properties": {
+                        "sessionID": "ses_x",
+                        "messageID": USER_MESSAGE_ID,
+                        "partID": "prt_user_1",
+                        "field": "text",
+                        "delta": "hello",
+                    },
+                },
+            ],
+        )
+        # The user message is already on screen; streaming it back as an
+        # assistant item would duplicate or relabel it.
+        assert host.item_upserts == []
+
+    asyncio.run(run())
+
+
+def test_streaming_tool_state_transitions(monkeypatch: pytest.MonkeyPatch) -> None:
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "STREAM_FLUSH_INTERVAL_S", 0.0)
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    runtime._active_turns.add("ses_x")
+    # The SSE stream is process-wide; only sessions the platform shows are
+    # streamed, so mark this one as owned.
+    runtime._remember_directory("ses_x", "/work")
+
+    async def run() -> None:
+        await _drain(
+            runtime,
+            [
+                _user_message_event(),
+                _assistant_message_event(),
+                _tool_part_event("running"),
+                _tool_part_event("completed"),
+                _tool_part_event("error"),
+            ],
+        )
+        statuses = [(item.type, item.status) for item in host.item_upserts]
+        assert statuses == [("tool", "running"), ("tool", "done"), ("tool", "failed")]
+        assert host.item_upserts[0].id == TOOL_PART_ID
+        assert host.item_upserts[-1].content["output"] == ""
+
+    asyncio.run(run())
+
+
+def test_streamed_parts_finish_as_done_before_the_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Turn end publishes ``done`` items, then the snapshot restates the same ids."""
+
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "STREAM_FLUSH_INTERVAL_S", 0.0)
+    client = FakeClient()
+    host = FakeHost()
+    runtime = _make_runtime(client, host)
+    runtime._active_turns.add("ses_x")
+    # The SSE stream is process-wide; only sessions the platform shows are
+    # streamed, so mark this one as owned.
+    runtime._remember_directory("ses_x", "/work")
+
+    async def run() -> None:
+        client.sessions["ses_x"] = {"id": "ses_x"}
+        client.messages["ses_x"] = [
+            {
+                "info": {
+                    "id": ASSISTANT_MESSAGE_ID,
+                    "role": "assistant",
+                    "parentID": USER_MESSAGE_ID,
+                    "sessionID": "ses_x",
+                    "time": {"created": 2_000, "completed": 3_000},
+                },
+                "parts": [
+                    {
+                        "id": TEXT_PART_ID,
+                        "type": "text",
+                        "text": "Bridge between machines",
+                    }
+                ],
+            }
+        ]
+        await _drain(
+            runtime,
+            [
+                _user_message_event(),
+                _assistant_message_event(),
+                _text_part_event(),
+                _delta_event("Bridge between machines"),
+            ],
+        )
+        assert host.item_upserts[-1].status == "running"
+        host.item_upserts.clear()
+
+        await runtime._finish_streaming_parts("ses_x", "ses_x")
+        assert [item.status for item in host.item_upserts] == ["done"]
+        assert _texts(host) == ["Bridge between machines"]
+        # Buffers are dropped but the order bookkeeping survives: opencode sends
+        # the final parts *after* session.idle, and the next turn's items must
+        # not restart the timeline order.
+        session = runtime._stream_sessions["ses_x"]
+        assert session.parts == {}
+        # The recorded slot (and the counter past it) survive the turn: the
+        # next turn continues from here instead of restarting at 1.
+        seeded = session.order[TEXT_PART_ID]
+        assert seeded >= 1
+        assert session.next_order_seq > seeded
+
+        # The snapshot produces the same item id, so it replaces instead of
+        # duplicating the streamed item.
+        snapshot = await runtime.get_session_snapshot("ses_x", "ses_x")
+        assert [item.id for item in snapshot.items] == [TEXT_PART_ID]
+
+    asyncio.run(run())
+
+
+def test_streaming_order_continues_across_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: turn 2's streamed items must not reuse turn 1's orderSeq.
+
+    Reported symptom: the second turn's text was rendered inside the first
+    turn and its answer never showed. The platform orders a timeline by
+    ``orderSeq``, and the turn-end snapshot numbers items by their position in
+    the message list, so a per-turn counter starting at 1 collided with the
+    previous turn's stored positions.
+    """
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "STREAM_FLUSH_INTERVAL_S", 0.0)
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        # Turn 1: one user message already in the session when the turn starts.
+        client.sessions["ses_x"] = {"id": "ses_x"}
+        client.messages["ses_x"] = [
+            {
+                "info": {
+                    "id": "msg_u0",
+                    "role": "user",
+                    "sessionID": "ses_x",
+                    "time": {"created": 1},
+                },
+                "parts": [{"id": "prt_u0", "type": "text", "text": "hi"}],
+            }
+        ]
+        runtime._active_turns.add("ses_x")
+        # The SSE stream is process-wide; only sessions the platform shows are
+        # streamed, so mark this one as owned.
+        runtime._remember_directory("ses_x", "/work")
+        await runtime._seed_stream_order("ses_x")
+        await _drain(
+            runtime,
+            [
+                _user_message_event(),
+                _assistant_message_event(),
+                _text_part_event(),
+                _delta_event("first answer"),
+            ],
+        )
+        first = host.item_upserts[-1]
+        # 1 pre-existing item (slot 0) + this turn's user message (slot 1),
+        # so the assistant part lands on slot 2 — exactly where the
+        # turn-end snapshot will number it.
+        assert first.order_seq == 2
+        await runtime._finish_streaming_parts("ses_x", "ses_x")
+        await runtime._finish_turn("ses_x")
+        runtime._active_turns.discard("ses_x")
+
+        # Turn 2: the session now holds turn 1's items; the new turn must
+        # continue after them.
+        client.messages["ses_x"].append(
+            {
+                "info": {
+                    "id": "msg_u1",
+                    "role": "user",
+                    "sessionID": "ses_x",
+                    "time": {"created": 2},
+                },
+                "parts": [{"id": "prt_u1", "type": "text", "text": "and now?"}],
+            }
+        )
+        host.item_upserts.clear()
+        runtime._active_turns.add("ses_x")
+        runtime._remember_directory("ses_x", "/work")
+        await runtime._seed_stream_order("ses_x")
+        second = _delta_event("second answer", part_id="prt_text_2")
+        second["properties"]["messageID"] = ASSISTANT_MESSAGE_ID
+        await _drain(runtime, [second])
+        assert len(host.item_upserts) == 1
+        item = host.item_upserts[-1]
+        # Continues after turn 1 instead of colliding with it…
+        assert item.order_seq > first.order_seq
+        # …and the second turn's text is its own, not appended to the first.
+        assert _texts(host) == ["second answer"]
+        assert item.id == "prt_text_2"
+
+    asyncio.run(run())
+
+
+def test_streaming_survives_a_session_without_a_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """opencode sends the final message and parts *after* ``session.idle``.
+
+    Buffering them would leave the answer stuck in ``running`` with nobody left
+    to finalize it, so a part that arrives with no active turn is published as
+    ``done`` straight away.
+    """
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "STREAM_FLUSH_INTERVAL_S", 0.0)
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    runtime._remember_directory("ses_x", "/work")
+
+    async def run() -> None:
+        # No _active_turns entry: the turn already ended.
+        await _drain(
+            runtime,
+            [
+                _user_message_event(),
+                _assistant_message_event(),
+                _text_part_event("the final answer"),
+            ],
+        )
+        assert _texts(host) == ["the final answer"]
+        assert host.item_upserts[-1].status == "done"
+        # And nothing is left behind to finalize later.
+        assert runtime._stream_sessions["ses_x"].parts == {}
+
+    asyncio.run(run())
+
+
+def test_streaming_skips_sessions_the_platform_does_not_show() -> None:
+    """``/global/event`` carries every opencode instance, including the user's TUI.
+
+    Streaming those would spend an ingest notification per throttle window on an
+    item the Server cannot resolve, so unowned sessions are ignored entirely.
+    """
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    # No _remember_directory / binding: ses_x belongs to the opencode TUI.
+
+    async def run() -> None:
+        await _drain(
+            runtime,
+            [
+                _user_message_event(),
+                _assistant_message_event(),
+                _text_part_event(),
+                _delta_event("not ours"),
+            ],
+        )
+        assert host.item_upserts == []
+        assert runtime._stream_sessions.get("ses_x") is None or not (
+            runtime._stream_sessions["ses_x"].parts
+        )
+
+    asyncio.run(run())
+
+
+def test_stream_event_failure_never_escapes_the_sse_loop() -> None:
+    """One malformed payload must cost one update, not a stream reconnect.
+
+    An exception escaping ``_handle_event`` reaches the transport handler, which
+    reconnects the SSE stream and can respawn serve.
+    """
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    runtime._remember_directory("ses_x", "/work")
+    runtime._active_turns.add("ses_x")
+
+    async def run() -> None:
+        await _drain(
+            runtime,
+            [
+                # ``state`` is a list, so the tool mapper trips over it.
+                {
+                    "type": "message.part.updated",
+                    "properties": {
+                        "sessionID": "ses_x",
+                        "part": {
+                            "id": TOOL_PART_ID,
+                            "messageID": ASSISTANT_MESSAGE_ID,
+                            "type": "tool",
+                            "tool": "bash",
+                            "state": ["not", "a", "dict"],
+                        },
+                    },
+                },
+                _delta_event("still streaming"),
+            ],
+        )
+        # The bad event was swallowed; the next one still streams.
+        assert _texts(host) == ["still streaming"]
+
+    asyncio.run(run())
+
+
+def test_stream_order_seed_never_fails_a_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ordering hint sits before the prompt: it must not swallow a message."""
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def broken(session_id: str, directory: str | None = None) -> list[dict[str, Any]]:
+        raise ValueError("not json")
+
+    monkeypatch.setattr(client, "list_messages", broken)
+
+    async def run() -> None:
+        result = await runtime.create_and_start_session("plat_1", "hi")
+        # The prompt still went out despite the seed blowing up.
+        assert result.ok
+        assert client.prompted
+        assert client.prompted[-1][1] == "hi"
+
+    asyncio.run(run())
+
+
+def test_late_delta_appends_to_the_published_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delta after the buffer was dropped must extend, not replace, the text.
+
+    Otherwise a trailing chunk republishes the answer as a ``running`` fragment
+    of just that chunk — the user sees the reply shrink to its last words.
+    """
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "STREAM_FLUSH_INTERVAL_S", 0.0)
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    runtime._remember_directory("ses_x", "/work")
+    runtime._active_turns.add("ses_x")
+
+    async def run() -> None:
+        await _drain(
+            runtime,
+            [
+                _user_message_event(),
+                _assistant_message_event(),
+                _text_part_event(),
+                _delta_event("Bridge between"),
+            ],
+        )
+        await runtime._finish_streaming_parts("ses_x", "ses_x")
+        assert _texts(host)[-1] == "Bridge between"
+
+        # The turn is over now: the trailing chunk arrives as a delta.
+        runtime._active_turns.discard("ses_x")
+        host.item_upserts.clear()
+        await _drain(runtime, [_delta_event(" machines")])
+        assert _texts(host) == ["Bridge between machines"]
+        assert host.item_upserts[-1].status == "done"
+
+    asyncio.run(run())
+
+
+def test_stream_state_is_trimmed_for_long_sessions() -> None:
+    from connector.runtimes.opencode.runtime import (
+        _STREAM_STATE_MAX_ENTRIES,
+        _trim_stream_state,
+    )
+
+    session = runtime_module_session = _StreamSession()
+    for index in range(_STREAM_STATE_MAX_ENTRIES + 10):
+        session.order[f"prt_{index}"] = index
+        session.parents[f"msg_{index}"] = "msg_0"
+        session.roles[f"msg_{index}"] = "assistant"
+        session.published[f"prt_{index}"] = "x"
+    _trim_stream_state(session)
+    assert len(session.order) == _STREAM_STATE_MAX_ENTRIES
+    assert len(session.parents) == _STREAM_STATE_MAX_ENTRIES
+    assert len(session.roles) == _STREAM_STATE_MAX_ENTRIES
+    assert len(session.published) == _STREAM_STATE_MAX_ENTRIES
+    # The newest entries are the ones kept, and the counter is untouched.
+    assert "prt_0" not in session.order
+    assert f"prt_{_STREAM_STATE_MAX_ENTRIES + 9}" in session.order
+    assert runtime_module_session.next_order_seq == 1
 
 
 # --------------------------------------------------------------------------- #

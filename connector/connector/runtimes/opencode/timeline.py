@@ -232,6 +232,83 @@ def map_messages_to_timeline(
     return tuple(items)
 
 
+def map_streaming_part(
+    external_session_id: str | None,
+    part: dict[str, Any],
+    *,
+    text: str,
+    turn_id: str | None,
+    revision: int = 1,
+    streaming: bool = True,
+) -> PlatformTimelineItem | None:
+    """Map one in-flight opencode part to a platform timeline item.
+
+    Used for live updates while a turn runs: opencode emits
+    ``message.part.delta`` (an append-only ``delta`` string) and
+    ``message.part.updated`` (the whole part, sent again when it changes or
+    completes). The item id is the opencode part id — the same id
+    ``map_messages_to_timeline`` uses for that part — so the streamed item and
+    the end-of-turn snapshot replace each other instead of duplicating.
+
+    ``text`` is the accumulated content (``part["text"]`` for an updated part,
+    the running accumulation for a delta). ``streaming`` only affects the
+    status: live items are ``running``, the terminal update is ``done``.
+    """
+
+    part_id = str(part.get("id") or "")
+    if not part_id:
+        return None
+    part_type = part.get("type")
+    content = text.strip()
+    if part_type == "text":
+        if not content:
+            return None
+        return MessageTimelineItem(
+            id=part_id,
+            type="message",
+            status="running" if streaming else "done",
+            role="assistant",
+            turn_id=turn_id,
+            revision=revision,
+            content=MarkdownMessageContent(text=content),
+            source=_source(external_session_id, part_id, turn_id),
+        )
+    if part_type == "reasoning":
+        if not content:
+            return None
+        return SystemTimelineItem(
+            id=part_id,
+            type="system",
+            status="running" if streaming else "done",
+            role="system",
+            turn_id=turn_id,
+            revision=revision,
+            content=ReasoningSystemContent(text=content),
+            source=_source(external_session_id, part_id, turn_id),
+        )
+    if part_type == "tool":
+        state = part.get("state") or {}
+        tool_name = str(part.get("tool") or "tool")
+        return ToolTimelineItem(
+            id=part_id,
+            type="tool",
+            # A running tool keeps ``running`` regardless of ``streaming``: the
+            # status comes from opencode's own tool state.
+            status=_tool_status(state),
+            role="tool",
+            turn_id=turn_id,
+            revision=revision,
+            content=ToolCallContent(
+                title=tool_name,
+                input=state.get("input"),
+                output=state.get("output"),
+            ),
+            source=_source(external_session_id, part_id, turn_id),
+            metadata={"tool": tool_name, "callID": part.get("callID")},
+        )
+    return None
+
+
 def derive_session_status(messages: list[dict[str, Any]]) -> str:
     """Derive a runtime status from the tail of the message list.
 
