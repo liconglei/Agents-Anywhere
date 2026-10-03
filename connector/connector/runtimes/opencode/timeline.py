@@ -36,12 +36,14 @@ def _source(
     external_session_id: str | None,
     native_item_id: str,
     turn_id: str | None = None,
+    client_message_id: str | None = None,
 ) -> TimelineSource:
     return TimelineSource(
         runtime=RUNTIME,
         external_session_id=external_session_id,
         native_item_id=native_item_id,
         turn_id=turn_id,
+        client_message_id=client_message_id,
     )
 
 
@@ -53,8 +55,14 @@ def _tool_status(state: dict[str, Any] | None) -> str:
 def map_messages_to_timeline(
     external_session_id: str | None,
     messages: list[dict[str, Any]],
+    client_message_ids: dict[str, str] | None = None,
 ) -> tuple[PlatformTimelineItem, ...]:
-    """Expand opencode messages into an ordered tuple of platform items."""
+    """Expand opencode messages into an ordered tuple of platform items.
+
+    ``client_message_ids`` maps native user-message ids to the platform
+    ``clientMessageId`` of the web message that produced them, so clients can
+    merge the optimistic echo instead of showing the message twice.
+    """
 
     items: list[PlatformTimelineItem] = []
 
@@ -87,7 +95,12 @@ def map_messages_to_timeline(
                     role="user",
                     turn_id=turn_id,
                     content=TextMessageContent(text=text),
-                    source=_source(external_session_id, message_id, turn_id),
+                    source=_source(
+                        external_session_id,
+                        message_id,
+                        turn_id,
+                        client_message_id=(client_message_ids or {}).get(message_id),
+                    ),
                 )
             )
             continue

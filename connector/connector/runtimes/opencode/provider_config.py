@@ -7,6 +7,7 @@ from connector.runtime_protocol import RuntimeInvalidRequestError
 DEFAULT_SERVER_URL = "http://127.0.0.1:4096"
 DEFAULT_REQUEST_TIMEOUT_S = 60.0
 DEFAULT_STREAM_TIMEOUT_S = 300.0
+DEFAULT_AUTO_START = True
 
 
 def opencode_config_schema() -> dict[str, Any]:
@@ -25,7 +26,17 @@ def opencode_config_schema() -> dict[str, Any]:
             "apiKey": {
                 "type": "string",
                 "title": "Server password",
-                "description": "Optional; sent as Authorization Bearer when opencode serve runs with OPENCODE_SERVER_PASSWORD.",
+                "description": (
+                    "Optional; HTTP Basic password used when opencode serve runs "
+                    "with OPENCODE_SERVER_PASSWORD. Auto-started serve inherits "
+                    "the local environment automatically."
+                ),
+            },
+            "apiUser": {
+                "type": "string",
+                "title": "Basic auth username",
+                "description": "Username paired with the server password (default: opencode).",
+                "default": "opencode",
             },
             "requestTimeoutSeconds": {
                 "type": "number",
@@ -33,6 +44,15 @@ def opencode_config_schema() -> dict[str, Any]:
                 "maximum": 600,
                 "default": DEFAULT_REQUEST_TIMEOUT_S,
                 "title": "Request timeout (s)",
+            },
+            "autoStart": {
+                "type": "boolean",
+                "default": DEFAULT_AUTO_START,
+                "title": "Auto-start local serve",
+                "description": (
+                    "Start a local `opencode serve` child process when the "
+                    "configured serverUrl (loopback only) is unreachable."
+                ),
             },
         },
         "additionalProperties": False,
@@ -43,6 +63,7 @@ def default_config_values() -> dict[str, Any]:
     return {
         "serverUrl": DEFAULT_SERVER_URL,
         "requestTimeoutSeconds": DEFAULT_REQUEST_TIMEOUT_S,
+        "autoStart": DEFAULT_AUTO_START,
     }
 
 
@@ -61,6 +82,15 @@ def normalized_config_values(raw: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeInvalidRequestError("apiKey must be a string")
     if not key:
         values.pop("apiKey", None)
+    user = values.get("apiUser")
+    if user is not None and not isinstance(user, str):
+        raise RuntimeInvalidRequestError("apiUser must be a string")
+    if not user:
+        values.pop("apiUser", None)
+    auto = values.get("autoStart", DEFAULT_AUTO_START)
+    if isinstance(auto, str):
+        auto = auto.strip().lower() in ("1", "true", "yes", "on")
+    values["autoStart"] = bool(auto)
     return values
 
 

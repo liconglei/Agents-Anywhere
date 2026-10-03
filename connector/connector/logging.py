@@ -5,6 +5,7 @@ import inspect
 import json
 import sys
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from typing import Any
 
 from loguru import logger
@@ -31,6 +32,7 @@ class RpcLogSink:
         self.notifier = notifier
         self._tasks: set[asyncio.Task[None]] = set()
         self._sink_id: int | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     def install(
         self,
@@ -40,9 +42,18 @@ class RpcLogSink:
     ) -> RpcLogSink:
         if remove_default_sink:
             logger.remove()
-        self._sink_id = logger.add(self._write, level=level, format="{message}",
-                                   filter=lambda record: record["extra"].get("meshcall_service") != "aa.local.v2.Logs"
-                                   and not record["message"].startswith("RPC call aa.local.v2.Logs."))
+        self._sink_id = logger.add(
+            self._write,
+            level=level,
+            format="{message}",
+            filter=lambda record: record["extra"].get("meshcall_service") != "aa.local.v2.Logs"
+            and not record["message"].startswith("RPC call aa.local.v2.Logs."),
+        )
+        # Log lines can also arrive from asyncio.to_thread worker threads;
+        # remember the loop the sink was attached to so those lines are still
+        # delivered instead of dying on create_task ("no running event loop").
+        with suppress(RuntimeError):
+            self._loop = asyncio.get_running_loop()
         return self
 
     async def close(self) -> None:
@@ -68,12 +79,26 @@ class RpcLogSink:
         if exception is not None:
             payload["exception"] = _clip(exception, 16000)
 
-        result = self.notifier("connector/log", payload)
-        if not inspect.isawaitable(result):
+        task = None
+
+        def _emit() -> None:
+            nonlocal task
+            result = self.notifier("connector/log", payload)
+            if inspect.isawaitable(result):
+                task = asyncio.ensure_future(result)
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None and running is self._loop:
+            _emit()
             return
-        task = asyncio.ensure_future(result)
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        if self._loop is not None and not self._loop.is_closed():
+            with suppress(RuntimeError):
+                self._loop.call_soon_threadsafe(_emit)
 
 
 def install_rpc_log_sink(
