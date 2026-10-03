@@ -309,6 +309,13 @@ class _StreamSession:
     # ``step-finish``) must not restart from empty when opencode sends another
     # delta for it, or the client sees the answer shrink to its last chunk.
     published: dict[str, str] = field(default_factory=dict)
+    # The user's own message, accumulated from its part events so the live
+    # timeline has the prompt too — without it the in-progress turn shows only
+    # assistant output and the round looks unanchored until the turn-end
+    # snapshot supplies the prompt.
+    user_parts: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # The orderSeq reserved for that prompt (the slot before the streamed parts).
+    user_order_seq: int | None = None
     # The SSE loop and the watchdog can both finalize the same part; this keeps
     # them from publishing it twice with different statuses.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -2553,7 +2560,9 @@ class OpenCodeRuntime(AgentRuntime):
         # ``base`` items already exist (0..base-1); the incoming user message
         # takes slot ``base``, so the first streamed part is ``base + 1`` — the
         # same slot the turn-end snapshot will give it.
+        session.user_order_seq = max(session.next_order_seq - 1, base)
         session.next_order_seq = max(session.next_order_seq, base + 1)
+        session.user_parts.clear()
 
     def _stream(self, native_id: str) -> _StreamSession:
         session = self._stream_sessions.get(native_id)
@@ -2662,6 +2671,9 @@ class OpenCodeRuntime(AgentRuntime):
         part_id = str(part.get("id") or "")
         message_id = str(part.get("messageID") or "")
         session = self._stream(native_id)
+        if session.roles.get(message_id) == "user":
+            await self._publish_streamed_user_message(platform_id, native_id, message_id, part)
+            return
         if part_type in _STREAM_CONTENT_PART_TYPES:
             entry = self._streamed_part(session, part_id, message_id, part)
             if entry is None:
@@ -2689,6 +2701,57 @@ class OpenCodeRuntime(AgentRuntime):
             # the turn continues with tools. Other internal parts (step-start,
             # patch, file) say nothing about completion and are ignored.
             await self._finalize_message_parts(platform_id, native_id, message_id)
+
+    async def _publish_streamed_user_message(
+        self,
+        platform_id: str,
+        native_id: str,
+        message_id: str,
+        part: dict[str, Any],
+    ) -> None:
+        """Publish the user's prompt as soon as opencode reports its part.
+
+        The turn-end snapshot is the only thing that used to carry the prompt,
+        so while a turn was running the live timeline held assistant output with
+        nothing to anchor it to — the round looked unanchored/misplaced and only
+        settled once the snapshot arrived. The item is built by the same mapper
+        the snapshot uses (same id: the opencode message id) and carries
+        ``source.clientMessageId`` as soon as the pending-send registry matches
+        the text, so it merges with the client's optimistic echo instead of
+        doubling it.
+        """
+
+        session = self._stream(native_id)
+        parts = session.user_parts.setdefault(message_id, [])
+        if not any(existing.get("id") == part.get("id") for existing in parts):
+            parts.append(dict(part))
+        client_message_ids = self._pending_messages.resolve(
+            native_id,
+            [{"info": {"id": message_id, "role": "user"}, "parts": list(parts)}],
+        )
+        item = timeline.map_user_message_item(
+            native_id,
+            message_id,
+            list(parts),
+            client_message_id=client_message_ids.get(message_id),
+        )
+        if item is None:
+            return
+        order_seq = (
+            session.user_order_seq
+            if session.user_order_seq is not None
+            else session.next_order_seq
+        )
+        try:
+            await self.host.timeline_item_upsert(
+                item.to_platform_item(platform_id, order_seq)
+            )
+        except Exception as exc:  # noqa: BLE001 - a lost update must be visible
+            logger.warning(
+                "opencode streamed user message push failed: message={} error={}",
+                message_id,
+                exc,
+            )
 
     async def _finalize_message_parts(
         self, platform_id: str, native_id: str, message_id: str
@@ -2734,9 +2797,17 @@ class OpenCodeRuntime(AgentRuntime):
             # text). The revision only advances for items the client can see,
             # so the platform does not see a gap it cannot match.
             return
+        part_key = entry.part.get("id") or ""
+        if not streaming:
+            if session.published.get(part_key) == entry.text:
+                # Already delivered verbatim (opencode re-sends the final part
+                # after ``session.idle``): a second upsert would be an idempotent
+                # but pointless ingest.
+                return
+            # Only a final publish counts as "delivered" — a running publish is
+            # expected to be superseded by the done one with the same text.
+            session.published[part_key] = entry.text
         entry.revision += 1
-        if entry.text:
-            session.published[entry.part.get("id") or ""] = entry.text
         try:
             await self.host.timeline_item_upsert(
                 item.to_platform_item(platform_id, entry.order_seq)
@@ -2796,6 +2867,7 @@ class OpenCodeRuntime(AgentRuntime):
                     platform_id, native_id, session, entry, streaming=False
                 )
             session.parts.clear()
+            session.user_parts.clear()
         _trim_stream_state(session)
 
     async def _handle_permission_asked(

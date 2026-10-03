@@ -111,6 +111,49 @@ def _user_attachments(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return entries
 
 
+def map_user_message_item(
+    external_session_id: str | None,
+    message_id: str,
+    parts: list[dict[str, Any]],
+    *,
+    client_message_id: str | None = None,
+) -> MessageTimelineItem | None:
+    """Map one opencode *user* message to a platform item.
+
+    Shared by the snapshot mapper and the live stream so both produce the same
+    item id (the opencode message id) and the same content — otherwise the live
+    item and the turn-end snapshot would show the prompt twice, and the live one
+    would not merge with the client's optimistic echo (which only merges when
+    ``source.clientMessageId`` matches).
+    """
+
+    text = "\n".join(
+        str(part.get("text") or "")
+        for part in parts
+        if part.get("type") == "text" and not part.get("synthetic")
+    ).strip()
+    attachments = _user_attachments(parts)
+    if not text and not attachments:
+        return None
+    return MessageTimelineItem(
+        id=message_id,
+        type="message",
+        status="done",
+        role="user",
+        turn_id=message_id,
+        content=TextMessageContent(
+            text=text,
+            metadata={"attachments": attachments} if attachments else {},
+        ),
+        source=_source(
+            external_session_id,
+            message_id,
+            message_id,
+            client_message_id=client_message_id,
+        ),
+    )
+
+
 def map_messages_to_timeline(
     external_session_id: str | None,
     messages: list[dict[str, Any]],
@@ -139,33 +182,14 @@ def map_messages_to_timeline(
         turn_id = str(turn_id) if turn_id else None
 
         if role == "user":
-            text = "\n".join(
-                str(part.get("text") or "")
-                for part in parts
-                if part.get("type") == "text" and not part.get("synthetic")
-            ).strip()
-            attachments = _user_attachments(parts)
-            if not text and not attachments:
-                continue
-            items.append(
-                MessageTimelineItem(
-                    id=message_id,
-                    type="message",
-                    status="done",
-                    role="user",
-                    turn_id=turn_id,
-                    content=TextMessageContent(
-                        text=text,
-                        metadata={"attachments": attachments} if attachments else {},
-                    ),
-                    source=_source(
-                        external_session_id,
-                        message_id,
-                        turn_id,
-                        client_message_id=(client_message_ids or {}).get(message_id),
-                    ),
-                )
+            item = map_user_message_item(
+                external_session_id,
+                message_id,
+                parts,
+                client_message_id=(client_message_ids or {}).get(message_id),
             )
+            if item is not None:
+                items.append(item)
             continue
 
         if role != "assistant":
