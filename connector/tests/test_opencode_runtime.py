@@ -2768,17 +2768,33 @@ def test_streaming_deltas_are_throttled(monkeypatch: pytest.MonkeyPatch) -> None
     asyncio.run(run())
 
 
-def test_streaming_never_republishes_the_user_message(
+def test_streaming_publishes_the_user_prompt_as_its_own_item(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The live timeline must contain the prompt, not just assistant output.
+
+    Only the turn-end snapshot used to carry it, so while a turn was running the
+    round showed assistant items with nothing to anchor them to and only settled
+    once the snapshot arrived. The item must reuse the snapshot's id (the opencode
+    message id) and carry ``source.clientMessageId`` so it merges with the
+    client's optimistic echo instead of doubling it.
+    """
     from connector.runtimes.opencode import runtime as runtime_module
 
     monkeypatch.setattr(runtime_module, "STREAM_FLUSH_INTERVAL_S", 0.0)
     client, host = FakeClient(), FakeHost()
     runtime = _make_runtime(client, host)
+    runtime._remember_directory("ses_x", "/work")
+    runtime._active_turns.add("ses_x")
 
     async def run() -> None:
-        user_part = _text_part_event("hello")
+        await runtime._seed_stream_order("ses_x")
+        client.sessions["ses_x"] = {"id": "ses_x"}
+        client.messages["ses_x"] = []
+        runtime._pending_messages.register(
+            native_session_id="ses_x", client_message_id="cm_1", text="hello there"
+        )
+        user_part = _text_part_event("hello there")
         user_part["properties"]["part"]["messageID"] = USER_MESSAGE_ID
         user_part["properties"]["part"]["id"] = "prt_user_1"
         await _drain(
@@ -2786,6 +2802,46 @@ def test_streaming_never_republishes_the_user_message(
             [
                 _user_message_event(),
                 user_part,
+                _assistant_message_event(),
+                _text_part_event(),
+                _delta_event("hi"),
+            ],
+        )
+        prompt_items = [item for item in host.item_upserts if item.role == "user"]
+        assert len(prompt_items) == 1
+        prompt = prompt_items[0]
+        assert prompt.id == USER_MESSAGE_ID
+        assert prompt.status == "done"
+        assert str(prompt.content["text"]) == "hello there"
+        # Merges with the optimistic echo rather than duplicating it.
+        assert str(prompt.source.get("clientMessageId")) == "cm_1"
+        # The prompt takes the slot before the streamed assistant parts, exactly
+        # where the turn-end snapshot numbers it.
+        assert prompt.order_seq == 0
+        assistant = [item for item in host.item_upserts if item.role == "assistant"]
+        assert assistant and assistant[0].order_seq > prompt.order_seq
+
+    asyncio.run(run())
+
+
+def test_streaming_deltas_never_republish_the_user_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delta for the user's message must not turn into an assistant item."""
+
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "STREAM_FLUSH_INTERVAL_S", 0.0)
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    runtime._remember_directory("ses_x", "/work")
+    runtime._active_turns.add("ses_x")
+
+    async def run() -> None:
+        await _drain(
+            runtime,
+            [
+                _user_message_event(),
                 {
                     "type": "message.part.delta",
                     "properties": {
@@ -2798,9 +2854,8 @@ def test_streaming_never_republishes_the_user_message(
                 },
             ],
         )
-        # The user message is already on screen; streaming it back as an
-        # assistant item would duplicate or relabel it.
-        assert host.item_upserts == []
+        assert [item.role for item in host.item_upserts] == []
+        assert runtime._stream_sessions["ses_x"].parts == {}
 
     asyncio.run(run())
 
@@ -3170,6 +3225,60 @@ def test_stream_state_is_trimmed_for_long_sessions() -> None:
     assert "prt_0" not in session.order
     assert f"prt_{_STREAM_STATE_MAX_ENTRIES + 9}" in session.order
     assert runtime_module_session.next_order_seq == 1
+
+
+def _step_finish_event() -> dict[str, Any]:
+    return {
+        "type": "message.part.updated",
+        "properties": {
+            "sessionID": "ses_x",
+            "part": {
+                "id": "prt_step_finish",
+                "messageID": ASSISTANT_MESSAGE_ID,
+                "sessionID": "ses_x",
+                "type": "step-finish",
+            },
+        },
+    }
+
+
+def test_streaming_does_not_republish_an_unchanged_final_part() -> None:
+    """opencode re-sends the final part after ``session.idle``.
+
+    Once the turn finalized it, the identical restatement must not become
+    another (idempotent but pointless) ingest; changed content still goes out.
+    """
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    runtime._remember_directory("ses_x", "/work")
+    runtime._active_turns.add("ses_x")
+
+    async def run() -> None:
+        await _drain(
+            runtime,
+            [
+                _user_message_event(),
+                _assistant_message_event(),
+                _text_part_event("the answer"),
+            ],
+        )
+        assert [item.status for item in host.item_upserts] == ["running"]
+
+        # step-finish finalizes it.
+        await _drain(runtime, [_step_finish_event()])
+        assert [item.status for item in host.item_upserts] == ["running", "done"]
+
+        # opencode restates the same final part after session.idle.
+        runtime._active_turns.discard("ses_x")
+        await _drain(runtime, [_text_part_event("the answer")])
+        assert len(host.item_upserts) == 2  # unchanged, deduped
+
+        # Changed content still goes through.
+        await _drain(runtime, [_text_part_event("the answer, extended")])
+        assert _texts(host)[-1] == "the answer, extended"
+        assert len(host.item_upserts) == 3
+
+    asyncio.run(run())
 
 
 # --------------------------------------------------------------------------- #
