@@ -97,17 +97,17 @@ def normalized_config_values(raw: dict[str, Any]) -> dict[str, Any]:
 def opencode_capabilities() -> dict[str, bool]:
     return {
         "modelCatalog": True,
-        "permissionCatalog": False,
+        "permissionCatalog": True,
         "sessionDiscovery": True,
         "sessionSnapshot": True,
         "sessionState": True,
-        "sessionNotices": False,
+        "sessionNotices": True,
         "createAndStartSession": True,
         "startTurn": True,
-        "steerTurn": False,
+        "steerTurn": True,
         "interruptTurn": True,
-        "commands": False,
-        "interactions": False,
-        "attachments": False,
+        "commands": True,
+        "interactions": True,
+        "attachments": True,
         "ipc": True,
     }

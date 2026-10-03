@@ -6,6 +6,7 @@ All tests run against fakes — no live ``opencode serve`` required.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -15,6 +16,7 @@ from typing import Any
 import pytest
 
 from connector.runtime_protocol import (
+    CAPABILITY_CATALOG_PERMISSION,
     CAPABILITY_SESSION_SEND_MESSAGE,
     RuntimeConfig,
     RuntimeInvalidRequestError,
@@ -25,7 +27,10 @@ from connector.runtimes.opencode.pending_messages import (
     OpenCodePendingClientMessageRegistry,
 )
 from connector.runtimes.opencode.provider import OpenCodeProvider
-from connector.runtimes.opencode.runtime import OpenCodeRuntime
+from connector.runtimes.opencode.runtime import (
+    PERMISSION_SELECTION_KEY,
+    OpenCodeRuntime,
+)
 from connector.runtimes.opencode.sdk.client import (
     OpenCodeClient,
     OpenCodeClientError,
@@ -76,6 +81,11 @@ def test_capabilities_declare_core_surface() -> None:
     assert caps["sessionDiscovery"] is True
     assert caps["startTurn"] is True
     assert caps["interruptTurn"] is True
+    # Verified against serve 1.18.34: prompt file parts accept local file://
+    # URLs, so platform uploads are supported.
+    assert caps["attachments"] is True
+    assert caps["commands"] is True
+    assert caps["interactions"] is True
 
 
 # --------------------------------------------------------------------------- #
@@ -169,6 +179,15 @@ def test_derive_session_status() -> None:
 # runtime with a fake client
 # --------------------------------------------------------------------------- #
 
+# ``GET /agent`` payload shape, trimmed to what the runtime reads: only
+# ``primary`` agents are user-selectable modes.
+_FAKE_AGENTS: tuple[dict[str, Any], ...] = (
+    {"name": "build", "mode": "primary", "permission": [{"permission": "*", "pattern": "*", "action": "allow"}]},
+    {"name": "plan", "mode": "primary", "permission": [{"permission": "edit", "pattern": "*", "action": "deny"}]},
+    {"name": "explore", "mode": "subagent", "permission": []},
+    {"name": "compaction", "mode": "primary", "permission": []},
+)
+
 
 class FakeClient:
     """Mimics the OpenCodeClient surface used by the runtime."""
@@ -184,6 +203,28 @@ class FakeClient:
         self.api_key: str | None = None
         self.api_user: str | None = None
         self._events: list[dict[str, Any]] = []
+        # Built-in slash command observability.
+        self.skill_calls: list[tuple[str, str, str, str | None]] = []
+        self.model_switches: list[tuple[str, str, str, str | None, str | None]] = []
+        self.summaries: list[tuple[str, str, str, str | None]] = []
+        self.compacts: list[tuple[str, str | None]] = []
+        self.forks: list[tuple[str, str | None, str | None]] = []
+        self.shares: list[tuple[str, str | None]] = []
+        self.reverts: list[tuple[str, str | None, str | None]] = []
+        # prompt_async part payloads (attachments land here).
+        self.prompt_parts: list[tuple[str, tuple]] = []
+        # prompt_async agent (Build/Plan mode) per session.
+        self.prompt_agents: list[tuple[str, str | None]] = []
+        # Build/Plan permission presets.
+        self.agents: list[dict[str, Any]] = list(_FAKE_AGENTS)
+        self.agent_directories: list[str | None] = []
+        # Commands / skills.
+        self.skills: list[dict[str, Any]] = []
+        self.command_directories: list[str | None] = []
+        # Interaction replies.
+        self.permission_replies: list[tuple[str, str, str, str | None]] = []
+        self.question_replies: list[tuple[str, str, str, str | None]] = []
+        self.question_rejects: list[tuple[str, str, str | None]] = []
 
     def set_credentials(self, api_user: str, api_key: str) -> None:
         if api_key:
@@ -226,16 +267,113 @@ class FakeClient:
         model: dict[str, str] | None = None,
         agent: str | None = None,
         directory: str | None = None,
+        extra_parts: tuple = (),
     ) -> None:
         self.prompted.append((session_id, content, model, directory))
+        self.prompt_parts.append((session_id, tuple(extra_parts)))
+        self.prompt_agents.append((session_id, agent))
         self.status[session_id] = {"type": "busy"}
+
+    async def list_agents(self, directory: str | None = None) -> list[dict[str, Any]]:
+        self.agent_directories.append(directory)
+        return list(self.agents)
 
     async def abort(self, session_id: str, directory: str | None = None) -> None:
         self.aborted.append(session_id)
         self.status[session_id] = {"type": "idle"}
 
+    # --- built-in slash command surface (used by execute_command tests) --- #
+    # ``list_commands`` returns user-defined skills only; built-in slash
+    # commands are injected by the runtime. Return an empty list here so
+    # tests can assert the runtime adds builtins on top.
+    async def list_commands(self, directory: str | None = None) -> list[dict[str, Any]]:
+        self.command_directories.append(directory)
+        return list(self.skills)
+
+    async def execute_command(
+        self,
+        session_id: str,
+        command: str,
+        arguments: str = "",
+        directory: str | None = None,
+    ) -> dict[str, Any] | None:
+        self.skill_calls.append((session_id, command, arguments, directory))
+        return None
+
+    async def switch_session_model(
+        self,
+        session_id: str,
+        model_id: str,
+        provider_id: str,
+        variant: str | None = None,
+        directory: str | None = None,
+    ) -> None:
+        self.model_switches.append(
+            (session_id, model_id, provider_id, variant, directory)
+        )
+
+    async def summarize_session(
+        self,
+        session_id: str,
+        provider_id: str,
+        model_id: str,
+        directory: str | None = None,
+    ) -> bool:
+        self.summaries.append((session_id, provider_id, model_id, directory))
+        return True
+
+    async def fork_session(
+        self,
+        session_id: str,
+        message_id: str | None = None,
+        directory: str | None = None,
+    ) -> dict[str, Any] | None:
+        self.forks.append((session_id, message_id, directory))
+        return {"id": "ses_forked", "title": "forked"}
+
+    async def share_session(
+        self, session_id: str, directory: str | None = None
+    ) -> dict[str, Any] | None:
+        self.shares.append((session_id, directory))
+        return {"id": session_id, "share": {"url": "https://opncd.ai/share/test123"}}
+
+    async def revert_latest_message(
+        self,
+        session_id: str,
+        message_id: str | None = None,
+        directory: str | None = None,
+    ) -> bool:
+        self.reverts.append((session_id, message_id, directory))
+        return True
+
     async def session_status_map(self, directory: str | None = None) -> dict[str, Any]:
         return self.status
+
+    async def reply_permission(
+        self,
+        session_id: str,
+        permission_id: str,
+        response: str,
+        directory: str | None = None,
+    ) -> None:
+        self.permission_replies.append((session_id, permission_id, response, directory))
+
+    async def reply_question(
+        self,
+        session_id: str,
+        question_id: str,
+        reply: str,
+        directory: str | None = None,
+    ) -> None:
+        self.question_replies.append((session_id, question_id, reply, directory))
+
+    async def reject_question(
+        self,
+        session_id: str,
+        question_id: str,
+        directory: str | None = None,
+    ) -> None:
+        self.question_rejects.append((session_id, question_id, directory))
 
     async def provider_overview(self) -> dict[str, Any]:
         return {
@@ -249,7 +387,37 @@ class FakeClient:
                             "id": "nemotron35-dspark",
                             "name": "Nemotron 35 DSpark",
                             "limit": {"context": 262144, "output": 32768},
-                        }
+                            "capabilities": {
+                                "toolcall": True,
+                                "reasoning": True,
+                                "output": {"text": True},
+                            },
+                            "variants": {
+                                "low": {"reasoningEffort": "low"},
+                                "medium": {"reasoningEffort": "medium"},
+                                "high": {"reasoningEffort": "high"},
+                            },
+                        },
+                        "embed-only": {
+                            "id": "embed-only",
+                            "name": "Embed Only",
+                            "limit": {"context": 8192, "output": 0},
+                            "capabilities": {
+                                "toolcall": False,
+                                "reasoning": False,
+                                "output": {"text": True},
+                            },
+                        },
+                        "image-only": {
+                            "id": "image-only",
+                            "name": "Image Only",
+                            "limit": {"context": 4096, "output": 0},
+                            "capabilities": {
+                                "toolcall": True,
+                                "reasoning": False,
+                                "output": {"text": False, "image": True},
+                            },
+                        },
                     },
                 }
             ],
@@ -276,6 +444,9 @@ class FakeHost:
         self.state_updates: list[tuple[str, str]] = []
         self.turn_ended: list[tuple[str, str]] = []
         self.health: list[tuple[str, dict[str, Any] | None]] = []
+        self.attachment_downloads: list[tuple[str, str]] = []
+        self.attachment_bytes: dict[str, bytes] = {}
+        self.notices: list[Any] = []
 
     async def timeline_sync(
         self, session_id: str, runtime: str, items: tuple, external_session_id: str | None = None, complete: bool = False
@@ -299,6 +470,23 @@ class FakeHost:
 
     async def runtime_health_update(self, status: str, detail: dict[str, Any] | None = None) -> None:
         self.health.append((status, detail))
+
+    async def notice_upsert(self, notice: Any) -> None:
+        self.notices.append(notice)
+
+    async def attachment_download(self, session_id: str, file_id: str) -> Any:
+        from connector.runtime_protocol import RuntimeAttachmentContent
+
+        self.attachment_downloads.append((session_id, file_id))
+        content = self.attachment_bytes.get(file_id)
+        if content is None:
+            raise KeyError(f"no attachment bytes registered for {file_id}")
+        return RuntimeAttachmentContent(
+            file_id=file_id,
+            name="note.txt",
+            media_type="text/plain",
+            content=content,
+        )
 
 
 def _make_runtime(
@@ -641,6 +829,7 @@ def test_get_session_state_busy() -> None:
     runtime = _make_runtime(client, host)
 
     async def run() -> None:
+        client.sessions["ses_c"] = {"id": "ses_c"}
         client.status["ses_c"] = {"type": "busy"}
         state = await runtime.get_session_state("ses_c", "ses_c")
         assert state.status == "running"
@@ -657,6 +846,7 @@ def test_get_session_state_reasserts_idle_once() -> None:
     runtime = _make_runtime(client, host)
 
     async def run() -> None:
+        client.sessions["ses_h"] = {"id": "ses_h"}
         client.status["ses_h"] = {"type": "idle"}
         state = await runtime.get_session_state("plat_h", "ses_h")
         assert state.status == "idle"
@@ -1251,7 +1441,17 @@ def test_serve_command_prefers_opencode_exe(monkeypatch: pytest.MonkeyPatch) -> 
     )
     monkeypatch.setattr(serve_process, "check_version_output", lambda candidate, env: None)
     assert OpenCodeRuntime._serve_command(4096) == [
-        r"C:\bin\opencode.cmd", "serve", "--hostname", "127.0.0.1", "--port", "4096"
+        r"C:\bin\opencode.cmd",
+        "serve",
+        # --print-logs is required: without it serve dies when any other
+        # opencode process holds the shared, exclusively-opened log file.
+        "--print-logs",
+        "--log-level",
+        "INFO",
+        "--hostname",
+        "127.0.0.1",
+        "--port",
+        "4096",
     ]
 
 
@@ -1263,7 +1463,16 @@ def test_serve_command_falls_back_to_npx(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     monkeypatch.setattr(serve_process, "check_version_output", lambda candidate, env: None)
     assert OpenCodeRuntime._serve_command(5000) == [
-        r"C:\node\npx.cmd", "opencode", "serve", "--hostname", "127.0.0.1", "--port", "5000"
+        r"C:\node\npx.cmd",
+        "opencode",
+        "serve",
+        "--print-logs",
+        "--log-level",
+        "INFO",
+        "--hostname",
+        "127.0.0.1",
+        "--port",
+        "5000",
     ]
 
 
@@ -1277,7 +1486,16 @@ def test_serve_command_falls_back_when_version_check_fails(monkeypatch: pytest.M
         serve_process, "check_version_output", lambda candidate, env: "exited with code 1"
     )
     assert OpenCodeRuntime._serve_command(4096) == [
-        r"C:\bin\npx.cmd", "opencode", "serve", "--hostname", "127.0.0.1", "--port", "4096"
+        r"C:\bin\npx.cmd",
+        "opencode",
+        "serve",
+        "--print-logs",
+        "--log-level",
+        "INFO",
+        "--hostname",
+        "127.0.0.1",
+        "--port",
+        "4096",
     ]
 
 
@@ -1461,11 +1679,50 @@ def test_auto_start_adopts_serve_when_port_has_unlisted_listener(
     asyncio.run(run())
 
 
-def test_auto_start_refuses_spawn_when_log_lock_held(
+def test_auto_start_spawns_despite_the_log_lock_holder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Production failure: every spawn died fastfail because a live opencode
-    instance held the log lock -> skip the doomed spawn, say why, spawn=never."""
+    """A TUI holding opencode.log must not wedge auto-start.
+
+    Production failure: ``is_serve_log_lock_held`` reported True (the user's
+    opencode TUI holds the log file), so the connector never spawned, waited
+    17s for a serve that did not exist, and failed ``runtime.start`` three
+    times. On serve 1.18.34 a second ``opencode serve`` starts fine while that
+    file is held, so the probe may only delay a spawn, never block it.
+    """
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    state = {"calls": 0}
+
+    async def down_then_up() -> dict:
+        state["calls"] += 1
+        if state["calls"] <= 2:  # precheck + one adoption poll fail
+            raise OpenCodeClientError("All connection attempts failed")
+        return {"healthy": True, "version": "1.18"}
+
+    monkeypatch.setattr(client, "health", down_then_up)
+    monkeypatch.setattr(serve_process, "is_serve_log_lock_held", lambda environment: True)
+    monkeypatch.setattr(runtime_module, "PORT_ADOPTION_WAIT_S", 0.01)
+    proc = _FakeProc()
+
+    async def fake_spawn(*args: Any, **kwargs: Any) -> _FakeProc:
+        return proc
+
+    _patch_serve(monkeypatch, fake_spawn)
+
+    async def run() -> None:
+        await runtime._auto_start_serve("http://127.0.0.1:4096")
+        assert runtime._serve is not None and runtime._serve.process is proc
+
+    asyncio.run(run())
+
+
+def test_auto_start_reports_the_log_holder_when_the_spawn_dies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hint is still worth surfacing — but only once the spawn really died."""
     from connector.runtimes.opencode import runtime as runtime_module
 
     client, host = FakeClient(), FakeHost()
@@ -1478,15 +1735,80 @@ def test_auto_start_refuses_spawn_when_log_lock_held(
     monkeypatch.setattr(serve_process, "is_serve_log_lock_held", lambda environment: True)
     monkeypatch.setattr(runtime_module, "PORT_ADOPTION_WAIT_S", 0.01)
 
+    async def fake_spawn(*args: Any, **kwargs: Any) -> _ExitedProc:
+        return _ExitedProc("")
+
+    _patch_serve(monkeypatch, fake_spawn)
+
+    async def not_listening(host_: str, port_: int) -> bool:
+        return False
+
+    monkeypatch.setattr(OpenCodeRuntime, "_port_listening", staticmethod(not_listening))
+
+    async def run() -> None:
+        with pytest.raises(RuntimeError, match="opencode.log"):
+            await runtime._auto_start_serve("http://127.0.0.1:4096")
+        assert runtime._serve is None
+
+    asyncio.run(run())
+
+
+def test_auto_start_adopts_a_serve_behind_the_log_holder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A booting serve is worth adopting before spawning our own."""
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    state = {"calls": 0}
+
+    async def booting_health() -> dict:
+        state["calls"] += 1
+        if state["calls"] <= 1:  # precheck fails, then the booting serve answers
+            raise OpenCodeClientError("connection refused")
+        return {"healthy": True, "version": "1.18"}
+
+    monkeypatch.setattr(client, "health", booting_health)
+    monkeypatch.setattr(serve_process, "is_serve_log_lock_held", lambda environment: True)
+    monkeypatch.setattr(runtime_module, "PORT_ADOPTION_WAIT_S", 0.01)
+
     async def no_spawn(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("must not spawn while the single-instance log lock is held")
+        raise AssertionError("must adopt the serve that just answered health")
 
     _patch_serve(monkeypatch, no_spawn)
 
     async def run() -> None:
-        with pytest.raises(RuntimeError, match="日志锁"):
-            await runtime._auto_start_serve("http://127.0.0.1:4096")
+        await runtime._auto_start_serve("http://127.0.0.1:4096")
         assert runtime._serve is None
+
+    asyncio.run(run())
+
+
+def test_auto_start_still_refuses_when_a_serve_answers_401(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live serve with credentials we do not have is unspawnable-around."""
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def denied() -> dict:
+        raise OpenCodeClientError("opencode GET /global/health failed: 401", status_code=401)
+
+    monkeypatch.setattr(client, "health", denied)
+    monkeypatch.setattr(serve_process, "is_serve_log_lock_held", lambda environment: True)
+    monkeypatch.setattr(runtime_module, "PORT_ADOPTION_WAIT_S", 0.01)
+
+    async def no_spawn(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("must not spawn while a 401 serve owns the port")
+
+    _patch_serve(monkeypatch, no_spawn)
+
+    async def run() -> None:
+        with pytest.raises(RuntimeError, match="401"):
+            await runtime._auto_start_serve("http://127.0.0.1:4096")
 
     asyncio.run(run())
 
@@ -1691,10 +2013,562 @@ def test_model_catalog_from_provider_overview() -> None:
 
     async def run() -> None:
         catalog = await runtime.list_model_catalog()
+        # Non-chat models (embed-only: no toolcall, image-only: no text output)
+        # are filtered out, leaving the single chat-capable model.
         assert len(catalog.models) == 1
         item = catalog.models[0]
         assert item.id == "local/nemotron35-dspark"
         assert "262144" in (item.description or "")
+        # Reasoning items are derived from the model's ``variants`` map; the
+        # catalog must not report an empty effort list for a reasoning model.
+        assert [effort.id for effort in item.reasoning_items] == ["low", "medium", "high"]
+        assert [effort.title for effort in item.reasoning_items] == ["Low", "Medium", "High"]
+        # With reasoning items present, the model itself has no selection id;
+        # each variant carries its own selection id instead.
+        assert item.selection_id is None
+        assert all(effort.selection_id for effort in item.reasoning_items)
+        assert all(
+            effort.selection_id.startswith("sel_model_") for effort in item.reasoning_items
+        )
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
+# permission catalog (Build / Plan)
+# --------------------------------------------------------------------------- #
+
+
+def test_permission_catalog_exposes_build_and_plan() -> None:
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        catalog = await runtime.list_permission_catalog()
+        # Only user-selectable primary agents become presets: the ``explore``
+        # subagent and opencode's internal ``compaction`` agent are not modes.
+        assert [item.id for item in catalog.permissions] == ["build", "plan"]
+        assert [item.title for item in catalog.permissions] == ["Build", "Plan"]
+        # Selection ids are opaque protocol ids (``protocol_selection_id``
+        # hashes its identity), and Build is what an unset picker shows.
+        assert all(
+            item.selection_id.startswith("sel_permission_")
+            for item in catalog.permissions
+        )
+        assert len({item.selection_id for item in catalog.permissions}) == 2
+        assert [item.default for item in catalog.permissions] == [True, False]
+        assert catalog.permissions[1].metadata["runtimeSettings"] == {"agent": "plan"}
+        # Agents are read once per project directory and cached.
+        assert client.agent_directories == [None]
+        await runtime.list_permission_catalog()
+        assert client.agent_directories == [None]
+
+        queried = await runtime.list_permission_catalog(query="plan")
+        assert [item.id for item in queried.permissions] == ["plan"]
+
+    asyncio.run(run())
+
+
+def test_permission_catalog_skips_absent_presets() -> None:
+    client, host = FakeClient(), FakeHost()
+    # A project without the plan agent must not offer a mode it cannot run.
+    client.agents = [{"name": "build", "mode": "primary", "permission": []}]
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        catalog = await runtime.list_permission_catalog()
+        assert [item.id for item in catalog.permissions] == ["build"]
+
+    asyncio.run(run())
+
+
+def test_permission_catalog_survives_agent_list_failure() -> None:
+    class BrokenAgentClient(FakeClient):
+        async def list_agents(self, directory: str | None = None) -> list[dict[str, Any]]:
+            raise OpenCodeClientError("opencode GET /agent failed: 500")
+
+    runtime = _make_runtime(BrokenAgentClient(), FakeHost())
+
+    async def run() -> None:
+        catalog = await runtime.list_permission_catalog()
+        # An unreadable agent list means no known presets: report an empty
+        # catalog instead of offering a mode that may not exist.
+        assert catalog.permissions == ()
+
+    asyncio.run(run())
+
+
+def test_capabilities_declare_permission_catalog() -> None:
+    runtime = _make_runtime(FakeClient(), FakeHost())
+
+    async def run() -> None:
+        runtime_caps = await runtime.get_runtime_capabilities()
+        session_caps = await runtime.get_session_capabilities("plat_1")
+        assert CAPABILITY_CATALOG_PERMISSION in {
+            capability.capability_id for capability in runtime_caps.capabilities
+        }
+        # The Server projects a session's effective capabilities from the
+        # session-scoped set only, so the mirror is what makes the client
+        # render the mode selector on an open session.
+        session_entries = {
+            capability.capability_id: capability
+            for capability in session_caps.capabilities
+        }
+        assert CAPABILITY_CATALOG_PERMISSION in session_entries
+        assert session_entries[CAPABILITY_CATALOG_PERMISSION].session_id == "plat_1"
+
+    asyncio.run(run())
+
+
+async def _permission_selections(runtime: OpenCodeRuntime) -> dict[str, str]:
+    catalog = await runtime.list_permission_catalog()
+    return {item.id: item.selection_id for item in catalog.permissions}
+
+
+def test_selected_mode_runs_on_the_next_turn() -> None:
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        selections = await _permission_selections(runtime)
+        await runtime.create_and_start_session("plat_1", "hi")
+        native_id = next(iter(client.sessions))
+
+        result = await runtime.update_session_selections(
+            "plat_1", native_id, {PERMISSION_SELECTION_KEY: selections["plan"]}
+        )
+        assert result.ok, result.message
+        assert runtime._selections["plat_1"][PERMISSION_SELECTION_KEY] == selections["plan"]
+
+        # opencode switches Build/Plan per prompt: the agent rides on the next
+        # prompt (and opencode then records it as ``session["agent"]``).
+        await runtime.start_turn("plat_1", native_id, "again")
+        assert client.prompt_agents[-1] == (native_id, "plan")
+
+        await runtime.update_session_selections(
+            "plat_1", native_id, {PERMISSION_SELECTION_KEY: selections["build"]}
+        )
+        await runtime.start_turn("plat_1", native_id, "and again")
+        assert client.prompt_agents[-1] == (native_id, "build")
+
+    asyncio.run(run())
+
+
+def test_create_session_applies_the_selected_mode() -> None:
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        selections = await _permission_selections(runtime)
+        await runtime.create_and_start_session(
+            "plat_1", "hi", selections={PERMISSION_SELECTION_KEY: selections["plan"]}
+        )
+        native_id = next(iter(client.sessions))
+        # The mode must apply to the very first turn, and be remembered even
+        # though the client will not resend the selection.
+        assert client.prompt_agents[-1] == (native_id, "plan")
+        await runtime.start_turn("plat_1", native_id, "again")
+        assert client.prompt_agents[-1] == (native_id, "plan")
+
+    asyncio.run(run())
+
+
+def test_steer_turn_keeps_the_selected_mode() -> None:
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        selections = await _permission_selections(runtime)
+        await runtime.create_and_start_session(
+            "plat_1", "hi", selections={PERMISSION_SELECTION_KEY: selections["plan"]}
+        )
+        native_id = next(iter(client.sessions))
+        await runtime.steer_turn("plat_1", native_id, "wait, do this instead")
+        assert client.prompt_agents[-1] == (native_id, "plan")
+
+    asyncio.run(run())
+
+
+def test_update_selections_rejects_unknown_permission_id() -> None:
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        await runtime.create_and_start_session("plat_1", "hi")
+        native_id = next(iter(client.sessions))
+        result = await runtime.update_session_selections(
+            "plat_1", native_id, {PERMISSION_SELECTION_KEY: "sel_permission_bogus"}
+        )
+        assert not result.ok
+        assert result.code == "opencode_invalid_selection"
+        # Nothing was stored: the caller keeps its previous mode.
+        assert PERMISSION_SELECTION_KEY not in runtime._selections.get("plat_1", {})
+
+    asyncio.run(run())
+
+
+def test_turn_without_permission_selection_leaves_the_mode_alone() -> None:
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        await runtime.create_and_start_session(
+            "plat_1", "hi", selections={"model": "local/x"}
+        )
+        native_id = next(iter(client.sessions))
+        # No mode was ever picked on this session, so the agent stays unset and
+        # opencode keeps whatever mode the user chose in its own UI.
+        assert client.prompt_agents[-1] == (native_id, None)
+        assert PERMISSION_SELECTION_KEY not in runtime._selections["plat_1"]
+
+    asyncio.run(run())
+
+
+def test_session_selections_read_back_the_mode_after_restart() -> None:
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        selections = await _permission_selections(runtime)
+        native_id = "ses_native"
+        client.sessions[native_id] = {"id": native_id, "agent": "plan"}
+        await runtime.update_session_selections(
+            "plat_1", native_id, {PERMISSION_SELECTION_KEY: selections["plan"]}
+        )
+
+        # Simulate a connector restart: the in-memory selections are gone, so
+        # the mode has to come from the agent opencode recorded on the session.
+        runtime._selections.clear()
+        state = await runtime.get_session_state("plat_1", native_id)
+        assert state is not None
+        assert state.selections[PERMISSION_SELECTION_KEY] == selections["plan"]
+
+        # Agents that are not user-selectable modes (a subagent, or
+        # ``compaction``) report no mode rather than a wrong one.
+        for agent in ("explore", "compaction", "", None):
+            client.sessions[native_id]["agent"] = agent
+            runtime._selections.clear()
+            state = await runtime.get_session_state("plat_1", native_id)
+            assert state is not None
+            assert PERMISSION_SELECTION_KEY not in state.selections
+
+        # In-memory selections win: a freshly picked mode is reported before
+        # the next turn has actually run it.
+        client.sessions[native_id]["agent"] = "build"
+        await runtime.update_session_selections(
+            "plat_1", native_id, {PERMISSION_SELECTION_KEY: selections["plan"]}
+        )
+        state = await runtime.get_session_state("plat_1", native_id)
+        assert state is not None
+        assert state.selections[PERMISSION_SELECTION_KEY] == selections["plan"]
+
+    asyncio.run(run())
+
+
+def test_mode_selection_is_dropped_when_the_preset_is_absent() -> None:
+    client, host = FakeClient(), FakeHost()
+    client.agents = [{"name": "build", "mode": "primary", "permission": []}]
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        plan_selection = "sel_permission_plan"
+        await runtime.create_and_start_session(
+            "plat_1", "hi", selections={PERMISSION_SELECTION_KEY: plan_selection}
+        )
+        native_id = next(iter(client.sessions))
+        # serve accepts an unknown agent name and then runs no turn at all, so
+        # a mode that is not installed must not be sent.
+        assert client.prompt_agents[-1] == (native_id, None)
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
+# slash commands (skills are directory-scoped in opencode)
+# --------------------------------------------------------------------------- #
+
+
+def test_session_commands_are_read_from_the_session_directory() -> None:
+    client, host = FakeClient(), FakeHost()
+    client.skills = [{"name": "init", "description": "guided setup", "template": "..."}]
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        await runtime.create_and_start_session("plat_1", "hi", cwd="/work")
+        native_id = next(iter(client.sessions))
+        commands = await runtime.list_commands("plat_1", native_id)
+        assert [command.id for command in commands][-1] == "init"
+        # ``GET /command`` answers 503 without ``?directory=``, so the session's
+        # own workspace has to be passed or no skill ever shows up.
+        assert client.command_directories == ["/work"]
+
+        # The runtime-level list has no session context and falls back to the
+        # serve cwd instead of guessing a project.
+        await runtime.list_runtime_commands()
+        assert client.command_directories[-1] is None
+
+    asyncio.run(run())
+
+
+def test_command_list_failure_keeps_builtins() -> None:
+    class BrokenCommandClient(FakeClient):
+        async def list_commands(self, directory: str | None = None) -> list[dict[str, Any]]:
+            raise OpenCodeClientError("opencode GET /command failed: 503")
+
+    runtime = _make_runtime(BrokenCommandClient(), FakeHost())
+
+    async def run() -> None:
+        commands = await runtime.list_commands("plat_1", "ses_x")
+        assert commands, "builtins must survive an unreadable command list"
+        assert all(command.metadata.get("builtin") for command in commands)
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
+# interactions (approvals and questions)
+# --------------------------------------------------------------------------- #
+
+
+def _permission_event(
+    session_id: str, permission_id: str = "per_1", action: str = "bash"
+) -> dict[str, Any]:
+    return {
+        "type": "permission.v2.asked",
+        "properties": {
+            "id": permission_id,
+            "sessionID": session_id,
+            "action": action,
+            "resources": ["rm -rf build"],
+        },
+    }
+
+
+def _question_event(session_id: str, question_id: str = "que_1") -> dict[str, Any]:
+    return {
+        "type": "question.v2.asked",
+        "properties": {
+            "id": question_id,
+            "sessionID": session_id,
+            "questions": [
+                {
+                    "question": "Which database should I use?",
+                    "options": [{"label": "PostgreSQL"}, {"label": "SQLite"}],
+                }
+            ],
+        },
+    }
+
+
+async def _drain(runtime: OpenCodeRuntime, events: list[dict[str, Any]]) -> None:
+    for event in events:
+        await runtime._handle_event(
+            {"type": event["type"], "properties": event["properties"]}
+        )
+
+
+def test_permission_approval_resumes_the_tracked_turn() -> None:
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        await runtime.create_and_start_session("plat_1", "hi", cwd="/work")
+        native_id = next(iter(client.sessions))
+        await _drain(runtime, [_permission_event(native_id)])
+        # A blocking approval must take the platform session out of "running".
+        assert ("plat_1", "waiting_approval") in host.state_updates
+
+        notices = await runtime.get_session_notices("plat_1", native_id)
+        notice_id = next(
+            notice.notice_id for notice in notices if notice.interaction_type == "approval"
+        )
+        result = await runtime.respond_interaction("plat_1", notice_id, "approve")
+        assert result.ok, result.message
+        assert client.permission_replies == [
+            (native_id, "per_1", "once", "/work")
+        ]
+        # Without this the composer stays blocked until the turn ends.
+        assert host.state_updates[-1] == ("plat_1", "running")
+        assert await runtime.get_session_notices("plat_1", native_id) == ()
+
+    asyncio.run(run())
+
+
+def test_question_notice_lists_options_and_blocks_the_turn() -> None:
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        await runtime.create_and_start_session("plat_1", "hi", cwd="/work")
+        native_id = next(iter(client.sessions))
+        await _drain(runtime, [_question_event(native_id)])
+        # A question blocks the turn exactly like a permission request.
+        assert ("plat_1", "waiting_approval") in host.state_updates
+
+        notices = await runtime.get_session_notices("plat_1", native_id)
+        notice = next(n for n in notices if n.interaction_type == "question")
+        # The selectable options have to reach the user, otherwise the notice
+        # only says "OpenCode 向你提问" and cannot be answered sensibly.
+        assert "PostgreSQL" in (notice.message or "")
+        assert "SQLite" in (notice.message or "")
+        assert notice.context.get("options") == ["PostgreSQL", "SQLite"]
+
+        result = await runtime.respond_interaction(
+            "plat_1", notice.notice_id, "reply", {"reply": "PostgreSQL"}
+        )
+        assert result.ok, result.message
+        assert client.question_replies == [
+            (native_id, "que_1", "PostgreSQL", "/work")
+        ]
+        assert host.state_updates[-1] == ("plat_1", "running")
+
+    asyncio.run(run())
+
+
+def test_question_dismiss_uses_the_reject_route() -> None:
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        await runtime.create_and_start_session("plat_1", "hi", cwd="/work")
+        native_id = next(iter(client.sessions))
+        await _drain(runtime, [_question_event(native_id)])
+        notice = next(
+            n
+            for n in await runtime.get_session_notices("plat_1", native_id)
+            if n.interaction_type == "question"
+        )
+        result = await runtime.respond_interaction(
+            "plat_1", notice.notice_id, "reply", {"reply": "cancel"}
+        )
+        assert result.ok, result.message
+        assert client.question_rejects == [(native_id, "que_1", "/work")]
+        assert client.question_replies == []
+
+        # An empty answer is rejected by opencode, so refuse it locally.
+        await _drain(runtime, [_question_event(native_id, "que_2")])
+        notice = next(
+            n
+            for n in await runtime.get_session_notices("plat_1", native_id)
+            if n.context.get("questionId") == "que_2"
+        )
+        result = await runtime.respond_interaction(
+            "plat_1", notice.notice_id, "reply", {"reply": "  "}
+        )
+        assert not result.ok
+        assert result.code == "empty_reply"
+
+    asyncio.run(run())
+
+
+def test_question_closed_by_opencode_resolves_the_notice() -> None:
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        await runtime.create_and_start_session("plat_1", "hi", cwd="/work")
+        native_id = next(iter(client.sessions))
+        await _drain(runtime, [_question_event(native_id)])
+        assert len(await runtime.get_session_notices("plat_1", native_id)) == 1
+        # opencode resolves/rejects questions on its own too; the card must not
+        # stay on screen forever in that case.
+        await _drain(
+            runtime,
+            [{"type": "question.v2.replied", "properties": {"id": "que_1", "sessionID": native_id}}],
+        )
+        assert await runtime.get_session_notices("plat_1", native_id) == ()
+        assert host.notices[-1].status == "resolved"
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
+# SDK client request/response contract (verified against serve 1.18.34)
+# --------------------------------------------------------------------------- #
+
+
+def _mock_client(
+    handler: Any,
+) -> tuple[OpenCodeClient, list[tuple[str, str, str]]]:
+    import httpx
+
+    calls: list[tuple[str, str, str]] = []
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        calls.append(
+            (request.method, request.url.path, request.content.decode() or "")
+        )
+        return handler(request)
+
+    client = OpenCodeClient("http://127.0.0.1:4096")
+    client._http = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle), base_url=client.base_url
+    )
+    return client, calls
+
+
+def test_client_question_reply_uses_the_v2_answers_payload() -> None:
+    import httpx
+
+    def ok(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(204)
+
+    client, calls = _mock_client(ok)
+
+    async def run() -> None:
+        await client.reply_question(
+            "ses_x", "que_1", "PostgreSQL", directory="/work"
+        )
+        # opencode 1.18.34 rejects ``{"reply": ...}`` with
+        # ``Missing key at ["answers"]``; only the V2 route exists at all.
+        method, path, body = calls[0]
+        assert method == "POST"
+        assert path == "/api/session/ses_x/question/que_1/reply"
+        assert json.loads(body) == {"answers": [["PostgreSQL"]]}
+        await client.reject_question("ses_x", "que_1", directory="/work")
+        assert calls[1][1] == "/api/session/ses_x/question/que_1/reject"
+        await client.close()
+
+    asyncio.run(run())
+
+
+def test_client_rejects_the_web_ui_fallback() -> None:
+    """An unknown opencode route answers 200 + HTML, which must not pass."""
+
+    import httpx
+
+    def spa(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, text="<!doctype html><html><body>opencode</body></html>",
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+
+    client, _ = _mock_client(spa)
+
+    async def run() -> None:
+        with pytest.raises(OpenCodeClientError, match="web UI"):
+            await client.get_session("ses_x")
+        await client.close()
+
+    asyncio.run(run())
+
+
+def test_client_accepts_empty_204_without_content_type() -> None:
+    """``prompt_async`` and the model switch answer 204 with no content-type."""
+
+    import httpx
+
+    def no_content(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/prompt_async"):
+            return httpx.Response(204)
+        return httpx.Response(200, json={"id": "ses_x"})
+
+    client, _ = _mock_client(no_content)
+
+    async def run() -> None:
+        await client.prompt_async("ses_x", "hi")
+        assert await client.switch_session_model("ses_x", "m", "p") is None
+        await client.close()
 
     asyncio.run(run())
 
@@ -1904,6 +2778,39 @@ def test_registry_ignores_empty_ids_and_text() -> None:
     assert registry.resolve("ses_x", [_user_message("msg_1", "hi")]) == {}
 
 
+def test_registry_skips_synthetic_text_when_matching_client_message_id() -> None:
+    """opencode auto-injects a synthetic "Called the Read tool..." text part
+    right after the user's prompt when a file part is sent. The registry must
+    ignore synthetic parts so the platform clientMessageId binding still
+    matches the user's original text, otherwise the optimistic echo on the
+    client is not merged and the user message renders twice.
+    """
+
+    registry = OpenCodePendingClientMessageRegistry()
+    registry.register(native_session_id="ses_x", client_message_id="cm_1", text="识别图片")
+    message_with_synthetic = {
+        "info": {"id": "msg_u", "role": "user", "sessionID": "ses_x"},
+        "parts": [
+            {"id": "prt_a", "type": "text", "text": "识别图片", "synthetic": False},
+            {
+                "id": "prt_b",
+                "type": "text",
+                "text": 'Called the Read tool with the following input: {"filePath":"note.txt"}',
+                "synthetic": True,
+            },
+            {
+                "id": "prt_c",
+                "type": "text",
+                "text": "ATTACHED-CONTENT",
+                "synthetic": True,
+            },
+            {"id": "prt_d", "type": "file", "filename": "file_x__note.txt", "url": "data:text/plain;base64,QQ=="},
+        ],
+    }
+    matched = registry.resolve("ses_x", [message_with_synthetic])
+    assert matched == {"msg_u": "cm_1"}
+
+
 def test_map_messages_sets_client_message_id_on_source() -> None:
     items = timeline.map_messages_to_timeline("ses_x", [USER_MSG], {"msg_user_1": "cm_9"})
     user_items = [item for item in items if item.role == "user"]
@@ -1970,3 +2877,236 @@ def test_create_session_uses_selected_workspace_directory() -> None:
         assert client.aborted == [native]
 
     asyncio.run(run())
+
+
+def test_list_runtime_commands_includes_builtins_before_skills() -> None:
+    """Built-in slash commands (model/compact/fork/share/undo) are injected
+    even when ``GET /command`` returns no skills, so the platform slash menu
+    can offer them — opencode's API only returns user-defined skills."""
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        commands = await runtime.list_runtime_commands(limit=100)
+        ids = [c.id for c in commands]
+        # All five builtins must be present.
+        for name in ("model", "compact", "fork", "share", "undo"):
+            assert name in ids, f"builtin {name!r} missing from {ids}"
+        # Builtins are emitted first, so the leading entries match exactly.
+        assert ids[:5] == ["model", "compact", "fork", "share", "undo"]
+        # /model must drive the platform selector UI, not an execute round-trip.
+        model_cmd = next(c for c in commands if c.id == "model")
+        assert model_cmd.accepts_args is False
+        assert model_cmd.metadata.get("ui") == {"kind": "selector", "target": "model"}
+        # Execute commands carry the platform ui metadata contract too.
+        compact_cmd = next(c for c in commands if c.id == "compact")
+        assert compact_cmd.accepts_args is False
+        ui = compact_cmd.metadata.get("ui")
+        assert isinstance(ui, dict)
+        assert ui.get("kind") == "execute"
+        assert ui.get("allowedStatuses") == ["idle", "error"]
+        # Metadata distinguishes builtins from skills.
+        assert model_cmd.metadata.get("builtin") is True
+        assert model_cmd.category == "builtin"
+
+    asyncio.run(run())
+
+
+def test_execute_command_dispatches_builtins_to_dedicated_endpoints() -> None:
+    """``/model``, ``/compact``, ``/fork``, ``/share``, ``/undo`` must NOT
+    hit ``POST /session/{id}/command`` (which only runs user skills); each
+    routes to its own opencode endpoint."""
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        # Bind a session so _adopt_session_binding can resolve it.
+        result = await runtime.create_and_start_session(
+            "plat_b", "hi", selections=None, cwd=None
+        )
+        native = result.result["externalSessionId"]
+        # opencode records the model on the session; /compact resolves it there.
+        client.sessions[native]["model"] = {"id": "qwen3.8-27b", "providerID": "local"}
+
+        # /model local/qwen3.8-27b
+        r = await runtime.execute_command(
+            "plat_b", "model", raw="local/qwen3.8-27b"
+        )
+        assert r.ok is True
+        # The session's bound directory is forwarded as the ``directory``
+        # query param — FakeClient defaults the cwd to ``/work``.
+        assert client.model_switches == [
+            (native, "qwen3.8-27b", "local", None, "/work")
+        ]
+        # skills endpoint NOT hit
+        assert client.skill_calls == []
+
+        # /compact drives the V1 summarize endpoint with the resolved model.
+        r = await runtime.execute_command("plat_b", "compact")
+        assert r.ok is True
+        assert client.summaries == [(native, "local", "qwen3.8-27b", "/work")]
+        assert r.result.get("executionState") == "completed"
+        assert client.skill_calls == []
+
+        # /fork reports the new session id in the display text.
+        r = await runtime.execute_command("plat_b", "fork")
+        assert r.ok is True
+        assert client.forks == [(native, None, "/work")]
+        assert "ses_forked" in str(r.result.get("text"))
+
+        # /share reports the share URL in the display text.
+        r = await runtime.execute_command("plat_b", "share")
+        assert r.ok is True
+        assert client.shares == [(native, "/work")]
+        assert "https://opncd.ai/share/test123" in str(r.result.get("text"))
+
+        # /undo
+        r = await runtime.execute_command("plat_b", "undo")
+        assert r.ok is True
+        assert client.reverts == [(native, None, "/work")]
+
+        # /model with no arg → helpful usage error, no API call.
+        r = await runtime.execute_command("plat_b", "model", raw="")
+        assert r.ok is False
+        assert r.code == "missing_argument"
+        assert client.model_switches == [(native, "qwen3.8-27b", "local", None, "/work")]
+
+        # /model with bare model id (no provider) → invalid_argument
+        r = await runtime.execute_command("plat_b", "model", raw="qwen3.8-27b")
+        assert r.ok is False
+        assert r.code == "invalid_argument"
+
+        # A non-builtin command still falls through to the skills endpoint.
+        r = await runtime.execute_command("plat_b", "review", raw="main")
+        assert r.ok is True
+        assert client.skill_calls == [
+            (native, "review", "main", "/work")
+        ]
+
+    asyncio.run(run())
+
+
+def test_start_turn_materializes_attachments_as_file_parts(tmp_path) -> None:
+    """Platform attachments are downloaded, staged under the connector data
+    directory and sent as opencode ``file`` parts with a ``file://`` URL the
+    serve can read (opencode inlines the content for text files)."""
+
+    import os
+
+    from connector.runtime_protocol import RuntimeAttachment
+    from connector.runtime_protocol.attachments import ATTACHMENTS_ROOT_ENV
+    from connector.runtimes.opencode.attachments import path_from_file_url
+
+    previous = os.environ.get(ATTACHMENTS_ROOT_ENV)
+    os.environ[ATTACHMENTS_ROOT_ENV] = str(tmp_path)
+    try:
+        client, host = FakeClient(), FakeHost()
+        host.attachment_bytes["file_abc123"] = b"ATTACHED-CONTENT-42"
+        runtime = _make_runtime(client, host)
+
+        async def run() -> None:
+            result = await runtime.create_and_start_session(
+                "plat_att",
+                "look at this",
+                selections=None,
+                cwd=None,
+                attachments=(
+                    RuntimeAttachment(
+                        file_id="file_abc123",
+                        name="note.txt",
+                        media_type="text/plain",
+                    ),
+                ),
+            )
+            assert result.ok is True
+            assert host.attachment_downloads == [("plat_att", "file_abc123")]
+            _sid, parts = client.prompt_parts[-1]
+            assert len(parts) == 1
+            part = parts[0]
+            assert part["type"] == "file"
+            assert part["mime"] == "text/plain"
+            # to_part embeds the platform fileId in the filename so the timeline
+            # mapper can recover it after opencode inlines the file:// URL.
+            assert part["filename"] == "file_abc123__note.txt"
+            url = str(part["url"])
+            assert url.startswith("file://")
+            # The staged path carries the platform file id as the parent dir,
+            # which the timeline mapper parses back out.
+            staged = path_from_file_url(url)
+            assert staged is not None
+            assert staged.parent.name == "file_abc123"
+            assert staged.read_bytes() == b"ATTACHED-CONTENT-42"
+
+        asyncio.run(run())
+    finally:
+        if previous is None:
+            os.environ.pop(ATTACHMENTS_ROOT_ENV, None)
+        else:
+            os.environ[ATTACHMENTS_ROOT_ENV] = previous
+
+
+def test_timeline_maps_user_file_parts_to_attachments() -> None:
+    """User file parts surface as timeline attachments (platform fileId
+    recovered from the connector-encoded filename); synthetic inline-read
+    text is dropped."""
+
+    # opencode inlines file:// URLs as data: URLs when storing the message,
+    # so the staged-path recovery no longer works. The connector embeds the
+    # platform fileId in the filename (see attachments.to_part), which
+    # survives the inlining, and the timeline mapper decodes it back.
+    inlined_url = "data:text/plain;base64,QVRUQUNIRUQtQ09OVEVOVC00Mg=="
+    messages = [
+        {
+            "info": {"id": "msg_user", "role": "user"},
+            "parts": [
+                {"id": "prt_0", "type": "text", "text": "what is this?", "synthetic": False},
+                {"id": "prt_1", "type": "text", "text": "Called the Read tool...", "synthetic": True},
+                {
+                    "id": "prt_2",
+                    "type": "file",
+                    "mime": "text/plain",
+                    "filename": "file_abc123__note.txt",
+                    "url": inlined_url,
+                },
+            ],
+        }
+    ]
+    items = timeline.map_messages_to_timeline("ses_x", messages)
+    assert len(items) == 1
+    item = items[0]
+    assert item.role == "user"
+    content = item.content.to_mapping()
+    # Synthetic inline text is not part of the user's message.
+    assert content["text"] == "what is this?"
+    attachments = content["attachments"]
+    assert len(attachments) == 1
+    assert attachments[0]["fileId"] == "file_abc123"
+    assert attachments[0]["name"] == "note.txt"
+    assert attachments[0]["mediaType"] == "text/plain"
+
+
+def test_timeline_user_message_with_only_a_file_still_maps() -> None:
+    messages = [
+        {
+            "info": {"id": "msg_user2", "role": "user"},
+            "parts": [
+                {
+                    "id": "prt_9",
+                    "type": "file",
+                    "mime": "image/png",
+                    "filename": "shot.png",
+                    "url": "data:image/png;base64,AAAA",
+                }
+            ],
+        }
+    ]
+    items = timeline.map_messages_to_timeline("ses_x", messages)
+    assert len(items) == 1
+    content = items[0].content.to_mapping()
+    assert content["text"] == ""
+    attachment = content["attachments"][0]
+    # Web-UI-originated parts keep an inline open URL and a synthetic id.
+    assert attachment["openUrl"] == "data:image/png;base64,AAAA"
+    assert attachment["fileId"].startswith("opencode-")

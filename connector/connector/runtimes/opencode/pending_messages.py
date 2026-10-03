@@ -101,10 +101,15 @@ class OpenCodePendingClientMessageRegistry:
 
 def user_message_text(message: dict[str, Any]) -> str:
     parts = message.get("parts") or []
+    # Match the timeline mapper: opencode auto-injects synthetic text parts
+    # (e.g. "Called the Read tool with the following input: ...") right after
+    # the user's prompt. Without this filter the binding.text ("识别图片")
+    # would be concatenated with the synthetic narration and never match the
+    # clientMessageId registration, leaving the optimistic echo un-merged.
     return "\n".join(
         str(part.get("text") or "")
         for part in parts
-        if part.get("type") == "text"
+        if part.get("type") == "text" and not part.get("synthetic")
     )
 
 

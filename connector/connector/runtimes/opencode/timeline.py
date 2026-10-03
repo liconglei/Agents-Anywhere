@@ -22,6 +22,11 @@ from connector.runtime_protocol.timeline import (
     ToolCallContent,
     ToolTimelineItem,
 )
+from connector.runtimes.opencode.attachments import (
+    decode_filename,
+    path_from_file_url,
+    staged_file_id,
+)
 
 RUNTIME = "opencode"
 
@@ -50,6 +55,60 @@ def _source(
 def _tool_status(state: dict[str, Any] | None) -> str:
     status = (state or {}).get("status")
     return _TOOL_STATUS_MAP.get(status, "pending")
+
+
+def _user_attachments(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Map user ``file`` parts to the platform's attachment content entries.
+
+    The platform fileId recovery priority:
+
+    1. **Filename-encoded** (preferred): ``attachments.to_part`` embeds the
+       platform fileId as ``<fileId>__<realName>`` in the ``filename`` field,
+       because opencode inlines ``file://`` URLs into ``data:`` URLs when
+       storing the message (which would otherwise lose the file id).
+       ``decode_filename`` splits the encoded pair back.
+    2. **Staged path**: when the URL is still a ``file://`` path under the
+       connector's session attachment directory, recover the fileId from the
+       parent directory name. This branch only fires for snapshots taken
+       before opencode has inlined the URL.
+    3. **Synthetic fallback**: ``opencode-<partId>`` — no platform match, so
+       the client cannot merge its optimistic preview. Surfaced as a last
+       resort so the chip still renders.
+
+    A ``data:`` URL means the file came from the opencode web UI's own
+    uploader; it is surfaced as an inline ``openUrl`` instead.
+    """
+
+    entries: list[dict[str, Any]] = []
+    for part in parts:
+        if part.get("type") != "file":
+            continue
+        url = str(part.get("url") or "")
+        raw_filename = str(part.get("filename") or "file")
+        encoded_file_id, real_name = decode_filename(raw_filename)
+        staged_file_id_value = staged_file_id(url)
+        file_id = encoded_file_id or staged_file_id_value
+        entry: dict[str, Any] = {"name": real_name}
+        media_type = part.get("mime")
+        if isinstance(media_type, str) and media_type:
+            entry["mediaType"] = media_type
+        if file_id:
+            entry["fileId"] = file_id
+        if url.startswith("data:"):
+            entry["openUrl"] = url
+        else:
+            staged = path_from_file_url(url)
+            if staged is not None:
+                try:
+                    entry["size"] = staged.stat().st_size
+                except OSError:
+                    pass
+        if "fileId" not in entry:
+            # Unknown origin (e.g. a raw path from another client): keep a
+            # stable synthetic id so the client still renders the chip.
+            entry["fileId"] = f"opencode-{part.get('id') or len(entries)}"
+        entries.append(entry)
+    return entries
 
 
 def map_messages_to_timeline(
@@ -83,9 +142,10 @@ def map_messages_to_timeline(
             text = "\n".join(
                 str(part.get("text") or "")
                 for part in parts
-                if part.get("type") == "text"
+                if part.get("type") == "text" and not part.get("synthetic")
             ).strip()
-            if not text:
+            attachments = _user_attachments(parts)
+            if not text and not attachments:
                 continue
             items.append(
                 MessageTimelineItem(
@@ -94,7 +154,10 @@ def map_messages_to_timeline(
                     status="done",
                     role="user",
                     turn_id=turn_id,
-                    content=TextMessageContent(text=text),
+                    content=TextMessageContent(
+                        text=text,
+                        metadata={"attachments": attachments} if attachments else {},
+                    ),
                     source=_source(
                         external_session_id,
                         message_id,
