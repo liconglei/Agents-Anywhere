@@ -1,11 +1,13 @@
 FROM node:22-bookworm-slim AS web-static
 
 ARG YARN_REGISTRY=
+ARG COREPACK_NPM_REGISTRY=https://registry.npmmirror.com
 
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
     NEXT_OUTPUT=export \
-    AGENTS_ANYWHERE_API=
+    AGENTS_ANYWHERE_API= \
+    COREPACK_NPM_REGISTRY=$COREPACK_NPM_REGISTRY
 
 WORKDIR /app/web-next
 
