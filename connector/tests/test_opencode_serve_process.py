@@ -190,6 +190,80 @@ def _patch_resolution(
     )
 
 
+def _npm_layout(tmp_path: Path) -> tuple[Path, Path]:
+    """A ``%APPDATA%\\npm`` style install: a .cmd shim and the binary it runs."""
+
+    package_dir = tmp_path / "node_modules" / "opencode-ai" / "bin"
+    package_dir.mkdir(parents=True)
+    native = package_dir / "opencode.exe"
+    native.write_bytes(b"MZ")
+    shim = tmp_path / "opencode.cmd"
+    shim.write_text(
+        "@ECHO off\r\nSETLOCAL\r\n"
+        '"%dp0%\\node_modules\\opencode-ai\\bin\\opencode.exe" %*\r\n',
+        encoding="utf-8",
+    )
+    return shim, native
+
+
+def test_forwarded_executable_resolves_the_npm_shim_target(tmp_path: Path) -> None:
+    """npm's shim only execs the package binary -- read it instead of paying for it.
+
+    Measured on a real install: ``opencode.cmd --version`` timed out after 15s
+    (a cmd.exe plus a node boot per call) while the ``opencode.exe`` it wraps
+    answered in 0.5s, so every connector start burned the timeout and fell back
+    to the slower npx path.
+    """
+
+    shim, native = _npm_layout(tmp_path)
+
+    assert serve_process.forwarded_executable(str(shim)) == str(native)
+    # A real binary is not a launcher: nothing to forward to.
+    assert serve_process.forwarded_executable(str(native)) is None
+    # A shim that does not exist cannot be read.
+    assert serve_process.forwarded_executable(str(tmp_path / "missing.cmd")) is None
+
+
+def test_resolve_serve_command_probes_the_forwarded_binary_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shim, native = _npm_layout(tmp_path)
+    monkeypatch.setattr(
+        serve_process,
+        "find_executable_on_path",
+        lambda name, path: str(shim) if name == "opencode" else None,
+    )
+    probed: list[str] = []
+    monkeypatch.setattr(
+        serve_process,
+        "check_version_output",
+        lambda candidate, environment: probed.append(candidate) and None,
+    )
+
+    assert serve_process.resolve_serve_command(4096, {"PATH": ""})[0] == str(native)
+    assert probed == [str(native)], probed
+
+
+def test_resolve_serve_command_falls_back_to_the_shim_when_the_binary_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable/unrunnable target must not cost us the working shim."""
+
+    shim, native = _npm_layout(tmp_path)
+    monkeypatch.setattr(
+        serve_process,
+        "find_executable_on_path",
+        lambda name, path: str(shim) if name == "opencode" else None,
+    )
+    monkeypatch.setattr(
+        serve_process,
+        "check_version_output",
+        lambda candidate, environment: "boom" if candidate == str(native) else None,
+    )
+
+    assert serve_process.resolve_serve_command(4096, {"PATH": ""})[0] == str(shim)
+
+
 def test_resolve_serve_command_prefers_verified_binary(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_resolution(monkeypatch, {"opencode": r"C:\bin\opencode.cmd", "npx": r"C:\node\npx.cmd"})
     assert serve_process.resolve_serve_command(4096) == [

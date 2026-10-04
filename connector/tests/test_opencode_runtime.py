@@ -1710,7 +1710,10 @@ def test_auto_start_spawns_despite_the_log_lock_holder(
 
     monkeypatch.setattr(client, "health", down_then_up)
     monkeypatch.setattr(serve_process, "is_serve_log_lock_held", lambda environment: True)
+    # Both windows are shortened; the free-port grace is the one that applies
+    # here, and the point of the test is that the holder cannot wedge the spawn.
     monkeypatch.setattr(runtime_module, "PORT_ADOPTION_WAIT_S", 0.01)
+    monkeypatch.setattr(runtime_module, "PORT_ADOPTION_GRACE_S", 0.01)
     proc = _FakeProc()
 
     async def fake_spawn(*args: Any, **kwargs: Any) -> _FakeProc:
@@ -1723,6 +1726,72 @@ def test_auto_start_spawns_despite_the_log_lock_holder(
         assert runtime._serve is not None and runtime._serve.process is proc
 
     asyncio.run(run())
+
+
+async def _never_spawn(*args: Any, **kwargs: Any) -> None:
+    raise AssertionError("must adopt the serve instead of spawning")
+
+
+async def _async_true(host: str, port: int) -> bool:
+    return True
+
+
+async def _async_false(host: str, port: int) -> bool:
+    return False
+
+
+def test_auto_start_waits_longer_for_adoption_when_the_port_is_taken(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The adoption window follows the evidence.
+
+    Something on our port that has not answered yet may be a serve that is
+    booting, so it gets the full window. A free port means there is nothing to
+    wait for -- and on a machine where some opencode always holds the log (a
+    TUI, CherryStudio) that is every restart, which is why the free-port case
+    must not pay the full 15s: the runtime was unavailable for 1.5-2.5 minutes
+    while the client got ``status='starting'`` for every request.
+    """
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def down() -> dict:
+        raise OpenCodeClientError("connection refused")
+
+    monkeypatch.setattr(client, "health", down)
+    monkeypatch.setattr(serve_process, "is_serve_log_lock_held", lambda environment: True)
+    windows: list[float | None] = []
+
+    async def record_adoption(timeout_s: float | None = None) -> tuple[bool, Any]:
+        windows.append(timeout_s)
+        return True, None  # adopted; the spawn must not run
+
+    monkeypatch.setattr(runtime, "_adoption_wait", record_adoption)
+    # _patch_serve also stubs _port_listening, so it has to come first.
+    _patch_serve(monkeypatch, _never_spawn)
+    monkeypatch.setattr(OpenCodeRuntime, "_port_listening", staticmethod(_async_true))
+
+    async def taken() -> None:
+        await runtime._auto_start_serve("http://127.0.0.1:4096")
+        assert windows == [None], windows  # None -> the full PORT_ADOPTION_WAIT_S
+
+    asyncio.run(taken())
+
+    client2, host2 = FakeClient(), FakeHost()
+    runtime2 = _make_runtime(client2, host2)
+    monkeypatch.setattr(client2, "health", down)
+    windows.clear()
+    monkeypatch.setattr(runtime2, "_adoption_wait", record_adoption)
+    monkeypatch.setattr(OpenCodeRuntime, "_port_listening", staticmethod(_async_false))
+
+    async def free() -> None:
+        await runtime2._auto_start_serve("http://127.0.0.1:4096")
+        assert windows == [runtime_module.PORT_ADOPTION_GRACE_S], windows
+        assert runtime_module.PORT_ADOPTION_GRACE_S < runtime_module.PORT_ADOPTION_WAIT_S
+
+    asyncio.run(free())
 
 
 def test_auto_start_reports_the_log_holder_when_the_spawn_dies(

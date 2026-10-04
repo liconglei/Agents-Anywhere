@@ -188,6 +188,10 @@ STREAM_FAILURE_RECOVERY_THRESHOLD = 3
 SERVE_RESTART_INITIAL_BACKOFF_S = 1.0
 SERVE_RESTART_MAX_BACKOFF_S = 30.0
 PORT_ADOPTION_WAIT_S = 15.0
+# ...and the shorter grace used when the port is free: a serve that is still
+# booting has not bound it yet, so this wait covers the peer-is-about-to-appear
+# case without charging the full window on every restart.
+PORT_ADOPTION_GRACE_S = 3.0
 
 # Streaming: opencode pushes ``message.part.delta`` per token chunk, so the
 # buffer is flushed at most this often per part. Fast enough to read as a
@@ -696,10 +700,11 @@ class OpenCodeRuntime(AgentRuntime):
         async with self._recovery_lock:
             await self._auto_start_serve_locked(server_url)
 
-    async def _adoption_wait(self) -> tuple[bool, OpenCodeClientError | None]:
-        """Poll health for PORT_ADOPTION_WAIT_S; (adopted?, last error)."""
+    async def _adoption_wait(self, timeout_s: float | None = None) -> tuple[bool, OpenCodeClientError | None]:
+        """Poll health for ``timeout_s``; (adopted?, last error)."""
 
-        deadline = asyncio.get_running_loop().time() + PORT_ADOPTION_WAIT_S
+        wait_s = PORT_ADOPTION_WAIT_S if timeout_s is None else timeout_s
+        deadline = asyncio.get_running_loop().time() + wait_s
         last_exc: OpenCodeClientError | None = None
         while asyncio.get_running_loop().time() < deadline:
             try:
@@ -740,16 +745,25 @@ class OpenCodeRuntime(AgentRuntime):
         # dying orphan serve from a previous connector) holds opencode's log
         # file open. Our spawn logs to stderr instead of taking that file
         # (``SERVE_LOG_FLAGS``), so the holder no longer dooms it — but the
-        # holder may still be a serve worth adopting. Probe briefly, then spawn
-        # anyway; only a serve we cannot authenticate to (401) is a case
-        # spawning cannot work around. A spawn that does die keeps
-        # ``LOCK_HOLD_HINT`` attached to the failure.
+        # holder may still be a serve worth adopting. Wait for one, with the
+        # window chosen by what the port says: a serve that already answered the
+        # precheck with a connection error may be booting, and it binds the port
+        # only when ready, so "nothing listening" cannot rule that out — but on
+        # a machine where some opencode always holds the log (a TUI, CherryStudio)
+        # that same silence is the normal case, and waiting the full window made
+        # the runtime unavailable for 1.5-2.5 minutes on every restart, 16s of it
+        # here, while the client got ``status='starting'`` for every request.
         if await asyncio.to_thread(serve_process.is_serve_log_lock_held, self._serve_env):
+            listening = await self._port_listening(host, port)
             logger.warning(
-                "opencode auto-start: opencode.log held by another opencode process; "
-                "probing for a serve to adopt"
+                "opencode auto-start: opencode.log held by another opencode process "
+                "and port {} is {}; probing for a serve to adopt",
+                port,
+                "taken" if listening else "free",
             )
-            adopted, last_exc = await self._adoption_wait()
+            adopted, last_exc = await self._adoption_wait(
+                None if listening else PORT_ADOPTION_GRACE_S
+            )
             if adopted:
                 logger.info("opencode auto-start: adopted external serve on port {}", port)
                 return

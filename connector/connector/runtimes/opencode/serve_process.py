@@ -21,6 +21,7 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 from connector.launch import launch_target
@@ -207,6 +208,73 @@ def serve_environment() -> dict[str, str]:
     return env
 
 
+_LAUNCHER_SUFFIXES = (".cmd", ".bat", ".ps1")
+# A token in a launcher script that mentions opencode: quoted or bare, with the
+# path separators npm shims use.
+_SHIM_TARGET = re.compile(r"""[^\s"'()&|<>^]*opencode[^\s"'()&|<>^]*""", re.IGNORECASE)
+
+
+def forwarded_executable(candidate: str) -> str | None:
+    """The real executable a launcher script forwards to, or ``None``.
+
+    npm installs ``opencode.cmd``/``opencode.ps1`` shims whose only job is to
+    exec the package's native ``bin/opencode.exe``. Paying for the wrapper is
+    expensive on Windows: ``opencode.cmd --version`` timed out after 15s on a
+    real install while the binary it wraps answered in 0.5s, so every connector
+    start burned the full timeout and then fell back to the even slower npx path.
+    The shim is read for its target instead of assuming a package layout, and a
+    shim whose target cannot be resolved is simply left alone.
+    """
+
+    if os.path.splitext(candidate)[1].lower() not in _LAUNCHER_SUFFIXES:
+        return None
+    try:
+        text = Path(candidate).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    base = Path(candidate).parent
+    for match in _SHIM_TARGET.finditer(text):
+        resolved = _resolve_shim_path(match.group(0), base)
+        if resolved is not None and os.path.normcase(resolved) != os.path.normcase(candidate):
+            return resolved
+    return None
+
+
+def _resolve_shim_path(token: str, base: Path) -> str | None:
+    text = token.strip().strip("\"'")
+    # npm shims spell the script directory ``%dp0%`` (cmd) or ``$PSScriptRoot`` /
+    # ``$basedir`` (PowerShell).
+    for marker in ("%~dp0", "%dp0%", "$PSScriptRoot", "$basedir"):
+        text = text.replace(marker, str(base))
+    if not text or "%" in text or "$" in text:
+        # An unexpanded variable means we would be guessing at the layout.
+        return None
+    path = Path(os.path.expandvars(text))
+    if not path.is_absolute():
+        path = base / path
+    return str(path) if path.is_file() else None
+
+
+def _serve_candidates(path_value: str | None) -> list[str]:
+    """opencode executables to version-check, best first.
+
+    The PATH hit is usually an npm shim, so the binary it forwards to is tried
+    before it; the shim stays in the list as a fallback for installs whose
+    target cannot be resolved.
+    """
+
+    found = find_executable_on_path("opencode", path_value)
+    if found is None:
+        return []
+    forwarded = forwarded_executable(found)
+    if forwarded is None:
+        return [found]
+    logger.info(
+        "opencode resolve: {} forwards to {}; probing the binary first", found, forwarded
+    )
+    return [forwarded, found]
+
+
 def resolve_serve_command(
     port: int,
     environment: dict[str, str] | None = None,
@@ -230,8 +298,7 @@ def resolve_serve_command(
     env = environment or os.environ
     path_value = env.get("PATH")
     reason: str | None = None
-    candidate = find_executable_on_path("opencode", path_value)
-    if candidate is not None:
+    for candidate in _serve_candidates(path_value):
         probe_started = time.monotonic()
         error = check_version_output(candidate, env)
         probe_elapsed = time.monotonic() - probe_started
@@ -250,14 +317,13 @@ def resolve_serve_command(
                 "--port",
                 str(port),
             ]
-        reason = f"system opencode failed version check: {error}"
+        reason = f"{candidate} failed version check: {error}"
         logger.warning(
-            "{} after {:.2f}s; falling back to npx path={}",
+            "{} after {:.2f}s; trying the next candidate",
             reason,
             probe_elapsed,
-            candidate,
         )
-    else:
+    if reason is None:
         reason = "opencode executable was not found on PATH"
         logger.info("opencode resolve: no system opencode on PATH; trying npx")
 
