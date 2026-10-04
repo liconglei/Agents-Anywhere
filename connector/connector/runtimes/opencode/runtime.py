@@ -192,6 +192,10 @@ PORT_ADOPTION_WAIT_S = 15.0
 # booting has not bound it yet, so this wait covers the peer-is-about-to-appear
 # case without charging the full window on every restart.
 PORT_ADOPTION_GRACE_S = 3.0
+# How long a pushed session status suppresses an identical re-push. opencode
+# emits the same status twice within milliseconds; the window only has to outlast
+# that burst, so a genuinely later push still reaches the Server.
+STATUS_PUSH_DEDUPE_WINDOW_S = 5.0
 
 # Streaming: opencode pushes ``message.part.delta`` per token chunk, so the
 # buffer is flushed at most this often per part. Fast enough to read as a
@@ -427,6 +431,9 @@ class OpenCodeRuntime(AgentRuntime):
         # Native sessions whose idle state was asserted to the host since their
         # last running update (see get_session_state self-heal).
         self._pushed_idle: set[str] = set()
+        # (status, monotonic) per native session, for the duplicate-burst window
+        # in ``_status_push_is_recent``.
+        self._status_pushes: dict[str, tuple[str, float]] = {}
         self._stopping = False
         self._started = False
         self._state_reconcile_interval_s = state_reconcile_interval_s
@@ -656,9 +663,19 @@ class OpenCodeRuntime(AgentRuntime):
         await self._stop_serve_process()
         await self._client.close()
         logger.info("opencode stop: tasks cancelled, client closed")
-
     async def _stop_serve_process(self) -> None:
-        """Terminate the auto-started ``opencode serve`` child, if any."""
+        """Terminate the auto-started ``opencode serve`` child, if any.
+
+        Leaving it running was tried and reverted: releasing the child means
+        closing its pipe transports (the only way to stop reading them), and on
+        Windows that kills the process instead of detaching it. Keeping the pipes
+        open while the connector exits would instead break the child's stderr,
+        which ``--print-logs`` depends on. Writing the child's output to a file
+        instead of pipes would make detaching safe, but that is a larger change
+        than the ~2s of spawn it would save on a restart that is already dominated
+        by the desktop app rebuilding the connector.
+        """
+
         serve = self._serve
         self._serve = None
         if serve is not None:
@@ -734,13 +751,27 @@ class OpenCodeRuntime(AgentRuntime):
         # here means a serve is already listening with credentials we do not
         # have; spawning another instance would only die on the shared log
         # file lock, so surface the auth hint instead.
+        #
+        # The three questions are independent -- is a serve answering, does
+        # another opencode hold the log, is anything on our port -- so they are
+        # asked at once. Chained, a connector restart spent ~4s failing the
+        # health connect and then ~3s in the log-lock probe before it was even
+        # allowed to spawn, all of it as ``status='starting'`` to the client.
+        health_task = asyncio.create_task(self._client.health(fast=True))
+        lock_task = asyncio.create_task(
+            asyncio.to_thread(serve_process.is_serve_log_lock_held, self._serve_env)
+        )
         try:
-            await self._client.health()
+            await health_task
+            # Something answered: adopt it and skip the probes below.
+            lock_task.cancel()
             return
         except OpenCodeClientError as exc:
             hint = self._auth_hint_message(exc)
             if hint is not None:
+                lock_task.cancel()
                 raise RuntimeError(hint) from exc
+        lock_held = await lock_task
         # Another opencode process (TUI, CLI, a foreign serve, CherryStudio, or a
         # dying orphan serve from a previous connector) holds opencode's log
         # file open. Our spawn logs to stderr instead of taking that file
@@ -751,9 +782,8 @@ class OpenCodeRuntime(AgentRuntime):
         # only when ready, so "nothing listening" cannot rule that out — but on
         # a machine where some opencode always holds the log (a TUI, CherryStudio)
         # that same silence is the normal case, and waiting the full window made
-        # the runtime unavailable for 1.5-2.5 minutes on every restart, 16s of it
-        # here, while the client got ``status='starting'`` for every request.
-        if await asyncio.to_thread(serve_process.is_serve_log_lock_held, self._serve_env):
+        # the runtime unavailable for 1.5-2.5 minutes on every restart.
+        if lock_held:
             listening = await self._port_listening(host, port)
             logger.warning(
                 "opencode auto-start: opencode.log held by another opencode process "
@@ -798,10 +828,27 @@ class OpenCodeRuntime(AgentRuntime):
                 self._client.health, OpenCodeClientError, self._auto_start_serve_timeout_s
             )
         except RuntimeError as exc:
+            # Another opencode process holding opencode.log kills the spawn, and
+            # on 1.18.34 ``--print-logs`` does not reliably prevent it. Retrying
+            # cannot help (the holder is not leaving on its own) and the child
+            # says only "Unexpected error", so name the real cause instead --
+            # RuntimeUnavailableError is surfaced by ``start`` without a retry.
+            if serve_process.is_serve_log_lock_failure(str(exc)):
+                log_path = serve_process.opencode_log_path(self._serve_env)
+                logger.warning(
+                    "opencode auto-start: spawn died on the opencode.log lock: {}",
+                    log_path,
+                )
+                await serve.stop()
+                if self._serve is serve:
+                    self._serve = None
+                raise RuntimeUnavailableError(
+                    f"{serve_process.LOCK_HOLD_HINT}（日志文件：{log_path}）"
+                ) from exc
             # A serve started elsewhere may be booting on the same port (or
-            # our spawn died because the port or the log lock was taken by
-            # a transient holder); if something answers, adoption beats
-            # treating the failed spawn as fatal.
+            # our spawn died because the port was taken by a transient holder);
+            # if something answers, adoption beats treating the failed spawn as
+            # fatal.
             port_busy = serve_process.is_port_in_use(str(exc)) or await self._port_listening(
                 host, port
             )
@@ -1672,7 +1719,9 @@ class OpenCodeRuntime(AgentRuntime):
         self._selections[session_id] = dict(selections)
         native_id: str | None = None
         raw = selections.get(MODEL_SELECTION_KEY)
-        model_key = await self._resolve_model_key(raw if isinstance(raw, str) else None)
+        model_key, model_variant = await self._resolve_model_selection(
+            raw if isinstance(raw, str) else None
+        )
         if model_key is not None:
             native_id = self._adopt_session_binding(session_id, external_session_id)
             provider_id, _, model_id = model_key.partition("/")
@@ -1682,6 +1731,7 @@ class OpenCodeRuntime(AgentRuntime):
                         native_id,
                         model_id,
                         provider_id,
+                        variant=model_variant,
                         directory=self._directory_for(native_id),
                     )
                 except OpenCodeClientError as exc:
@@ -1733,10 +1783,11 @@ class OpenCodeRuntime(AgentRuntime):
                     len(materialized),
                 )
         logger.info(
-            "opencode turn start: platform={} native={} model={} agent={} attachments={}",
+            "opencode turn start: platform={} native={} model={} variant={} agent={} attachments={}",
             self._platform_id(native_id),
             native_id,
             (model or {}).get("modelID"),
+            (model or {}).get("variant"),
             agent,
             len(parts),
         )
@@ -1799,8 +1850,10 @@ class OpenCodeRuntime(AgentRuntime):
             )
         return reasoning[0].selection_id
 
-    async def _resolve_model_key(self, raw: str | None) -> str | None:
-        """The ``provider/model`` key for a client-supplied model selection.
+    async def _resolve_model_selection(
+        self, raw: str | None
+    ) -> tuple[str | None, str | None]:
+        """``(provider/model key, variant)`` for a client-supplied model selection.
 
         Accepts both shapes the platform uses. The composer picks with the model
         key, but the selection it sends over the runtime RPC is the catalog's
@@ -1810,13 +1863,20 @@ class OpenCodeRuntime(AgentRuntime):
         accepting the key meant a picked model never reached the prompt: the turn
         went out without a model and opencode silently used its own default,
         while the picker still showed what had been chosen.
+
+        The variant is the second half of the answer. A reasoning model has no
+        selectable id of its own -- its variants do -- so the id the client sends
+        identifies *model plus effort*, and dropping the effort (as this did)
+        meant the picker offered a choice the turn never applied. opencode's own
+        ``ModelRef`` is ``{id, providerID, variant?}`` both for
+        ``POST /api/session/{id}/model`` and for a prompt's ``model`` field.
         """
 
         if not raw:
-            return None
+            return None, None
         if "/" in raw:
             provider_id, _, model_id = raw.partition("/")
-            return raw if provider_id and model_id else None
+            return (raw if provider_id and model_id else None), None
         models = await self._connected_models()
         for key, model in models.items():
             if (
@@ -1825,31 +1885,33 @@ class OpenCodeRuntime(AgentRuntime):
                 )
                 == raw
             ):
-                return key
+                return key, None
             for reasoning in _reasoning_items(key, model.get("variants") or {}):
                 if reasoning.selection_id == raw:
-                    # The reasoning level rides along in the id, but
-                    # ``prompt_async`` only carries provider/model, so the level
-                    # is recorded rather than silently dropped.
-                    logger.info(
-                        "opencode model selection carries reasoning={} for {}; "
-                        "prompt carries the model only",
-                        reasoning.id,
-                        key,
-                    )
-                    return key
+                    # ``metadata.variant`` is opencode's own variant key, which is
+                    # what ModelRef.variant expects; ``id`` is the reasoning
+                    # effort, which usually matches but need not.
+                    variant = reasoning.metadata.get("variant")
+                    return key, variant if isinstance(variant, str) and variant else None
         logger.warning(
             "opencode model selection matches no catalog model: selection={}", raw
         )
-        return None
+        return None, None
 
-    async def _model_ref(self, selections: Mapping[str, str | None] | None) -> dict[str, str] | None:
+    async def _model_ref(
+        self, selections: Mapping[str, str | None] | None
+    ) -> dict[str, str] | None:
         raw = (selections or {}).get(MODEL_SELECTION_KEY)
-        key = await self._resolve_model_key(raw if isinstance(raw, str) else None)
+        key, variant = await self._resolve_model_selection(
+            raw if isinstance(raw, str) else None
+        )
         if key is None:
             return None
         provider_id, _, model_id = key.partition("/")
-        return {"providerID": provider_id, "modelID": model_id}
+        ref = {"providerID": provider_id, "modelID": model_id}
+        if variant:
+            ref["variant"] = variant
+        return ref
 
     async def interrupt_session(
         self,
@@ -2107,7 +2169,11 @@ class OpenCodeRuntime(AgentRuntime):
         """
 
         raw = (self._selections.get(session_id) or {}).get(MODEL_SELECTION_KEY)
-        picked = await self._resolve_model_key(raw if isinstance(raw, str) else None)
+        # ``/session/{id}/summarize`` takes providerID + modelID only, so the
+        # variant is not part of the answer here.
+        picked, _variant = await self._resolve_model_selection(
+            raw if isinstance(raw, str) else None
+        )
         if picked is not None:
             provider_id, _, model_id = picked.partition("/")
             if provider_id and model_id:
@@ -2544,6 +2610,26 @@ class OpenCodeRuntime(AgentRuntime):
                     "opencode unfinished item settle failed: item={} error={}", item.id, exc
                 )
 
+    def _status_push_is_recent(self, native_id: str, status: str) -> bool:
+        """True when this exact status was pushed moments ago.
+
+        Bounded on purpose: a duplicate that arrives seconds later still has to
+        be pushed, so a lost update cannot leave the session stuck in the wrong
+        state. This only swallows the burst opencode emits for one transition.
+        """
+
+        previous = self._status_pushes.get(native_id)
+        if previous is None:
+            return False
+        pushed_status, pushed_at = previous
+        return (
+            pushed_status == status
+            and time.monotonic() - pushed_at < STATUS_PUSH_DEDUPE_WINDOW_S
+        )
+
+    def _remember_status_push(self, native_id: str, status: str) -> None:
+        self._status_pushes[native_id] = (status, time.monotonic())
+
     async def _handle_event(self, event: dict[str, Any]) -> None:
         etype = event.get("type")
         props = event.get("properties") or {}
@@ -2587,10 +2673,22 @@ class OpenCodeRuntime(AgentRuntime):
                         native_id,
                     )
                     return
+                if self._status_push_is_recent(native_id, "running"):
+                    # opencode emits the same status twice within milliseconds
+                    # (verified on 1.18.34: 24 identical ``busy`` events in the
+                    # last 60 log lines). Each one became another
+                    # ``session state push`` to the Server for no change at all.
+                    logger.debug(
+                        "opencode session.status busy suppressed (duplicate): platform={} native={}",
+                        platform_id,
+                        native_id,
+                    )
+                    return
                 logger.info(
                     "opencode session.status busy: platform={} native={}", platform_id, native_id
                 )
                 self._pushed_idle.discard(native_id)
+                self._remember_status_push(native_id, "running")
                 with suppress(Exception):
                     await self.host.session_state_update(
                         platform_id,
@@ -2611,6 +2709,7 @@ class OpenCodeRuntime(AgentRuntime):
                         platform_id,
                         native_id,
                     )
+                    self._status_pushes.pop(native_id, None)
                     self._idle_seq[native_id] = self._idle_seq.get(native_id, 0) + 1
                     await self._finish_turn(native_id)
                 else:

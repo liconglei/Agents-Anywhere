@@ -232,7 +232,7 @@ class FakeClient:
             self.api_user = api_user
             self.api_key = api_key
 
-    async def health(self) -> dict[str, Any]:
+    async def health(self, **_kwargs: Any) -> dict[str, Any]:
         return {"version": "1.18.34"}
 
     async def list_sessions(self) -> list[dict[str, Any]]:
@@ -703,7 +703,7 @@ def test_default_probe_adopts_env_password(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_start_raises_when_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
     class DeadClient(FakeClient):
-        async def health(self) -> dict[str, Any]:
+        async def health(self, **_kwargs: Any) -> dict[str, Any]:
             raise OpenCodeClientError("connection refused", status_code=None)
 
     # No resolvable opencode binary -> auto-start fails fast, nothing spawned.
@@ -926,6 +926,36 @@ def test_event_busy_updates_state_for_active_turn() -> None:
             {"type": "session.status", "properties": {"sessionID": native, "status": {"type": "busy"}}}
         )
         assert ("plat_e", "running") in host.state_updates
+
+    asyncio.run(run())
+
+
+def test_duplicate_busy_status_is_pushed_once() -> None:
+    """opencode repeats a status within milliseconds; push it once.
+
+    A real turn produced 24 identical ``session.status busy`` events in the last
+    60 log lines, and every one became another ``session state push`` to the
+    Server. The window is bounded, so a genuinely later push still goes out.
+    """
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        result = await runtime.create_and_start_session("plat_dup", "hi", selections=None)
+        native = result.result["externalSessionId"]
+        host.state_updates.clear()
+        busy = {"type": "session.status", "properties": {"sessionID": native, "status": {"type": "busy"}}}
+
+        for _ in range(5):
+            await runtime._handle_event(dict(busy))
+        assert host.state_updates.count(("plat_dup", "running")) == 1, host.state_updates
+
+        # Once the burst is older than the window, the same status is pushed again
+        # -- a lost update must never leave the session in the wrong state.
+        runtime._status_pushes[native] = ("running", time.monotonic() - 60.0)
+        await runtime._handle_event(dict(busy))
+        assert host.state_updates.count(("plat_dup", "running")) == 2, host.state_updates
 
     asyncio.run(run())
 
@@ -1415,7 +1445,7 @@ def test_auto_start_resolution_does_not_block_loop(monkeypatch: pytest.MonkeyPat
         time.sleep(0.3)
         raise RuntimeError("opencode executable not found on PATH (and no npx fallback)")
 
-    async def down() -> dict[str, Any]:
+    async def down(**_kwargs: Any) -> dict[str, Any]:
         raise OpenCodeClientError("connection refused")
 
     monkeypatch.setattr(client, "health", down)
@@ -1533,7 +1563,7 @@ def test_auto_start_waits_until_healthy(monkeypatch: pytest.MonkeyPatch) -> None
     runtime = _make_runtime(client, host)
     state = {"calls": 0}
 
-    async def flaky_health() -> dict:
+    async def flaky_health(**_kwargs: Any) -> dict:
         state["calls"] += 1
         if state["calls"] < 3:
             raise OpenCodeClientError("connection refused")
@@ -1562,7 +1592,7 @@ def test_auto_start_reports_early_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     client, host = FakeClient(), FakeHost()
     runtime = _make_runtime(client, host)
 
-    async def dead_health() -> dict:
+    async def dead_health(**_kwargs: Any) -> dict:
         raise OpenCodeClientError("connection refused")
 
     monkeypatch.setattr(client, "health", dead_health)
@@ -1587,7 +1617,7 @@ def test_auto_start_adopts_external_serve_on_port(monkeypatch: pytest.MonkeyPatc
     runtime = _make_runtime(client, host)
     state = {"calls": 0}
 
-    async def booting_health() -> dict:
+    async def booting_health(**_kwargs: Any) -> dict:
         state["calls"] += 1
         if state["calls"] <= 2:  # precheck + adoption poll fail, then external serve is up
             raise OpenCodeClientError("connection refused")
@@ -1634,7 +1664,7 @@ def test_auto_start_reports_401_without_spawning_second_serve(
     client, host = FakeClient(), FakeHost()
     runtime = _make_runtime(client, host)
 
-    async def denied() -> dict:
+    async def denied(**_kwargs: Any) -> dict:
         raise OpenCodeClientError("opencode GET /global/health failed: 401", status_code=401)
 
     monkeypatch.setattr(client, "health", denied)
@@ -1660,7 +1690,7 @@ def test_auto_start_adopts_serve_when_port_has_unlisted_listener(
     runtime = _make_runtime(client, host)
     state = {"calls": 0}
 
-    async def booting_health() -> dict:
+    async def booting_health(**_kwargs: Any) -> dict:
         state["calls"] += 1
         if state["calls"] <= 2:  # precheck + adoption poll fail, then serve answers
             raise OpenCodeClientError("connection refused")
@@ -1702,7 +1732,7 @@ def test_auto_start_spawns_despite_the_log_lock_holder(
     runtime = _make_runtime(client, host)
     state = {"calls": 0}
 
-    async def down_then_up() -> dict:
+    async def down_then_up(**_kwargs: Any) -> dict:
         state["calls"] += 1
         if state["calls"] <= 2:  # precheck + one adoption poll fail
             raise OpenCodeClientError("All connection attempts failed")
@@ -1757,7 +1787,7 @@ def test_auto_start_waits_longer_for_adoption_when_the_port_is_taken(
     client, host = FakeClient(), FakeHost()
     runtime = _make_runtime(client, host)
 
-    async def down() -> dict:
+    async def down(**_kwargs: Any) -> dict:
         raise OpenCodeClientError("connection refused")
 
     monkeypatch.setattr(client, "health", down)
@@ -1803,7 +1833,7 @@ def test_auto_start_reports_the_log_holder_when_the_spawn_dies(
     client, host = FakeClient(), FakeHost()
     runtime = _make_runtime(client, host)
 
-    async def always_down() -> dict:
+    async def always_down(**_kwargs: Any) -> dict:
         raise OpenCodeClientError("connection refused")
 
     monkeypatch.setattr(client, "health", always_down)
@@ -1838,7 +1868,7 @@ def test_auto_start_adopts_a_serve_behind_the_log_holder(
     runtime = _make_runtime(client, host)
     state = {"calls": 0}
 
-    async def booting_health() -> dict:
+    async def booting_health(**_kwargs: Any) -> dict:
         state["calls"] += 1
         if state["calls"] <= 1:  # precheck fails, then the booting serve answers
             raise OpenCodeClientError("connection refused")
@@ -1869,7 +1899,7 @@ def test_auto_start_still_refuses_when_a_serve_answers_401(
     client, host = FakeClient(), FakeHost()
     runtime = _make_runtime(client, host)
 
-    async def denied() -> dict:
+    async def denied(**_kwargs: Any) -> dict:
         raise OpenCodeClientError("opencode GET /global/health failed: 401", status_code=401)
 
     monkeypatch.setattr(client, "health", denied)
@@ -1897,7 +1927,7 @@ def test_auto_start_adopts_serve_when_only_log_lock_busy(
     runtime = _make_runtime(client, host)
     state = {"calls": 0}
 
-    async def booting_health() -> dict:
+    async def booting_health(**_kwargs: Any) -> dict:
         state["calls"] += 1
         if state["calls"] <= 2:  # precheck + first adoption poll fail, then serve answers
             raise OpenCodeClientError("connection refused")
@@ -1931,7 +1961,7 @@ def test_start_auto_starts_local_serve_when_down(monkeypatch: pytest.MonkeyPatch
     runtime = _make_runtime(client, host)
     state = {"calls": 0}
 
-    async def down_then_up() -> dict:
+    async def down_then_up(**_kwargs: Any) -> dict:
         state["calls"] += 1
         if state["calls"] < 3:
             raise OpenCodeClientError("All connection attempts failed")
@@ -1956,13 +1986,91 @@ def test_start_auto_starts_local_serve_when_down(monkeypatch: pytest.MonkeyPatch
     asyncio.run(run())
 
 
+def test_start_names_the_log_lock_instead_of_retrying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spawn killed by opencode.log is reported once, with the real cause.
+
+    ``--print-logs`` does not reliably stop opencode 1.18.34 from opening the
+    log file, so a spawn next to a running TUI dies with a bare "Unexpected
+    error" -- or through Bun's own crash paths. Retrying cannot help (the holder
+    is not leaving), and RuntimeUnavailableError is what ``start`` surfaces
+    without another attempt.
+    """
+
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    spawns: list[Any] = []
+
+    async def always_down(**_kwargs: Any) -> dict:
+        raise OpenCodeClientError("connection refused")
+
+    monkeypatch.setattr(client, "health", always_down)
+    monkeypatch.setattr(serve_process, "is_serve_log_lock_held", lambda environment: False)
+    monkeypatch.setattr(runtime_module, "PORT_ADOPTION_WAIT_S", 0.01)
+    monkeypatch.setattr(
+        serve_process,
+        "opencode_log_path",
+        lambda environment: r"C:\Users\me\.local\share\opencode\log\opencode.log",
+    )
+
+    async def dying_spawn(*args: Any, **kwargs: Any) -> Any:
+        spawns.append(args)
+        return _ExitedProc(
+            "Error: Unexpected error\n"
+            r"Unknown: FileSystem.open (C:\Users\me\.local\share\opencode\log\opencode.log)"
+        )
+
+    _patch_serve(monkeypatch, dying_spawn)
+
+    async def run() -> None:
+        with pytest.raises(RuntimeUnavailableError, match="opencode.log"):
+            await runtime.start()
+        # One attempt only: the holder is not going away, so two more spawns would
+        # just crash two more Bun processes.
+        assert len(spawns) == 1, spawns
+
+    asyncio.run(run())
+
+
+def test_start_reports_the_log_lock_when_bun_fastfails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same lock reaches us as a Windows fastfail code, with no message."""
+
+    from connector.runtimes.opencode import runtime as runtime_module
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def always_down(**_kwargs: Any) -> dict:
+        raise OpenCodeClientError("connection refused")
+
+    monkeypatch.setattr(client, "health", always_down)
+    monkeypatch.setattr(serve_process, "is_serve_log_lock_held", lambda environment: False)
+    monkeypatch.setattr(runtime_module, "PORT_ADOPTION_WAIT_S", 0.01)
+
+    async def bun_crash(*args: Any, **kwargs: Any) -> Any:
+        return _ExitedProc("STATUS_STACK_BUFFER_OVERRUN (Bun 启动 fastfail)")
+
+    _patch_serve(monkeypatch, bun_crash)
+
+    async def run() -> None:
+        with pytest.raises(RuntimeUnavailableError):
+            await runtime.start()
+
+    asyncio.run(run())
+
+
 def test_start_remote_url_fails_without_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
     client, host = FakeClient(), FakeHost()
     values = provider_config.default_config_values()
     values["serverUrl"] = "http://10.0.0.5:4096"
     runtime = _make_runtime(client, host, values=values)
 
-    async def always_down() -> dict:
+    async def always_down(**_kwargs: Any) -> dict:
         raise OpenCodeClientError("connection refused")
 
     monkeypatch.setattr(client, "health", always_down)
@@ -1987,7 +2095,7 @@ def test_serve_exit_reports_health_and_recovers(monkeypatch: pytest.MonkeyPatch)
     runtime = _make_runtime(client, host)
     state = {"calls": 0}
 
-    async def down_twice() -> dict:
+    async def down_twice(**_kwargs: Any) -> dict:
         state["calls"] += 1
         if state["calls"] <= 2:  # start() probe + auto-start pre-check
             raise OpenCodeClientError("connection refused")
@@ -2026,7 +2134,7 @@ def test_recovery_respawns_child_while_serve_unhealthy(monkeypatch: pytest.Monke
     host = FakeHost()
     state = {"healthy": False}
 
-    async def down_health() -> dict:
+    async def down_health(**_kwargs: Any) -> dict:
         if state["healthy"]:
             return {"healthy": True, "version": "1.18"}
         raise OpenCodeClientError("connection refused")
@@ -2132,15 +2240,20 @@ def test_picked_model_selection_id_reaches_the_prompt() -> None:
         item = catalog.models[0]
         # This model has reasoning variants, so the id the client can pick lives
         # on a variant -- exactly what the picker sends.
-        selection = item.reasoning_items[1].selection_id
+        reasoning = item.reasoning_items[1]
+        selection = reasoning.selection_id
         assert selection and selection.startswith("sel_model_")
 
         await runtime.start_turn(
             "ses_sel", "ses_x", "hello", selections={"model": selection}
         )
+        # The effort is half of what the id encodes, and opencode's ModelRef
+        # carries it as ``variant`` on the prompt too -- so the picker's effort
+        # choice reaches the turn instead of being logged and dropped.
         assert client.prompted[-1][2] == {
             "providerID": "local",
             "modelID": "nemotron35-dspark",
+            "variant": reasoning.metadata["variant"],
         }, client.prompted[-1]
 
     asyncio.run(run())
@@ -2154,15 +2267,17 @@ def test_model_selection_id_is_mirrored_to_opencode() -> None:
 
     async def run() -> None:
         catalog = await runtime.list_model_catalog()
-        selection = catalog.models[0].reasoning_items[0].selection_id
+        reasoning = catalog.models[0].reasoning_items[0]
         result = await runtime.update_session_selections(
-            "ses_sel", "ses_x", {"model": selection}
+            "ses_sel", "ses_x", {"model": reasoning.selection_id}
         )
         assert result.ok, result.message
-        assert client.model_switches[-1][:3] == (
+        # (session, model, provider, variant, directory)
+        assert client.model_switches[-1][:4] == (
             "ses_x",
             "nemotron35-dspark",
             "local",
+            reasoning.metadata["variant"],
         ), client.model_switches
 
     asyncio.run(run())

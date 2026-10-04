@@ -40,9 +40,11 @@ _OUTPUT_TAIL_LINES = 80
 
 PortInUseMarkers = ("EADDRINUSE", "address already in use", "already listening")
 
-# Log to stderr instead of the shared, exclusively-opened opencode.log — see
-# ``resolve_serve_command``. ``ServeProcess`` drains stderr into its ring
-# buffer and echoes it into failure messages, so nothing is lost.
+# opencode logs to stderr instead of taking <data>/opencode/log/opencode.log
+# exclusively, which is what used to make a second instance impossible.
+# ``ServeProcess`` drains stderr into its ring buffer. It reduces the collision
+# with another opencode but is not a guarantee on 1.18.34 -- see
+# ``is_serve_log_lock_failure``.
 SERVE_LOG_FLAGS: tuple[str, ...] = ("--print-logs", "--log-level", "INFO")
 
 # opencode keeps its own log file open while any instance runs (TUI, CLI or
@@ -278,6 +280,26 @@ def _serve_candidates(path_value: str | None) -> list[str]:
     return [forwarded, found]
 
 
+def is_serve_log_lock_failure(text: str) -> bool:
+    """True when a spawn died because another opencode holds its log file.
+
+    ``--print-logs`` routes the child's logs to stderr instead of its log file,
+    which reduces the collision with another opencode instance but does **not**
+    remove it: on 1.18.34 a spawn next to a running TUI still died with ``Unknown:
+    FileSystem.open (.../opencode.log)``, and two further attempts took Bun's own
+    crash paths (``STATUS_STACK_BUFFER_OVERRUN``, ``Illegal instruction``) for
+    what is the same lock. Recognising it matters twice over: retrying cannot help
+    because the holder is not going away on its own, and the raw message
+    ("Unexpected error") hides the actual cause.
+    """
+
+    lowered = text.lower()
+    if "filesystem.open" in lowered and "opencode.log" in lowered:
+        return True
+    # Bun's crash paths for the same failure: no usable message, just a fastfail.
+    return "bun has crashed" in lowered or "Bun 启动 fastfail" in text
+
+
 def resolve_serve_command(
     port: int,
     environment: dict[str, str] | None = None,
@@ -289,13 +311,12 @@ def resolve_serve_command(
     Falls back to ``npx`` when the system binary is missing or fails the
     version check (same semantics as the codex binary selection).
 
-    ``--print-logs`` is mandatory, not cosmetic: without it serve opens
-    ``<data>/opencode/log/opencode.log`` exclusively, so it dies during boot
-    with ``Unknown: FileSystem.open`` whenever any other opencode process (a
-    TUI, the CLI, CherryStudio's embedded instance) holds that file. With
-    ``--print-logs`` the child logs to stderr instead — which
-    ``ServeProcess`` already drains into its ring buffer — and coexists with a
-    running TUI.
+    ``--print-logs`` routes the child's logs to stderr instead of its log file,
+    which ``ServeProcess`` drains into a ring buffer. It reduces the collision
+    with another opencode instance but does not eliminate it (see
+    ``is_serve_log_lock_failure``), so the spawn still has to happen while the log
+    is held -- there is nothing else to fall back on when no serve answers -- and
+    its failure has to be recognised rather than retried as "Unexpected error".
     """
 
     env = environment or os.environ
@@ -598,3 +619,15 @@ class ServeProcess:
         if proc.returncode is None:
             with suppress(Exception):
                 proc.kill()
+        # Close the child's pipe transports explicitly. Cancelling the drain
+        # readers and then walking away leaves the proactor transports to the
+        # garbage collector, and on Windows their ``__del__`` asks for a file
+        # descriptor that is already gone -- asyncio then reports ``ValueError:
+        # I/O operation on closed pipe`` from a ``proactor_events`` repr during
+        # interpreter teardown, which surfaced in the connector log as an ERROR on
+        # an otherwise clean shutdown. It has to happen *after* the kill: closing
+        # a subprocess transport while the child is alive kills the child.
+        transport = getattr(proc, "_transport", None)
+        if transport is not None:
+            with suppress(Exception):
+                transport.close()
