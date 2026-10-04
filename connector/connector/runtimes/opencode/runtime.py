@@ -1454,6 +1454,16 @@ class OpenCodeRuntime(AgentRuntime):
         """
 
         selections: dict[str, str | None] = dict(self._selections.get(session_id) or {})
+        # Report the model the way the picker's options are keyed -- the catalog
+        # item id (``provider/model``) -- not the one-way selection id the client
+        # sent. Echoing the id back left the composer unable to match any option,
+        # so the model shown during the interaction was not the one picked when
+        # the task was created.
+        raw_model = selections.get(MODEL_SELECTION_KEY)
+        if isinstance(raw_model, str):
+            resolved_model = await self._resolve_model_key(raw_model)
+            if resolved_model is not None:
+                selections[MODEL_SELECTION_KEY] = resolved_model
         need_model = not selections.get(MODEL_SELECTION_KEY)
         need_permission = not selections.get(PERMISSION_SELECTION_KEY)
         if not (need_model or need_permission):
@@ -1657,9 +1667,10 @@ class OpenCodeRuntime(AgentRuntime):
         self._selections[session_id] = dict(selections)
         native_id: str | None = None
         raw = selections.get(MODEL_SELECTION_KEY)
-        if isinstance(raw, str) and "/" in raw:
+        model_key = await self._resolve_model_key(raw if isinstance(raw, str) else None)
+        if model_key is not None:
             native_id = self._adopt_session_binding(session_id, external_session_id)
-            provider_id, _, model_id = raw.partition("/")
+            provider_id, _, model_id = model_key.partition("/")
             if provider_id and model_id:
                 try:
                     await self._client.switch_session_model(
@@ -1696,7 +1707,7 @@ class OpenCodeRuntime(AgentRuntime):
         session_id: str | None = None,
         attachments: tuple = (),
     ) -> None:
-        model = self._model_ref(selections)
+        model = await self._model_ref(selections)
         # Build/Plan is the agent this turn runs as; opencode remembers it on
         # the session, so the picker can read the mode back after a restart.
         agent = await self._permission_mode_for_turn(native_id, selections)
@@ -1764,12 +1775,56 @@ class OpenCodeRuntime(AgentRuntime):
                 external_session_id=native_id,
             )
 
-    @staticmethod
-    def _model_ref(selections: Mapping[str, str | None] | None) -> dict[str, str] | None:
-        raw = (selections or {}).get(MODEL_SELECTION_KEY)
-        if not raw or "/" not in raw:
+    async def _resolve_model_key(self, raw: str | None) -> str | None:
+        """The ``provider/model`` key for a client-supplied model selection.
+
+        Accepts both shapes the platform uses. The composer picks with the model
+        key, but the selection it sends over the runtime RPC is the catalog's
+        ``selection_id`` -- a one-way hash -- so the id is resolved by rebuilding
+        the catalog's own ids and matching, the same way
+        ``_permission_preset_from_selection`` resolves a permission id. Only
+        accepting the key meant a picked model never reached the prompt: the turn
+        went out without a model and opencode silently used its own default,
+        while the picker still showed what had been chosen.
+        """
+
+        if not raw:
             return None
-        provider_id, _, model_id = raw.partition("/")
+        if "/" in raw:
+            provider_id, _, model_id = raw.partition("/")
+            return raw if provider_id and model_id else None
+        models = await self._connected_models()
+        for key, model in models.items():
+            if (
+                protocol_selection_id(
+                    "opencode", "model", {"model_id": key, "reasoning_id": None}
+                )
+                == raw
+            ):
+                return key
+            for reasoning in _reasoning_items(key, model.get("variants") or {}):
+                if reasoning.selection_id == raw:
+                    # The reasoning level rides along in the id, but
+                    # ``prompt_async`` only carries provider/model, so the level
+                    # is recorded rather than silently dropped.
+                    logger.info(
+                        "opencode model selection carries reasoning={} for {}; "
+                        "prompt carries the model only",
+                        reasoning.id,
+                        key,
+                    )
+                    return key
+        logger.warning(
+            "opencode model selection matches no catalog model: selection={}", raw
+        )
+        return None
+
+    async def _model_ref(self, selections: Mapping[str, str | None] | None) -> dict[str, str] | None:
+        raw = (selections or {}).get(MODEL_SELECTION_KEY)
+        key = await self._resolve_model_key(raw if isinstance(raw, str) else None)
+        if key is None:
+            return None
+        provider_id, _, model_id = key.partition("/")
         return {"providerID": provider_id, "modelID": model_id}
 
     async def interrupt_session(
@@ -2028,8 +2083,9 @@ class OpenCodeRuntime(AgentRuntime):
         """
 
         raw = (self._selections.get(session_id) or {}).get(MODEL_SELECTION_KEY)
-        if isinstance(raw, str) and "/" in raw:
-            provider_id, _, model_id = raw.partition("/")
+        picked = await self._resolve_model_key(raw if isinstance(raw, str) else None)
+        if picked is not None:
+            provider_id, _, model_id = picked.partition("/")
             if provider_id and model_id:
                 return provider_id, model_id
         try:

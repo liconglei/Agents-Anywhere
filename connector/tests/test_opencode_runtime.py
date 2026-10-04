@@ -2110,6 +2110,105 @@ def test_model_catalog_from_provider_overview() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# model selection: the composer sends a selection id, not the model key
+# --------------------------------------------------------------------------- #
+
+
+def test_picked_model_selection_id_reaches_the_prompt() -> None:
+    """The reported bug: a picked model never reached the turn.
+
+    The composer's picker is keyed by the model id, but the selection it sends
+    over the runtime RPC is the catalog's one-way ``sel_model_*`` id. Only
+    ``provider/model`` was understood, so every turn went out without a model,
+    opencode used its own default, and the picker still showed the model the
+    user had chosen.
+    """
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        catalog = await runtime.list_model_catalog()
+        item = catalog.models[0]
+        # This model has reasoning variants, so the id the client can pick lives
+        # on a variant -- exactly what the picker sends.
+        selection = item.reasoning_items[1].selection_id
+        assert selection and selection.startswith("sel_model_")
+
+        await runtime.start_turn(
+            "ses_sel", "ses_x", "hello", selections={"model": selection}
+        )
+        assert client.prompted[-1][2] == {
+            "providerID": "local",
+            "modelID": "nemotron35-dspark",
+        }, client.prompted[-1]
+
+    asyncio.run(run())
+
+
+def test_model_selection_id_is_mirrored_to_opencode() -> None:
+    """Switching the model must also reach opencode's own session record."""
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        catalog = await runtime.list_model_catalog()
+        selection = catalog.models[0].reasoning_items[0].selection_id
+        result = await runtime.update_session_selections(
+            "ses_sel", "ses_x", {"model": selection}
+        )
+        assert result.ok, result.message
+        assert client.model_switches[-1][:3] == (
+            "ses_x",
+            "nemotron35-dspark",
+            "local",
+        ), client.model_switches
+
+    asyncio.run(run())
+
+
+def test_reported_model_selection_is_the_key_the_picker_matches() -> None:
+    """Report the model id, not the id the client sent.
+
+    The composer matches its options by ``item.id``; handing the one-way
+    selection id back left it unable to match anything, so the model shown while
+    working was not the one picked at creation.
+    """
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        catalog = await runtime.list_model_catalog()
+        selection = catalog.models[0].reasoning_items[1].selection_id
+        await runtime.update_session_selections("ses_sel", "ses_x", {"model": selection})
+        # The fallback path reads opencode's own record for whatever the
+        # in-memory selection does not answer.
+        client.sessions["ses_x"] = {"id": "ses_x"}
+        state = await runtime.get_session_state("ses_sel", "ses_x")
+        assert state is not None
+        assert state.selections["model"] == "local/nemotron35-dspark", state.selections
+
+    asyncio.run(run())
+
+
+def test_unknown_model_selection_sends_no_model() -> None:
+    """An id that matches nothing must not silently pick something else."""
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        await runtime.start_turn(
+            "ses_sel", "ses_x", "hello", selections={"model": "sel_model_nope"}
+        )
+        assert client.prompted[-1][2] is None, client.prompted[-1]
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
 # permission catalog (Build / Plan)
 # --------------------------------------------------------------------------- #
 
