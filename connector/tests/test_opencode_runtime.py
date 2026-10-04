@@ -2168,12 +2168,15 @@ def test_model_selection_id_is_mirrored_to_opencode() -> None:
     asyncio.run(run())
 
 
-def test_reported_model_selection_is_the_key_the_picker_matches() -> None:
-    """Report the model id, not the id the client sent.
+def test_reported_model_selection_stays_a_resolvable_selection_id() -> None:
+    """``session.state.selections`` must round-trip as selection ids.
 
-    The composer matches its options by ``item.id``; handing the one-way
-    selection id back left it unable to match anything, so the model shown while
-    working was not the one picked at creation.
+    The composer resolves ``selections.model`` with ``modelIdsForSelectionId``,
+    i.e. it expects the catalog's one-way id -- exactly what it sent. Reporting a
+    resolved ``provider/model`` key instead left it matching no option, so the
+    picker showed the first catalog entry (MIMO) while the turn itself ran on the
+    picked model. Same contract as the permission selection, which always travels
+    as ``sel_permission_*``.
     """
 
     client, host = FakeClient(), FakeHost()
@@ -2183,12 +2186,39 @@ def test_reported_model_selection_is_the_key_the_picker_matches() -> None:
         catalog = await runtime.list_model_catalog()
         selection = catalog.models[0].reasoning_items[1].selection_id
         await runtime.update_session_selections("ses_sel", "ses_x", {"model": selection})
-        # The fallback path reads opencode's own record for whatever the
-        # in-memory selection does not answer.
         client.sessions["ses_x"] = {"id": "ses_x"}
         state = await runtime.get_session_state("ses_sel", "ses_x")
         assert state is not None
-        assert state.selections["model"] == "local/nemotron35-dspark", state.selections
+        assert state.selections["model"] == selection, state.selections
+        # And the client can map it straight back to the model it picked.
+        assert state.selections["model"] in {
+            item.selection_id for item in catalog.models
+        } | {effort.selection_id for item in catalog.models for effort in item.reasoning_items}
+
+    asyncio.run(run())
+
+
+def test_model_fallback_after_restart_reports_a_resolvable_selection_id() -> None:
+    """With no in-memory selection the session's own model is reported as an id.
+
+    After a connector restart the picker still has to show the model the session
+    is actually on, and it can only do that from an id the catalog contains.
+    """
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        catalog = await runtime.list_model_catalog()
+        item = catalog.models[0]
+        provider_id, _, model_id = item.id.partition("/")
+        client.sessions["ses_x"] = {"id": "ses_x", "model": {"providerID": provider_id, "id": model_id}}
+        state = await runtime.get_session_state("ses_sel", "ses_x")
+        assert state is not None
+        reported = state.selections["model"]
+        assert reported in {
+            effort.selection_id for effort in item.reasoning_items
+        } | ({item.selection_id} if item.selection_id else set()), reported
 
     asyncio.run(run())
 
