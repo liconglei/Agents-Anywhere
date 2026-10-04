@@ -2665,6 +2665,9 @@ def _tool_part_event(status: str) -> dict[str, Any]:
                     "status": status,
                     "input": {"command": "ls"},
                     "output": "file.txt" if status == "completed" else "",
+                    # opencode reports the tool's own start/end; the connector
+                    # turns them into the elapsed suffix on a state change.
+                    "time": {"start": 2_000, "end": 2_500},
                 },
             },
         },
@@ -3279,6 +3282,184 @@ def test_streaming_does_not_republish_an_unchanged_final_part() -> None:
         assert len(host.item_upserts) == 3
 
     asyncio.run(run())
+
+
+def _tool_snapshot_message(*, status: str, output: str = "file.txt") -> dict[str, Any]:
+    """One assistant message whose single tool part carries ``status``."""
+
+    return {
+        "info": {
+            "id": ASSISTANT_MESSAGE_ID,
+            "role": "assistant",
+            "parentID": USER_MESSAGE_ID,
+            "sessionID": "ses_x",
+            "time": {"created": 2_000, "completed": 3_000},
+        },
+        "parts": [
+            {
+                "id": TOOL_PART_ID,
+                "messageID": ASSISTANT_MESSAGE_ID,
+                "sessionID": "ses_x",
+                "type": "tool",
+                "tool": "bash",
+                "callID": "call_1",
+                "state": {
+                    "status": status,
+                    "input": {"command": "ls"},
+                    "output": output,
+                    "time": {"start": 2_000, "end": 2_500},
+                },
+            }
+        ],
+    }
+
+
+def test_unchanged_tool_restatements_are_not_republished() -> None:
+    """opencode restates a running tool several times with identical state.
+
+    Each restatement used to become another upsert (nine ingests in 90ms were
+    observed on a real turn, all byte-identical), and each one is a Server write.
+    """
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    runtime._remember_directory("ses_x", "/work")
+    runtime._active_turns.add("ses_x")
+
+    async def run() -> None:
+        await _drain(runtime, [_assistant_message_event(), _tool_part_event("running")])
+        assert len(host.item_upserts) == 1
+        assert host.item_upserts[0].status == "running"
+
+        # Same state, same content: nothing the client can render changed.
+        await _drain(runtime, [_tool_part_event("running")] * 5)
+        assert len(host.item_upserts) == 1
+
+        # A real transition still goes out (opencode "completed" -> our "done").
+        await _drain(runtime, [_tool_part_event("completed")])
+        assert len(host.item_upserts) == 2
+        assert host.item_upserts[1].status == "done"
+
+    asyncio.run(run())
+
+
+def test_turn_end_settles_items_opencode_left_running() -> None:
+    """A turn that closes with ``running`` items must not keep the UI spinning.
+
+    opencode has been observed reporting ``outcome=completed`` with tool items
+    still ``running`` (the provider stalled, the stream went quiet, the turn
+    ended anyway). The snapshot reports them faithfully, so without this the
+    client spins forever on a turn that is over.
+    """
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    runtime._remember_directory("ses_x", "/work")
+    runtime._active_turns.add("ses_x")
+
+    async def run() -> None:
+        client.sessions["ses_x"] = {"id": "ses_x"}
+        client.messages["ses_x"] = [_tool_snapshot_message(status="running", output="")]
+        await runtime._finish_turn("ses_x")
+
+        settled = [item for item in host.item_upserts if item.id == TOOL_PART_ID]
+        assert [item.status for item in settled] == ["failed"], (
+            "the unfinished tool must be restated as failed, never left running"
+        )
+        # The correction has to win over the snapshot's revision.
+        assert settled[0].revision > 1
+        # And the turn itself is still reported as completed.
+        assert host.turn_ended[-1][1] == "completed"
+
+    asyncio.run(run())
+
+
+def test_turn_end_leaves_finished_items_alone() -> None:
+    """The settle pass must not touch a clean snapshot."""
+
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    runtime._remember_directory("ses_x", "/work")
+    runtime._active_turns.add("ses_x")
+
+    async def run() -> None:
+        client.sessions["ses_x"] = {"id": "ses_x"}
+        client.messages["ses_x"] = [_tool_snapshot_message(status="completed")]
+        await _drain(runtime, [_assistant_message_event(), _tool_part_event("running")])
+        before = len(host.item_upserts)
+        await runtime._finish_turn("ses_x")
+        # No settle correction: the snapshot says the tool finished.
+        assert len(host.item_upserts) == before
+
+    asyncio.run(run())
+
+
+def test_info_log_names_every_step_and_item_transition() -> None:
+    """The log has to answer "is it still working?" on its own.
+
+    Reported as indistinguishable: a turn that was working and a turn that was
+    frozen produced the same client log, because only ``session.status`` changes
+    were recorded at INFO. Every assistant step (opencode's unit of work) and
+    every status change -- with how long the tool took -- is now one INFO line,
+    while the text updates in between stay at DEBUG.
+    """
+
+    from connector.logging import logger
+
+    messages: list[str] = []
+    sink_id = logger.add(lambda _message: messages.append(str(_message)), level="INFO", format="{message}")
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    runtime._remember_directory("ses_x", "/work")
+    runtime._active_turns.add("ses_x")
+
+    async def run() -> None:
+        try:
+            client.sessions["ses_x"] = {"id": "ses_x"}
+            client.messages["ses_x"] = [_tool_snapshot_message(status="completed")]
+            # The real pre-prompt path: it seeds orderSeq and the turn clock.
+            await runtime._seed_stream_order("ses_x")
+            await _drain(runtime, [_user_message_event(), _assistant_message_event()])
+            await _drain(runtime, [_tool_part_event("running")] * 4)
+            # One step per assistant message, not one per part or restatement.
+            await _drain(
+                runtime,
+                [
+                    {
+                        "type": "message.part.updated",
+                        "properties": {
+                            "sessionID": "ses_x",
+                            "part": {
+                                "id": "prt_text_2",
+                                "messageID": "msg_assistant_2",
+                                "sessionID": "ses_x",
+                                "type": "text",
+                                "text": "second step",
+                            },
+                        },
+                    }
+                ],
+            )
+            await _drain(runtime, [_tool_part_event("completed")])
+            await runtime._finish_turn("ses_x")
+        finally:
+            logger.remove(sink_id)
+
+    asyncio.run(run())
+
+    steps = [line for line in messages if "opencode step start" in line]
+    assert len(steps) == 2, steps
+    assert any("step=1/" in line and "first_part=tool" in line for line in steps), steps
+    # A restated tool part must not add lines: only transitions are logged.
+    transitions = [line for line in messages if "opencode item " in line]
+    assert len(transitions) == 4, transitions
+    assert any("status=running->done" in line for line in transitions)
+    # A finished tool reports how long it took, which is the usual answer to
+    # "why is the turn taking so long".
+    assert any("after 0.5s" in line for line in transitions), transitions
+    turn_end = [line for line in messages if "turn-end delivered" in line]
+    assert len(turn_end) == 1, turn_end
+    assert "outcome=completed" in turn_end[0]
+    assert "elapsed=" in turn_end[0], turn_end[0]
 
 
 # --------------------------------------------------------------------------- #

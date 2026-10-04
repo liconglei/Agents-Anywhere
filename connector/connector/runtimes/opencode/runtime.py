@@ -16,9 +16,10 @@ Session model:
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
@@ -48,6 +49,7 @@ from connector.runtime_protocol import (
     RuntimePermissionCatalog,
     RuntimePermissionItem,
     RuntimeReasoningItem,
+    RuntimeTimelineItem,
     RuntimeTimelineSnapshot,
     RuntimeUnavailableError,
     SessionMeta,
@@ -316,6 +318,17 @@ class _StreamSession:
     user_parts: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     # The orderSeq reserved for that prompt (the slot before the streamed parts).
     user_order_seq: int | None = None
+    # (content hash, orderSeq, status) of the last item actually pushed per part.
+    # opencode restates parts -- several times while a tool runs, and once more
+    # after ``session.idle`` -- and every upsert is an ingest on the Server, so an
+    # unchanged restatement is dropped instead of republished (a running tool
+    # otherwise burned ~9 ingests in 90ms with byte-identical content).
+    fingerprints: dict[str, tuple[str, int, str]] = field(default_factory=dict)
+    # Assistant messages already announced in this turn, so a step is logged once
+    # instead of once per part it contains.
+    steps: set[str] = field(default_factory=set)
+    # When this turn became active, for the turn-end duration log.
+    started_at: float = 0.0
     # The SSE loop and the watchdog can both finalize the same part; this keeps
     # them from publishing it twice with different statuses.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -328,7 +341,7 @@ class _StreamSession:
 # old part is long since replaced by the turn-end snapshot, and if it ever
 # streams again it simply gets a fresh slot.
 _STREAM_STATE_MAX_ENTRIES = 4000
-_STREAM_TRIMED_MAPS = ("order", "parents", "roles", "published")
+_STREAM_TRIMED_MAPS = ("order", "parents", "roles", "published", "fingerprints")
 
 
 def _trim_stream_state(session: _StreamSession) -> None:
@@ -336,6 +349,27 @@ def _trim_stream_state(session: _StreamSession) -> None:
         mapping: dict[str, Any] = getattr(session, name)
         while len(mapping) > _STREAM_STATE_MAX_ENTRIES:
             mapping.pop(next(iter(mapping)))
+
+
+def _elapsed_suffix(part: Mapping[str, Any]) -> str:
+    """`` after 900.4s`` for a tool that has been running, else ``""``.
+
+    A long tool is the usual reason a turn looks stuck from the outside, so the
+    log line that reports a tool's state change also says how long it took. Uses
+    opencode's own ``state.time`` (epoch ms) rather than our clock so it matches
+    the timestamps the runtime reports.
+    """
+
+    state = part.get("state")
+    times = state.get("time") if isinstance(state, Mapping) else None
+    if not isinstance(times, Mapping):
+        return ""
+    start = times.get("start")
+    if not isinstance(start, int):
+        return ""
+    end = times.get("end")
+    stop = end if isinstance(end, int) else int(time.time() * 1000)
+    return f" after {round(max(0.0, (stop - start) / 1000), 1)}s"
 
 
 def _permission_preset_from_selection(selection_id: str | None) -> str | None:
@@ -1333,23 +1367,24 @@ class OpenCodeRuntime(AgentRuntime):
 
     async def _publish_timeline(
         self, session_id: str, external_session_id: str | None
-    ) -> None:
+    ) -> tuple[RuntimeTimelineItem, ...]:
         native_id = self._adopt_session_binding(session_id, external_session_id)
         messages = await self._client.list_messages(native_id, self._directory_for(native_id))
         client_message_ids = self._pending_messages.resolve(native_id, messages)
-        items = [
+        items = tuple(
             item.to_platform_item(session_id, seq)
             for seq, item in enumerate(
                 timeline.map_messages_to_timeline(native_id, messages, client_message_ids)
             )
-        ]
+        )
         await self.host.timeline_sync(
             session_id,
             "opencode",
-            tuple(items),
+            items,
             external_session_id=native_id,
             complete=True,
         )
+        return items
 
     async def get_session_state(
         self,
@@ -2273,10 +2308,26 @@ class OpenCodeRuntime(AgentRuntime):
         # Final live state (items flip from ``running`` to ``done``) before the
         # snapshot, which restates the same item ids from the message list.
         await self._finish_streaming_parts(platform_id, native_id)
-        await self._publish_timeline_safe(platform_id, native_id)
+        items = await self._publish_timeline_safe(platform_id, native_id)
+        # After the snapshot: it is the authoritative picture of what opencode
+        # thinks finished, and anything still running in it will never be
+        # corrected by a later event.
+        await self._settle_unfinished_items(platform_id, native_id, items, outcome)
         self._pending_messages.unresolve(native_id)
         await self._report_turn_end(platform_id, native_id, outcome)
         await self._flush_unended_turns()
+
+    def _turn_elapsed_s(self, native_id: str) -> float:
+        """Seconds since this turn became active, or ``-1.0`` if unknown.
+
+        Set on the pre-prompt path, so a turn adopted after a connector restart
+        reports ``-1`` rather than a misleading 0.
+        """
+
+        session = self._stream_sessions.get(native_id)
+        if session is None or session.started_at <= 0.0:
+            return -1.0
+        return round(time.monotonic() - session.started_at, 1)
 
     async def _report_turn_end(self, platform_id: str, native_id: str, outcome: str) -> None:
         """Deliver turn-end + idle state to the host, or remember it for retry.
@@ -2298,10 +2349,11 @@ class OpenCodeRuntime(AgentRuntime):
             )
             self._pushed_idle.add(native_id)
             logger.info(
-                "opencode turn-end delivered: platform={} native={} outcome={}",
+                "opencode turn-end delivered: platform={} native={} outcome={} elapsed={}s",
                 platform_id,
                 native_id,
                 outcome,
+                self._turn_elapsed_s(native_id),
             )
         except Exception as exc:  # noqa: BLE001 - retry through the watchdog
             logger.warning(
@@ -2342,9 +2394,9 @@ class OpenCodeRuntime(AgentRuntime):
 
     async def _publish_timeline_safe(
         self, session_id: str, external_session_id: str
-    ) -> None:
+    ) -> tuple[RuntimeTimelineItem, ...]:
         try:
-            await self._publish_timeline(session_id, external_session_id)
+            return await self._publish_timeline(session_id, external_session_id)
         except Exception as exc:  # noqa: BLE001 - snapshot failures must not block turn-end
             logger.warning(
                 "opencode timeline publish failed: platform={} native={} error={}",
@@ -2352,6 +2404,51 @@ class OpenCodeRuntime(AgentRuntime):
                 external_session_id,
                 exc,
             )
+            return ()
+
+    async def _settle_unfinished_items(
+        self,
+        platform_id: str,
+        native_id: str,
+        items: tuple[RuntimeTimelineItem, ...],
+        outcome: str,
+    ) -> None:
+        """Give items opencode left ``running`` at turn end a terminal state.
+
+        opencode has been observed closing a turn with ``outcome=completed``
+        while tool items were still ``running``: the provider stalled, the event
+        stream went quiet for minutes, and the turn ended without ever reporting
+        those tools as finished. The snapshot reports them faithfully as running,
+        so the client keeps a spinner on a turn that is over and nothing will ever
+        clear it. An ``interrupted`` outcome has the same problem by definition.
+
+        The inconsistency is worth a WARNING when opencode claimed success, and
+        either way the item is restated as ``failed``: the fact stays visible in
+        the log, and the UI stops waiting.
+        """
+
+        unfinished = [item for item in items if item.status == "running"]
+        if not unfinished:
+            return
+        if outcome == "completed":
+            logger.warning(
+                "opencode turn ended with unfinished items: platform={} native={} "
+                "outcome={} count={} items={}",
+                platform_id,
+                native_id,
+                outcome,
+                len(unfinished),
+                ", ".join(f"{item.type}:{item.id}" for item in unfinished[:10]),
+            )
+        for item in unfinished:
+            try:
+                await self.host.timeline_item_upsert(
+                    replace(item, status="failed", revision=item.revision + 1)
+                )
+            except Exception as exc:  # noqa: BLE001 - best effort, never fatal
+                logger.warning(
+                    "opencode unfinished item settle failed: item={} error={}", item.id, exc
+                )
 
     async def _handle_event(self, event: dict[str, Any]) -> None:
         etype = event.get("type")
@@ -2543,6 +2640,12 @@ class OpenCodeRuntime(AgentRuntime):
         """
 
         session = self._stream(native_id)
+        # Per-turn bookkeeping, reset before the ordering hint below: it is
+        # allowed to fail (and return early) without leaving the previous turn's
+        # step counter in place.
+        session.user_parts.clear()
+        session.steps.clear()
+        session.started_at = time.monotonic()
         try:
             messages = await self._client.list_messages(
                 native_id, self._directory_for(native_id)
@@ -2678,6 +2781,20 @@ class OpenCodeRuntime(AgentRuntime):
             entry = self._streamed_part(session, part_id, message_id, part)
             if entry is None:
                 return
+            if message_id and message_id not in session.steps:
+                # opencode reports one assistant message per step (a tool round
+                # trip, a patch, the final answer). Their boundaries are the only
+                # structure a turn has, and they are what makes "still working"
+                # readable in the log between two status changes.
+                session.steps.add(message_id)
+                logger.info(
+                    "opencode step start: platform={} native={} step={}/{} first_part={}",
+                    platform_id,
+                    native_id,
+                    len(session.steps),
+                    message_id,
+                    part_type,
+                )
             if part_type in {"text", "reasoning"}:
                 text = part.get("text")
                 if isinstance(text, str):
@@ -2798,20 +2915,42 @@ class OpenCodeRuntime(AgentRuntime):
             # so the platform does not see a gap it cannot match.
             return
         part_key = entry.part.get("id") or ""
-        if not streaming:
-            if session.published.get(part_key) == entry.text:
-                # Already delivered verbatim (opencode re-sends the final part
-                # after ``session.idle``): a second upsert would be an idempotent
-                # but pointless ingest.
-                return
-            # Only a final publish counts as "delivered" — a running publish is
-            # expected to be superseded by the done one with the same text.
-            session.published[part_key] = entry.text
-        entry.revision += 1
-        try:
-            await self.host.timeline_item_upsert(
-                item.to_platform_item(platform_id, entry.order_seq)
+        platform_item = item.to_platform_item(platform_id, entry.order_seq)
+        fingerprint = (
+            platform_item.content_hash,
+            platform_item.order_seq,
+            platform_item.status,
+        )
+        previous = session.fingerprints.get(part_key)
+        if previous == fingerprint:
+            # Nothing the client can render changed. opencode restates the same
+            # part repeatedly (a tool's state while it runs, the final part after
+            # ``session.idle``), and each upsert costs one Server ingest.
+            logger.debug(
+                "opencode part push skipped (unchanged): item={} status={}",
+                item.id,
+                platform_item.status,
             )
+            return
+        session.fingerprints[part_key] = fingerprint
+        session.published[part_key] = entry.text
+        entry.revision += 1
+        if previous is None or previous[2] != platform_item.status:
+            # A status change is what the client renders (spinner on, spinner
+            # off, tool failed), so it is worth an INFO line; the text updates in
+            # between stay at DEBUG to keep a long turn readable.
+            logger.info(
+                "opencode item {} id={} status={}->{} orderSeq={} revision={}{}",
+                platform_item.type,
+                platform_item.id,
+                previous[2] if previous else "new",
+                platform_item.status,
+                platform_item.order_seq,
+                platform_item.revision,
+                _elapsed_suffix(entry.part),
+            )
+        try:
+            await self.host.timeline_item_upsert(platform_item)
         except Exception as exc:  # noqa: BLE001 - a lost update must be visible
             logger.warning(
                 "opencode streamed item push failed: item={} revision={} error={}",
