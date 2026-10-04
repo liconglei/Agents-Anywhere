@@ -73,6 +73,12 @@ def _is_html(content_type: str, body: str) -> bool:
     return head.startswith(("<!doctype html", "<html"))
 
 
+# Read budget for the auto-start "is a serve already there?" precheck. The
+# client's default connect timeout is generous on purpose (a busy serve can be
+# slow to answer), but paying it while nothing is listening only delays the spawn.
+HEALTH_FAST_TIMEOUT_S = 1.5
+
+
 class OpenCodeClient:
     def __init__(
         self,
@@ -141,12 +147,13 @@ class OpenCodeClient:
         *,
         json_body: Any = None,
         directory: str | None = None,
+        timeout: httpx.Timeout | float | None = None,
     ) -> Any:
         client = await self._client()
         if directory:
             path = append_directory_param(path, directory)
         try:
-            response = await client.request(method, path, json=json_body)
+            response = await client.request(method, path, json=json_body, timeout=timeout)
         except httpx.HTTPError as exc:
             raise OpenCodeClientError(f"opencode server unreachable: {exc}") from exc
         if response.status_code >= 400:
@@ -174,8 +181,17 @@ class OpenCodeClient:
             )
         return response.json()
 
-    async def health(self) -> dict[str, Any] | None:
-        return await self._request("GET", "/global/health")
+    async def health(self, *, fast: bool = False) -> dict[str, Any] | None:
+        """``GET /global/health``.
+
+        ``fast`` uses a short connect timeout for the "is anything listening?"
+        precheck on the auto-start path: with the client's default (10s connect)
+        a dead port costs several seconds of ADE attempts before the runtime is
+        even allowed to spawn, and the client shows ``starting`` throughout.
+        """
+
+        timeout = httpx.Timeout(HEALTH_FAST_TIMEOUT_S, connect=1.0) if fast else None
+        return await self._request("GET", "/global/health", timeout=timeout)
 
     async def list_sessions(self) -> list[dict[str, Any]]:
         data = await self._request("GET", "/session")

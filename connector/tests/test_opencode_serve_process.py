@@ -190,6 +190,30 @@ def test_check_version_output_timeout_kills_process_tree(monkeypatch: pytest.Mon
         assert fake.taskkill[0][0][0] == "taskkill"
 
 
+def test_log_lock_failure_is_recognised_in_all_its_shapes() -> None:
+    """The lock reaches us as a clean error or as a Bun crash, with no message.
+
+    All three were observed on 1.18.34 while a TUI held opencode.log, and none of
+    them can be fixed by retrying.
+    """
+
+    assert serve_process.is_serve_log_lock_failure(
+        "Error: Unexpected error\n"
+        r"Unknown: FileSystem.open (C:\Users\me\.local\share\opencode\log\opencode.log)"
+    )
+    assert serve_process.is_serve_log_lock_failure(
+        "STATUS_STACK_BUFFER_OVERRUN (Bun 启动 fastfail)"
+    )
+    assert serve_process.is_serve_log_lock_failure(
+        "oh no: Bun has crashed. This indicates a bug in Bun, not your code."
+    )
+    # A port collision is a different problem and must not be swallowed here.
+    assert not serve_process.is_serve_log_lock_failure(
+        "Error: listen EADDRINUSE 127.0.0.1:4096"
+    )
+    assert not serve_process.is_serve_log_lock_failure("")
+
+
 # --------------------------------------------------------------------------- #
 # resolve_serve_command
 # --------------------------------------------------------------------------- #
