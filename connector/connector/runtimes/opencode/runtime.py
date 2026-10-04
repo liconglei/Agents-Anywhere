@@ -1454,16 +1454,12 @@ class OpenCodeRuntime(AgentRuntime):
         """
 
         selections: dict[str, str | None] = dict(self._selections.get(session_id) or {})
-        # Report the model the way the picker's options are keyed -- the catalog
-        # item id (``provider/model``) -- not the one-way selection id the client
-        # sent. Echoing the id back left the composer unable to match any option,
-        # so the model shown during the interaction was not the one picked when
-        # the task was created.
-        raw_model = selections.get(MODEL_SELECTION_KEY)
-        if isinstance(raw_model, str):
-            resolved_model = await self._resolve_model_key(raw_model)
-            if resolved_model is not None:
-                selections[MODEL_SELECTION_KEY] = resolved_model
+        # The selection is echoed back exactly as it arrived. The client treats
+        # ``selections`` values as opaque selection ids on both sides -- it
+        # resolves them with ``modelIdsForSelectionId`` /
+        # ``permissionIdForSelectionId`` -- so reporting a resolved model key
+        # here left the composer unable to match any option and it fell back to
+        # the first catalog entry.
         need_model = not selections.get(MODEL_SELECTION_KEY)
         need_permission = not selections.get(PERMISSION_SELECTION_KEY)
         if not (need_model or need_permission):
@@ -1485,7 +1481,16 @@ class OpenCodeRuntime(AgentRuntime):
                     and provider_id
                     and model_id
                 ):
-                    selections[MODEL_SELECTION_KEY] = f"{provider_id}/{model_id}"
+                    # A selection id, like the in-memory path: the client
+                    # resolves this value through the catalog, so a raw
+                    # ``provider/model`` key is unresolvable for it. For a
+                    # reasoning model only its variants are selectable, so the
+                    # first variant stands in -- the model is what the picker
+                    # shows either way.
+                    model_key = f"{provider_id}/{model_id}"
+                    selections[MODEL_SELECTION_KEY] = (
+                        await self._model_selection_id(model_key) or model_key
+                    )
         if need_permission:
             preset = self._permission_mode_from_session(session)
             if preset is not None:
@@ -1774,6 +1779,25 @@ class OpenCodeRuntime(AgentRuntime):
                 status="running",
                 external_session_id=native_id,
             )
+
+    async def _model_selection_id(self, model_key: str) -> str | None:
+        """The selection id a client can resolve back to ``model_key``.
+
+        Mirrors what ``list_model_catalog`` hands out: a model without reasoning
+        variants is addressable directly, a reasoning model only through one of
+        its variants (its own ``selection_id`` is ``None`` there).
+        """
+
+        models = await self._connected_models()
+        model = models.get(model_key)
+        if model is None:
+            return None
+        reasoning = _reasoning_items(model_key, model.get("variants") or {})
+        if not reasoning:
+            return protocol_selection_id(
+                "opencode", "model", {"model_id": model_key, "reasoning_id": None}
+            )
+        return reasoning[0].selection_id
 
     async def _resolve_model_key(self, raw: str | None) -> str | None:
         """The ``provider/model`` key for a client-supplied model selection.
