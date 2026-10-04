@@ -28,7 +28,10 @@ from connector.launch import launch_target
 from connector.logging import logger
 
 LOGIN_SHELL_PATH_MARKER = "__AGENTS_ANYWHERE_PATH__"
-VERSION_TIMEOUT_S = 15.0
+# Budget for one `<candidate> --version` probe. Kept short on purpose: the probe
+# only picks a binary, and every candidate it rejects is paid for again on the
+# next candidate and again on the next connector restart.
+VERSION_TIMEOUT_S = 5.0
 VERSION_DRAIN_TIMEOUT_S = 2.0
 HEALTH_POLL_INTERVAL_S = 1.0
 DRAIN_FINISH_TIMEOUT_S = 1.0
@@ -342,13 +345,20 @@ def resolve_serve_command(
     raise RuntimeError(f"opencode executable not found on PATH (and no npx fallback): {reason}")
 
 
-def check_version_output(candidate: str, environment: dict[str, str]) -> str | None:
+def check_version_output(candidate: str, environment: dict[str, Any]) -> str | None:
     """Return None when `<candidate> --version` looks like a real opencode CLI.
 
     Blocking; callers on the event loop must run this in a thread. On Windows a
     plain timeout only kills the direct child (powershell/cmd), while a
     grandchild holding the output pipes can hang ``communicate`` indefinitely —
     so the whole process tree is killed on timeout.
+
+    The budget is deliberately short. This only picks a binary; it does not
+    decide whether the runtime works, and the ``npx`` fallback that a failed
+    probe falls back to was measured coming up in 2.1s while two 15s probes in a
+    row left the client looking at ``status='starting'`` for the whole time. A
+    candidate that cannot report its version within ``VERSION_TIMEOUT_S`` is not
+    going to serve the turn any sooner.
     """
 
     target = launch_target("opencode", candidate)
@@ -360,6 +370,9 @@ def check_version_output(candidate: str, environment: dict[str, str]) -> str | N
         proc = subprocess.Popen(
             command,
             env=dict(environment),
+            # Same as ServeProcess.spawn: a connector is spawned by the desktop
+            # app, where stdin is not a console. Never let a probe inherit it.
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
