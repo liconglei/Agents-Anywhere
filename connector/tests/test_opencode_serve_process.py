@@ -108,16 +108,19 @@ class _FakeSubprocess:
     SubprocessError = subprocess.SubprocessError
     TimeoutExpired = subprocess.TimeoutExpired
     PIPE = "pipe"
+    DEVNULL = "devnull"
     CREATE_NO_WINDOW = 0x08000000
 
     def __init__(self, result: _FakeCompleted | None = None, exc: Exception | None = None) -> None:
         self._result = result
         self._exc = exc
         self.taskkill: list[Any] = []
+        self.popen_kwargs: dict[str, Any] = {}
 
     def Popen(self, *args: Any, **kwargs: Any) -> Any:
         if self._exc is not None:
             raise self._exc
+        self.popen_kwargs = kwargs
         if self._result is None:
             return _TimeoutProc()
         return _FakePopenProc(self._result)
@@ -135,6 +138,25 @@ def _patch_subprocess(monkeypatch: pytest.MonkeyPatch, fake: _FakeSubprocess) ->
 def test_check_version_output_accepts_semver_line(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_subprocess(monkeypatch, _FakeSubprocess(_FakeCompleted(0, "1.18.34\n")))
     assert serve_process.check_version_output("opencode", {}) is None
+
+
+def test_version_probe_never_inherits_stdin_and_keeps_a_short_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connector is spawned by the desktop app, where stdin is not a console.
+
+    ``ServeProcess.spawn`` already passes ``DEVNULL``; the version probe did not,
+    so it was the one spawn in this path that could block on an inherited handle.
+    The budget is asserted too because it is a deliberate trade: two probes at
+    15s each is what made the runtime look stuck for half a minute on a restart
+    where the ``npx`` fallback would have been serving in 2.1s.
+    """
+
+    fake = _FakeSubprocess(_FakeCompleted(0, "1.18.34\n"))
+    _patch_subprocess(monkeypatch, fake)
+    assert serve_process.check_version_output("opencode", {}) is None
+    assert fake.popen_kwargs["stdin"] == _FakeSubprocess.DEVNULL
+    assert serve_process.VERSION_TIMEOUT_S <= 5.0
 
 
 def test_check_version_output_rejects_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
