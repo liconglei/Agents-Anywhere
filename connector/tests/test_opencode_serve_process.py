@@ -195,6 +195,7 @@ def test_resolve_serve_command_prefers_verified_binary(monkeypatch: pytest.Monke
     assert serve_process.resolve_serve_command(4096) == [
         r"C:\bin\opencode.cmd",
         "serve",
+        *serve_process.SERVE_LOG_FLAGS,
         "--hostname",
         "127.0.0.1",
         "--port",
@@ -214,6 +215,7 @@ def test_resolve_serve_command_falls_back_when_version_check_fails(
         r"C:\node\npx.cmd",
         "opencode",
         "serve",
+        *serve_process.SERVE_LOG_FLAGS,
         "--hostname",
         "127.0.0.1",
         "--port",
@@ -227,6 +229,7 @@ def test_resolve_serve_command_falls_back_to_npx(monkeypatch: pytest.MonkeyPatch
         r"C:\node\npx.cmd",
         "opencode",
         "serve",
+        *serve_process.SERVE_LOG_FLAGS,
         "--hostname",
         "127.0.0.1",
         "--port",
@@ -242,6 +245,17 @@ def test_resolve_serve_command_honours_hostname(monkeypatch: pytest.MonkeyPatch)
         "--port",
         "4096",
     ]
+
+
+def test_resolve_serve_command_always_forces_stderr_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--print-logs`` is load-bearing, not cosmetic.
+
+    Asserted literally instead of via ``SERVE_LOG_FLAGS`` so that emptying the
+    constant (which would silently reintroduce the boot failure described in
+    ``resolve_serve_command``) fails here.
+    """
+    _patch_resolution(monkeypatch, {"opencode": "/usr/local/bin/opencode"})
+    assert "--print-logs" in serve_process.resolve_serve_command(4096)
 
 
 def test_resolve_serve_command_raises_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
