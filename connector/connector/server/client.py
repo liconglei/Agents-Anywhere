@@ -445,7 +445,17 @@ class BackendRpcClient:
                     method,
                     exc,
                 )
-        await self._ingest.enqueue(method, params)
+        try:
+            await self._ingest.enqueue(method, params)
+        except Exception:
+            # A swallowed delivery failure leaves the runtime convinced the item
+            # reached the platform, so the turn dies later with no cause. Surface
+            # it instead: the runtime can mark the item failed and tell the user.
+            logger.opt(lazy=True).exception(
+                "timeline notification undeliverable on every channel method={}",
+                method,
+            )
+            raise
 
     async def send_response(
         self,
