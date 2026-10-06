@@ -26,6 +26,46 @@ from connector.runtime_protocol.host import RuntimeHostClient
 
 FILE_ID_PREFIX = "file_"
 _UNSAFE_RE = re.compile(r"[^\w.\-+]+")
+GENERIC_MEDIA_TYPES = frozenset(
+    {
+        "application/octet-stream",
+        "binary/octet-stream",
+        "",
+    }
+)
+# Text-ish media types accepted by model providers for inline file parts. A
+# provider rejects an unknown part outright ("AI_UnsupportedFunctionalityError"),
+# so a text file mislabelled as a generic binary loses the whole turn.
+_TEXT_MEDIA_TYPES = frozenset({"text/plain", "text/markdown", "text/csv", "application/json"})
+_TEXT_SUFFIXES = frozenset(
+    {
+        ".txt", ".md", ".markdown", ".yml", ".yaml", ".json", ".toml", ".ini",
+        ".cfg", ".conf", ".csv", ".tsv", ".log", ".env", ".xml", ".py", ".js",
+        ".ts", ".tsx", ".jsx", ".sh", ".bat", ".ps1", ".go", ".rs", ".java",
+        ".c", ".h", ".cpp", ".hpp", ".rb", ".php", ".sql", ".html", ".css",
+        ".vue", ".svelte", ".gradle", ".properties", ".gitignore", ".dockerfile",
+    }
+)
+
+
+def resolve_media_type(name: str, declared: str | None) -> str:
+    """Pick a media type an openai-compatible provider will accept.
+
+    The platform hands us ``application/octet-stream`` for anything it has not
+    classified, and providers reject an unrecognised part media type instead of
+    ignoring it, which fails the turn. Anything that looks like text gets a
+    text type; genuinely binary files keep the generic label.
+    """
+
+    candidate = (declared or "").strip().lower()
+    if candidate and candidate not in GENERIC_MEDIA_TYPES:
+        return candidate
+    suffix = Path(name).suffix.lower()
+    if suffix in _TEXT_SUFFIXES or not suffix:
+        return "text/plain"
+    if candidate:
+        return candidate
+    return "application/octet-stream"
 # Separator used to embed the platform fileId into the opencode file part's
 # ``filename`` field. opencode inlines ``file://`` URLs as ``data:`` URLs when
 # it stores the message, which makes the staged-path-based fileId recovery in
@@ -159,9 +199,10 @@ async def materialize_opencode_attachments(
                 file_id=attachment.file_id,
                 name=name,
                 path=str(target),
-                media_type=downloaded.media_type
-                or attachment.media_type
-                or "application/octet-stream",
+                media_type=resolve_media_type(
+                    name,
+                    downloaded.media_type or attachment.media_type,
+                ),
                 byte_size=len(downloaded.content),
             )
         )
