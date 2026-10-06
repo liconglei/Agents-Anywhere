@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from connector.runtime_protocol.size_budget import MAX_TIMELINE_TEXT_BYTES
 from connector.runtime_protocol.timeline import (
     MarkdownMessageContent,
     MessageTimelineItem,
@@ -27,6 +28,11 @@ from connector.runtimes.opencode.attachments import (
     path_from_file_url,
     staged_file_id,
 )
+
+# opencode stores attachments as inline data URLs, so a video arrives as
+# megabytes of base64. Keep the inline URL only while it still fits the frame
+# budget alongside the rest of the item.
+MAX_INLINE_ATTACHMENT_BYTES = MAX_TIMELINE_TEXT_BYTES
 
 RUNTIME = "opencode"
 
@@ -95,7 +101,15 @@ def _user_attachments(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if file_id:
             entry["fileId"] = file_id
         if url.startswith("data:"):
-            entry["openUrl"] = url
+            # opencode stores attachments as inline data URLs, so a video lands
+            # here as several megabytes of base64. One such entry pushes the
+            # whole itemUpsert past the frame budget. Drop the inline URL and
+            # keep the chip: the client resolves the bytes through its own
+            # attachment channel, which is how every other runtime delivers
+            # them. Inventing extra keys here would violate the content
+            # contract, so the entry simply looks like a non-inline one.
+            if len(url.encode("utf-8")) <= MAX_INLINE_ATTACHMENT_BYTES:
+                entry["openUrl"] = url
         else:
             staged = path_from_file_url(url)
             if staged is not None:

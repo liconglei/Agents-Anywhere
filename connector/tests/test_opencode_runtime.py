@@ -4249,32 +4249,71 @@ def test_start_turn_materializes_attachments_as_file_parts(tmp_path) -> None:
             os.environ[ATTACHMENTS_ROOT_ENV] = previous
 
 
-@pytest.mark.parametrize(
-    ("name", "declared", "expected"),
-    [
-        ("ci.yml", "application/octet-stream", "text/plain"),
-        ("config.yaml", None, "text/plain"),
-        ("README", "application/octet-stream", "text/plain"),
-        ("main.py", "application/octet-stream", "text/plain"),
-        ("logo.png", "application/octet-stream", "application/octet-stream"),
-        ("model.bin", "application/octet-stream", "application/octet-stream"),
-        ("manual.pdf", "application/pdf", "application/pdf"),
-        ("photo.png", "image/png", "image/png"),
-    ],
-)
-def test_resolve_media_type_never_leaves_text_unusable(
-    name: str, declared: str | None, expected: str
-) -> None:
-    """A generic binary label on a text file fails the whole turn.
+def test_resolve_media_type_follows_the_payload_not_the_extension() -> None:
+    """A generic binary label must not make a text file unusable.
 
     openai-compatible providers reject an unrecognised file part media type
-    outright (AI_UnsupportedFunctionalityError), so a yml the platform filed as
-    application/octet-stream has to be re-labelled before it reaches the model.
+    outright (AI_UnsupportedFunctionalityError), so the label has to be decided
+    by the bytes: extensions cannot be enumerated exhaustively, and the platform
+    files every unclassified upload as application/octet-stream.
     """
 
     from connector.runtimes.opencode.attachments import resolve_media_type
 
-    assert resolve_media_type(name, declared) == expected
+    yaml_bytes = b"name: ci\non: [push]\njobs:\n  build:\n    steps:\n      - run: echo hi\n"
+    source_bytes = b"def main():\n    return 0\n"
+    png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 32
+    utf16_bytes = "﻿配置说明\n".encode("utf-16-le")
+
+    # Text payloads get a text label whatever they are called, including names
+    # no list would contain.
+    assert resolve_media_type("ci.yml", "application/octet-stream", yaml_bytes) == "text/plain"
+    assert resolve_media_type("notes", "application/octet-stream", yaml_bytes) == "text/plain"
+    assert resolve_media_type("weird.unknownext", "application/octet-stream", yaml_bytes) == "text/plain"
+    assert resolve_media_type("main.py", "application/octet-stream", source_bytes) == "text/x-python"
+    # A UTF-16 document is text too, despite the zero bytes in its encoding.
+    assert resolve_media_type("config.ini", "application/octet-stream", utf16_bytes).startswith("text/")
+
+    # Binary payloads keep a binary label whatever they are called.
+    for name in ("clip.mp4", "photo.png", "blob", "notes"):
+        assert not resolve_media_type(name, "application/octet-stream", png_bytes).startswith("text/")
+
+    # An explicit, specific label is never overridden.
+    assert resolve_media_type("report.pdf", "application/pdf", png_bytes) == "application/pdf"
+    assert resolve_media_type("x.png", "image/png", png_bytes) == "image/png"
+
+
+def test_resolve_media_type_without_a_sample_keeps_the_declared_type() -> None:
+    """No bytes to sniff means no evidence, so the platform's label stands."""
+
+    from connector.runtimes.opencode.attachments import resolve_media_type
+
+    assert resolve_media_type("mystery", "application/octet-stream", b"") == "application/octet-stream"
+    assert resolve_media_type("note.txt", "text/plain", b"") == "text/plain"
+
+
+def test_oversized_inline_attachment_keeps_the_chip_without_the_data_url() -> None:
+    """A data: URL is megabytes of base64; the entry keeps its identity only."""
+
+    from connector.runtimes.opencode.timeline import (
+        MAX_INLINE_ATTACHMENT_BYTES,
+        _user_attachments,
+    )
+
+    small = _user_attachments(
+        [{"type": "file", "id": "p1", "filename": "file_abc__note.txt", "mime": "text/plain", "url": "data:text/plain;base64,aGk="}]
+    )
+    assert small[0]["openUrl"].startswith("data:")
+
+    oversized = "data:video/mp4;base64," + "A" * (MAX_INLINE_ATTACHMENT_BYTES + 10)
+    entry = _user_attachments(
+        [{"type": "file", "id": "p2", "filename": "file_def__clip.mp4", "mime": "video/mp4", "url": oversized}]
+    )[0]
+    # No inline bytes, but the fileId/name survive so the chip still renders and
+    # the client resolves the content through its own attachment channel.
+    assert "openUrl" not in entry
+    assert entry["fileId"] == "file_def"
+    assert entry["name"] == "clip.mp4"
 
 
 def test_timeline_maps_user_file_parts_to_attachments() -> None:
