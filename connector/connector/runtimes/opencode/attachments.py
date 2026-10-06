@@ -14,6 +14,7 @@ the client can render the attachment chip with its normal authenticated URL.
 
 from __future__ import annotations
 
+import mimetypes
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,39 +34,68 @@ GENERIC_MEDIA_TYPES = frozenset(
         "",
     }
 )
-# Text-ish media types accepted by model providers for inline file parts. A
-# provider rejects an unknown part outright ("AI_UnsupportedFunctionalityError"),
-# so a text file mislabelled as a generic binary loses the whole turn.
-_TEXT_MEDIA_TYPES = frozenset({"text/plain", "text/markdown", "text/csv", "application/json"})
-_TEXT_SUFFIXES = frozenset(
-    {
-        ".txt", ".md", ".markdown", ".yml", ".yaml", ".json", ".toml", ".ini",
-        ".cfg", ".conf", ".csv", ".tsv", ".log", ".env", ".xml", ".py", ".js",
-        ".ts", ".tsx", ".jsx", ".sh", ".bat", ".ps1", ".go", ".rs", ".java",
-        ".c", ".h", ".cpp", ".hpp", ".rb", ".php", ".sql", ".html", ".css",
-        ".vue", ".svelte", ".gradle", ".properties", ".gitignore", ".dockerfile",
-    }
-)
+# Bytes sampled when deciding whether a payload is text. Enough to catch a
+# UTF-8 header, a BOM, or the first control bytes of any real binary format,
+# without reading a 4 GB video into memory.
+_TEXT_SNIFF_BYTES = 8192
+# Control characters that never appear in source text but do in binary data.
+# Tab, newline and carriage return are ordinary text.
+_BINARY_CONTROL = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
-def resolve_media_type(name: str, declared: str | None) -> str:
+def looks_like_text(sample: bytes) -> bool:
+    """Decide text vs binary from the bytes themselves.
+
+    Deciding by file extension cannot be exhaustive -- the next format always
+    arrives unlisted -- so the only durable signal is the payload. The BOM /
+    UTF-16 checks come first because those encodings contain NUL bytes that
+    would otherwise read as binary.
+    """
+
+    if not sample:
+        return False
+    for bom, encoding in ((b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")):
+        if sample.startswith(bom):
+            try:
+                sample[len(bom) :].decode(encoding)
+            except UnicodeDecodeError:
+                return False
+            return True
+    if sample.startswith(b"\xef\xbb\xbf"):
+        sample = sample[3:]
+    if b"\x00" in sample:
+        # A NUL outside a UTF-16/UTF-32 document means binary.
+        return False
+    try:
+        text = sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    # Control characters never appear in source text but do in binary data.
+    # Tab, newline and carriage return are ordinary text.
+    return _BINARY_CONTROL.search(text.encode("utf-8")) is None
+
+
+def resolve_media_type(name: str, declared: str | None, sample: bytes = b"") -> str:
     """Pick a media type an openai-compatible provider will accept.
 
     The platform hands us ``application/octet-stream`` for anything it has not
     classified, and providers reject an unrecognised part media type instead of
-    ignoring it, which fails the turn. Anything that looks like text gets a
-    text type; genuinely binary files keep the generic label.
+    ignoring it, which fails the whole turn. An explicit, specific declared type
+    always wins; otherwise the payload's own bytes decide, with the name only
+    consulted through ``mimetypes`` for the exact type of a text file.
     """
 
     candidate = (declared or "").strip().lower()
     if candidate and candidate not in GENERIC_MEDIA_TYPES:
         return candidate
-    suffix = Path(name).suffix.lower()
-    if suffix in _TEXT_SUFFIXES or not suffix:
-        return "text/plain"
-    if candidate:
-        return candidate
-    return "application/octet-stream"
+    if not looks_like_text(sample):
+        return candidate or "application/octet-stream"
+    guessed, _ = mimetypes.guess_type(name)
+    if guessed and guessed.startswith("text/"):
+        return guessed
+    if guessed in {"application/json", "application/xml", "application/yaml", "application/x-yaml"}:
+        return guessed
+    return "text/plain"
 # Separator used to embed the platform fileId into the opencode file part's
 # ``filename`` field. opencode inlines ``file://`` URLs as ``data:`` URLs when
 # it stores the message, which makes the staged-path-based fileId recovery in
@@ -202,6 +232,7 @@ async def materialize_opencode_attachments(
                 media_type=resolve_media_type(
                     name,
                     downloaded.media_type or attachment.media_type,
+                    downloaded.content[:_TEXT_SNIFF_BYTES],
                 ),
                 byte_size=len(downloaded.content),
             )

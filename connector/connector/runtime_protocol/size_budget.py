@@ -1,15 +1,22 @@
 """Keep one timeline notification inside the backend frame budget.
 
 A single ``timeline.itemUpsert`` must fit in ``CONNECTOR_WS_MAX_NOTIFICATION_BYTES``
-(900 KiB). A tool that dumps a large file (``cat`` a 4 MiB yml, ``git diff`` of
-a vendored tree) puts its whole output in ``ToolCallContent.output``, so the
-frame is refused and the item never reaches the platform -- which used to end
-the turn with no visible cause.
+(900 KiB). Anything unbounded can push it over: a tool dumping a whole file, a
+vendor diff in an artifact patch, an agent prompt, or an attachment inlined by
+the runtime as a ``data:`` URL. When the frame was refused the item never
+reached the platform and the turn ended with no visible cause.
 
-Trimming happens here rather than in every runtime adapter: the oversize item
-is the same shape no matter which adapter produced it, and adapters should not
-each invent their own limit. Oversize strings are kept head-first, because the
-beginning of a tool result carries the part a reader actually acts on.
+Two layers, because neither alone is enough:
+
+- :func:`bound_content_field` bounds the fields known to be large at the point
+  they are built, so ordinary oversize content is trimmed with a notice instead
+  of being mangled by a generic pass.
+- :func:`bound_payload` is the backstop applied where the frame is actually
+  measured, so a field nobody thought about still cannot exceed the budget. It
+  protects every runtime and every content type, including ones added later.
+
+Oversize strings are kept head-first, because the beginning of a result is the
+part a reader acts on.
 """
 
 from __future__ import annotations
@@ -79,6 +86,64 @@ def bound_content_field(field: Any, max_bytes: int = MAX_TIMELINE_TEXT_BYTES) ->
     if _serialized_size(bounded) > max_bytes:
         bounded = _truncate_text(_serialized(bounded), max_bytes)
     return bounded
+
+
+def bound_payload(payload: Any, max_bytes: int) -> tuple[Any, bool]:
+    """Backstop applied where the frame is measured.
+
+    Returns ``(payload, shrank)``. The largest strings are trimmed first, so a
+    small id is never cut while a multi-megabyte blob is.
+    """
+
+    if _serialized_size(payload) <= max_bytes:
+        return payload, False
+
+    # Longest first: cutting the biggest offender buys the most headroom.
+    ordered = sorted(_all_strings(payload), key=_utf8_len, reverse=True)
+    for text in ordered:
+        if _serialized_size(payload) <= max_bytes:
+            break
+        if _utf8_len(text) <= 2048:
+            # Small enough that cutting it would not help; only replace it when
+            # the structure itself is the problem, which _shrink handles.
+            continue
+        allowed = max_bytes - (_serialized_size(payload) - _utf8_len(text))
+        bounded = _truncate_text(text, max(allowed, 0))
+        payload = _map_strings(payload, {id(text): bounded})
+    if _serialized_size(payload) > max_bytes:
+        payload = _shrink(payload, max_bytes)
+    return payload, True
+
+
+def _all_strings(value: Any) -> list[str]:
+    found: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, str):
+            found.append(node)
+        elif isinstance(node, dict):
+            for child in node.values():
+                walk(child)
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                walk(child)
+
+    walk(value)
+    return found
+
+
+def _map_strings(node: Any, replacements: dict[int, str]) -> Any:
+    """Rebuild ``node`` with the identified strings replaced."""
+
+    if isinstance(node, str):
+        return replacements.get(id(node), node)
+    if isinstance(node, dict):
+        return {key: _map_strings(child, replacements) for key, child in node.items()}
+    if isinstance(node, list):
+        return [_map_strings(child, replacements) for child in node]
+    if isinstance(node, tuple):
+        return tuple(_map_strings(child, replacements) for child in node)
+    return node
 
 
 def _serialized(value: Any) -> str:
