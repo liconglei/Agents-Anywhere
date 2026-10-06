@@ -4249,6 +4249,34 @@ def test_start_turn_materializes_attachments_as_file_parts(tmp_path) -> None:
             os.environ[ATTACHMENTS_ROOT_ENV] = previous
 
 
+@pytest.mark.parametrize(
+    ("name", "declared", "expected"),
+    [
+        ("ci.yml", "application/octet-stream", "text/plain"),
+        ("config.yaml", None, "text/plain"),
+        ("README", "application/octet-stream", "text/plain"),
+        ("main.py", "application/octet-stream", "text/plain"),
+        ("logo.png", "application/octet-stream", "application/octet-stream"),
+        ("model.bin", "application/octet-stream", "application/octet-stream"),
+        ("manual.pdf", "application/pdf", "application/pdf"),
+        ("photo.png", "image/png", "image/png"),
+    ],
+)
+def test_resolve_media_type_never_leaves_text_unusable(
+    name: str, declared: str | None, expected: str
+) -> None:
+    """A generic binary label on a text file fails the whole turn.
+
+    openai-compatible providers reject an unrecognised file part media type
+    outright (AI_UnsupportedFunctionalityError), so a yml the platform filed as
+    application/octet-stream has to be re-labelled before it reaches the model.
+    """
+
+    from connector.runtimes.opencode.attachments import resolve_media_type
+
+    assert resolve_media_type(name, declared) == expected
+
+
 def test_timeline_maps_user_file_parts_to_attachments() -> None:
     """User file parts surface as timeline attachments (platform fileId
     recovered from the connector-encoded filename); synthetic inline-read
