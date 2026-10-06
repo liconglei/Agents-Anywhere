@@ -39,6 +39,10 @@ desktop-workbench/.cache/
 desktop-workbench/release/
 desktop-next/build/uv/
 
+# Standalone Connector package build output and download cache.
+connector/dist/
+connector/.cache/
+
 # Generated reference-doc caches live under docs/reference locally.
 docs/reference/*
 !docs/reference/README.md
