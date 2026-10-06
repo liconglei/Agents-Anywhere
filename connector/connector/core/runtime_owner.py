@@ -38,23 +38,46 @@ def runtime_path(config_path: str | Path | None = None) -> Path:
     return system_home() / ".agents-anywhere" / "connector-runtime.json"
 
 
-def state_lock_port(path: str | Path) -> int:
-    """The per-user TCP port that represents this record's cross-process mutex."""
+def _state_lock_port_seed(path: str | Path) -> str:
     file = Path(path)
     identity = str(file.parent.resolve() / file.name)
     if sys.platform == "win32":
         identity = identity.lower()
-    digest = hashlib.sha256(f"aa-machine-state-v1\n{identity}".encode()).digest()
+    return f"aa-machine-state-v1\n{identity}"
+
+
+def state_lock_port(path: str | Path) -> int:
+    """The per-user TCP port that represents this record's cross-process mutex."""
+    digest = hashlib.sha256(_state_lock_port_seed(path).encode()).digest()
     return 49152 + int.from_bytes(digest[:2], "big") % 16384
 
 
-def _claim_state_lock(port: int, deadline: float) -> socket.socket:
+def _state_lock_fallback_port(path: str | Path, attempt: int) -> int:
+    """A deterministic alternative to :func:`state_lock_port`.
+
+    Windows reserves large swaths of the dynamic range (Hyper-V, WSL, and other
+    virtualisation stacks), so the hashed port is unusable outright roughly half
+    the time. Deriving the fallback from the same identity plus an attempt
+    counter keeps every process on the same machine agreeing on one port.
+    """
+    seed = f"{_state_lock_port_seed(path)}\n{attempt}"
+    digest = hashlib.sha256(seed.encode()).digest()
+    return 49152 + int.from_bytes(digest[:2], "big") % 16384
+
+
+def _claim_state_lock(path: Path, deadline: float) -> socket.socket:
     """Binding alone claims the port, so a failed attempt must never reuse its socket.
 
+    ``EADDRINUSE`` means a peer holds the lock, so the same port is retried.
+    ``EACCES`` on Windows means the port sits in an OS-reserved range and no
+    amount of waiting will free it, so the deterministic fallback is used.
+
     SO_REUSEADDR is deliberately not set on POSIX: Linux then lets a second process bind
-    the same port while the owner sits between bind() and listen(), which both breaks the
-    exclusion and makes the next bind() fail with EINVAL.
+    the same port while the owner sits between bind() and listen(), which both breaks
+    the exclusion and makes the next bind() fail with EINVAL.
     """
+    port = state_lock_port(path)
+    attempt = 0
     while True:
         lease = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -65,6 +88,10 @@ def _claim_state_lock(port: int, deadline: float) -> socket.socket:
             return lease
         except OSError as exc:
             lease.close()
+            if exc.errno == errno.EACCES and sys.platform == "win32" and time.monotonic() < deadline:
+                attempt += 1
+                port = _state_lock_fallback_port(path, attempt)
+                continue
             if exc.errno not in {errno.EADDRINUSE, errno.EACCES}:
                 raise
             if time.monotonic() >= deadline:
@@ -75,7 +102,7 @@ def _claim_state_lock(port: int, deadline: float) -> socket.socket:
 @contextmanager
 def state_lock(path: Path, timeout: float = 5) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lease = _claim_state_lock(state_lock_port(path), time.monotonic() + timeout)
+    lease = _claim_state_lock(path, time.monotonic() + timeout)
     try:
         yield
     finally:

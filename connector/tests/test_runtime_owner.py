@@ -5,6 +5,7 @@ import os
 import socket
 import subprocess
 import sys
+from errno import EACCES
 
 import pytest
 
@@ -147,6 +148,46 @@ def test_state_lock_excludes_a_socket_that_has_not_started_listening(tmp_path):
         holder.close()
     with runtime_owner.state_lock(path, timeout=0.2):
         pass
+
+
+def test_state_lock_falls_back_when_the_hashed_port_is_reserved(tmp_path, monkeypatch):
+    """Windows reserves big port ranges, so a refused bind must not look like contention."""
+    path = tmp_path / ".rti_reserved.migration.lock"
+    reserved = runtime_owner.state_lock_port(path)
+    fallback = runtime_owner._state_lock_fallback_port(path, 1)
+    assert fallback != reserved
+
+    attempts: list[int] = []
+
+    def fake_claim(chosen: int) -> None:  # pragma: no cover - replaced below
+        raise AssertionError("unused")
+
+    real_socket = runtime_owner.socket.socket
+
+    class RecordingSocket(real_socket):  # type: ignore[misc, valid-type]
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+        def bind(self, address):  # type: ignore[override]
+            attempts.append(address[1])
+            if address[1] == reserved:
+                # Windows maps WSAEACCES to errno.EACCES for reserved ranges.
+                raise OSError(EACCES, "permission denied")
+            return real_socket.bind(self, address)
+
+    with monkeypatch.context() as scope:
+        scope.setattr(runtime_owner.socket, "socket", RecordingSocket)
+        with runtime_owner.state_lock(path, timeout=5):
+            pass
+    assert attempts[:2] == [reserved, fallback]
+
+
+def test_state_lock_fallback_port_is_deterministic(tmp_path):
+    path = tmp_path / ".rti_deterministic.migration.lock"
+    first = runtime_owner._state_lock_fallback_port(path, 1)
+    assert first == runtime_owner._state_lock_fallback_port(path, 1)
+    assert first != runtime_owner._state_lock_fallback_port(path, 2)
+    assert first != runtime_owner.state_lock_port(path)
 
 
 def test_live_unrelated_process_does_not_block_connector_start():
