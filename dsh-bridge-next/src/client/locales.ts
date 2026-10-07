@@ -243,7 +243,7 @@ export const en = {
   "用于定时扫描的 Agent；DSH 消息实时同步": "For agents that use periodic scanning; DSH messages sync in real time",
   "{count} 秒": "{count} seconds",
   "断线自动重连": "Reconnect automatically",
-  "Connector 意外退出后自动重启；多次失败会停止重试": "Restarts the Connector automatically after an unexpected exit; repeated failures stop retrying.",
+  "意外退出或服务器未就绪时自动重连；多次失败会停止重试": "Reconnects after an unexpected exit or while the server is unavailable; repeated failures stop retrying.",
   "已开启": "On",
   "已关闭": "Off",
   "设置已保存": "Settings saved",

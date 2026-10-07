@@ -36,6 +36,7 @@ interface Dependencies {
   reconnectScheduleMs?: number[]
   reconnectStableMs?: number
   reconnectMaxAttempts?: number
+  resumeScheduleMs?: number[]
 }
 
 /** Backoff for a Connector child that died on its own; the server outage itself is retried inside the child. */
@@ -44,6 +45,8 @@ const RECONNECT_SCHEDULE_MS = [1_000, 2_000, 4_000, 8_000, 15_000]
 const RECONNECT_STABLE_MS = 60_000
 /** After this many attempts the plugin stops on its own and waits for a manual start. */
 const RECONNECT_MAX_ATTEMPTS = 8
+/** Backoff for a saved connection whose server was not up yet when the plugin started. */
+const RESUME_SCHEDULE_MS = [3_000, 5_000, 10_000, 20_000, 30_000]
 
 export class OnboardingManager {
   private settings: ConnectionSettings
@@ -85,6 +88,10 @@ export class OnboardingManager {
   private readonly reconnectScheduleMs: number[]
   private readonly reconnectStableMs: number
   private readonly reconnectMaxAttempts: number
+  private resumeTimer: ReturnType<typeof setTimeout> | null = null
+  private resumeTask: Promise<unknown> | null = null
+  private resumeAttempts = 0
+  private readonly resumeScheduleMs: number[]
 
   constructor(private readonly config: ResolvedConfig, private readonly dependencies: Dependencies = {}) {
     this.settings = { apiBaseUrl: config.apiBaseUrl }
@@ -103,6 +110,7 @@ export class OnboardingManager {
     this.reconnectScheduleMs = dependencies.reconnectScheduleMs ?? RECONNECT_SCHEDULE_MS
     this.reconnectStableMs = dependencies.reconnectStableMs ?? RECONNECT_STABLE_MS
     this.reconnectMaxAttempts = dependencies.reconnectMaxAttempts ?? RECONNECT_MAX_ATTEMPTS
+    this.resumeScheduleMs = dependencies.resumeScheduleMs ?? RESUME_SCHEDULE_MS
     this.unsubscribeUnexpectedStop = this.connector.onUnexpectedStop?.(() => this.scheduleReconnect(true)) ?? (() => {})
   }
 
@@ -138,7 +146,7 @@ export class OnboardingManager {
         const wasBlocked = this.desktop.status !== 'absent'
         void this.refreshRole().then(() => {
           if (wasBlocked && !this.disposed && this.desktop.status === 'absent' && this.account) {
-            void this.begin().catch(error => this.setProgress('error', safeMessage(error)))
+            void this.begin().catch(error => { this.setProgress('error', safeMessage(error)); this.scheduleResume() })
           }
         }).catch(error => this.setProgress('error', safeMessage(error)))
       }, this.dependencies.rolePollIntervalMs ?? 1500)
@@ -154,7 +162,7 @@ export class OnboardingManager {
     await this.initialize()
     if (this.account && this.desktop.status === 'absent') {
       // This starts only a previously authorized device. Fresh installs are idle.
-      try { await this.begin() } catch (error) { this.setProgress('error', safeMessage(error)) }
+      try { await this.begin() } catch (error) { this.setProgress('error', safeMessage(error)); this.scheduleResume() }
     }
   }
 
@@ -357,6 +365,7 @@ export class OnboardingManager {
     else if (error instanceof ConnectorCredentialError && this.binding) await this.checkDeviceRecovery(this.binding.connectorId)
     else if (error instanceof ApiError && error.status === 401 && this.binding) this.setRecovery(this.binding.connectorId, 'login_required', '账号登录已失效，请重新登录后恢复设备连接。')
     else if (!this.recovery) this.setProgress('error', safeMessage(error))
+    this.scheduleResume()
   }
 
   recoverDevice(action: DeviceRecoveryAction): Promise<DeviceRecoveryResult> {
@@ -527,6 +536,43 @@ export class OnboardingManager {
     this.reconnectAttempts = 0
   }
 
+  private canResumeServer(): boolean {
+    return !this.disposed && Boolean(this.account) && this.desktop.status === 'absent'
+      && !this.recovery && !this.connectorAuthFailed && this.stage === 'error'
+      && this.connectorSettings.get().autoReconnect
+  }
+
+  private scheduleResume(): void {
+    if (this.resumeTimer || this.resumeTask) return
+    if (!this.canResumeServer()) return
+    const base = this.resumeScheduleMs[Math.min(this.resumeAttempts, this.resumeScheduleMs.length - 1)] ?? RESUME_SCHEDULE_MS[0] ?? 3_000
+    this.resumeAttempts += 1
+    const timer = setTimeout(() => { this.resumeTimer = null; void this.runResume() },
+      Math.max(1, base + Math.round(base * 0.2 * (Math.random() * 2 - 1))))
+    timer.unref?.()
+    this.resumeTimer = timer
+  }
+
+  private runResume(): Promise<void> {
+    const task: Promise<void> = Promise.resolve().then(async () => {
+      try {
+        if (!this.canResumeServer()) return
+        await this.begin()
+        this.resumeAttempts = 0
+      } catch { }
+      finally { if (this.resumeTask === task) this.resumeTask = null }
+      if (this.stage === 'error') this.scheduleResume()
+    })
+    this.resumeTask = task
+    return task
+  }
+
+  private cancelResume(): void {
+    if (this.resumeTimer) clearTimeout(this.resumeTimer)
+    this.resumeTimer = null
+    this.resumeAttempts = 0
+  }
+
   saveConnectorSettings(input: ConnectorSettings): Promise<null> {
     return this.serial(async () => {
       await this.requireStandalone()
@@ -540,6 +586,7 @@ export class OnboardingManager {
       if (this.disposed) throw new Error('插件已关闭。')
       await this.connectorSettings.save(next)
       this.resolvedUvPath = await resolveUv(this.config, next)
+      if (!previous.autoReconnect && this.canResumeServer()) this.scheduleResume()
       if (restart) {
         await this.cancelFlow()
         await this.connector.stop()
@@ -606,6 +653,7 @@ export class OnboardingManager {
   private async cancelFlow(): Promise<void> {
     // Any explicit navigation supersedes a pending automatic retry.
     this.cancelReconnect()
+    this.cancelResume()
     this.recoveryController?.abort()
     this.recoveryCheck = null
     this.recoveryController = null
@@ -647,6 +695,7 @@ export class OnboardingManager {
     this.unsubscribeConnector()
     this.unsubscribeUnexpectedStop()
     this.cancelReconnect()
+    this.cancelResume()
     this.controller?.abort()
     this.profileController.abort()
     await this.profileRefresh
@@ -662,6 +711,7 @@ export class OnboardingManager {
     if (this.roleTimer) clearInterval(this.roleTimer)
     this.roleTimer = null
     this.cancelReconnect()
+    this.cancelResume()
     this.mobile.clear()
     this.controller?.abort()
     this.profileController.abort()

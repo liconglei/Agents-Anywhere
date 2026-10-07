@@ -89,6 +89,7 @@ async function fixture() {
     checkServer: async (base) => { checkedServers.push(base); if (healthError) throw healthError },
     onlineTimeoutMs: 5000, pollIntervalMs: 10,
     reconnectScheduleMs: [5], reconnectMaxAttempts: 3,
+    resumeScheduleMs: [5],
     machineState: {
       readConnectorIds: async () => localIds,
     },
@@ -101,6 +102,7 @@ async function fixture() {
     setDesktop(value: DesktopDetection) { detection = value },
     setLocalIds(value: string[]) { localIds = value },
     failHealthCheck() { healthError = new Error('无法连接服务器，请检查地址和网络后重试。') },
+    restoreHealthCheck() { healthError = null },
     async reopen() { await manager.dispose(); manager = create(); return manager },
     async close() { await manager.dispose(); await rm(root, { recursive: true, force: true }) },
   }
@@ -552,6 +554,54 @@ test('invalid or unavailable login targets preserve the connected account and ba
     assert.equal((await h.manager.inspect()).stage, 'ready')
     assert.deepEqual(await readJson(join(h.root, 'account.json')), account)
     assert.deepEqual(await readJson(join(h.root, 'settings.json')), { apiBaseUrl: h.api.baseUrl })
+  } finally { await h.close() }
+})
+
+test('a server that is unreachable at startup is retried until the saved connection returns on its own', async () => {
+  const h = await fixture()
+  h.api.online = true
+  try {
+    await callback((await h.manager.begin()).url)
+    await until(async () => (await h.manager.inspect()).stage === 'ready')
+    h.failHealthCheck()
+    await h.reopen()
+    await h.manager.resume()
+    assert.equal((await h.manager.inspect()).stage, 'error')
+    const starts = h.connector.starts
+    h.restoreHealthCheck()
+    await until(async () => (await h.manager.inspect()).stage === 'ready')
+    assert.equal(h.connector.starts, starts + 1, 'recovery must start the Connector exactly once')
+    h.failHealthCheck()
+    await h.reopen()
+    await h.manager.resume()
+    assert.equal((await h.manager.inspect()).stage, 'error')
+    await h.manager.controlConnector('stop')
+    assert.equal((await h.manager.inspect()).stage, 'idle')
+    h.restoreHealthCheck()
+    await delay(60)
+    assert.equal(h.connector.starts, starts + 1, 'a manual stop must not be undone by the retry loop')
+  } finally { await h.close() }
+})
+
+test('the reconnect switch also gates waiting for a late server', async () => {
+  const h = await fixture()
+  h.api.online = true
+  try {
+    await h.manager.saveConnectorSettings({ ...DEFAULT_CONNECTOR_SETTINGS, autoReconnect: false })
+    await callback((await h.manager.begin()).url)
+    await until(async () => (await h.manager.inspect()).stage === 'ready')
+    h.failHealthCheck()
+    await h.reopen()
+    await h.manager.resume()
+    assert.equal((await h.manager.inspect()).stage, 'error')
+    const starts = h.connector.starts
+    h.restoreHealthCheck()
+    await delay(60)
+    assert.equal(h.connector.starts, starts, 'a closed switch must not retry on its own')
+    const settings = (await h.manager.inspect()).connector.settings
+    await h.manager.saveConnectorSettings({ ...settings, autoReconnect: true })
+    await until(async () => (await h.manager.inspect()).stage === 'ready')
+    assert.equal(h.connector.starts, starts + 1, 're-enabling the switch retries immediately')
   } finally { await h.close() }
 })
 

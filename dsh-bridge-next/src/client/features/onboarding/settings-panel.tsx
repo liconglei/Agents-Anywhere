@@ -104,7 +104,7 @@ export function SettingsPanel({ t, host, state, snapshot, onConnection }: {
             onChange={value => update('syncIntervalSeconds', Number(value))} />
         </div>
         <div className={css.row}>
-          <div><span>{t('断线自动重连')}</span><p className={css.hint}>{t('Connector 意外退出后自动重启；多次失败会停止重试')}</p></div>
+          <div><span>{t('断线自动重连')}</span><p className={css.hint}>{t('意外退出或服务器未就绪时自动重连；多次失败会停止重试')}</p></div>
           <Button variant="outline" aria-pressed={draft.autoReconnect} disabled={busy}
             onClick={() => update('autoReconnect', !draft.autoReconnect)}>
             {draft.autoReconnect ? t('已开启') : t('已关闭')}
