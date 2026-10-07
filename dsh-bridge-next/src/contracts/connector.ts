@@ -3,10 +3,11 @@ export interface ConnectorSettings {
   uvPypiIndexUrl: string
   uvPythonInstallMirror: string
   syncIntervalSeconds: number
+  autoReconnect: boolean
 }
 
 export const DEFAULT_CONNECTOR_SETTINGS: ConnectorSettings = {
-  uvPath: '', uvPypiIndexUrl: '', uvPythonInstallMirror: '', syncIntervalSeconds: 30,
+  uvPath: '', uvPypiIndexUrl: '', uvPythonInstallMirror: '', syncIntervalSeconds: 30, autoReconnect: true,
 }
 
 export const PYTHON_MIRRORS = [

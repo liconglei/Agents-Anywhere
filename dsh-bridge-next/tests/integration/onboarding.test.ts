@@ -823,4 +823,57 @@ test('Desktop appearing during pairing or mid-startup aborts and stops the plugi
   } finally { await h.close() }
 })
 
+test('an unexpected Connector exit restarts itself until the retry budget runs out', async () => {
+  const h = await fixture()
+  h.api.online = true
+  try {
+    await callback((await h.manager.begin()).url)
+    await until(async () => (await h.manager.inspect()).stage === 'ready')
+    const base = h.connector.starts
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      h.connector.crash()
+      await until(async () => h.connector.starts === base + attempt && (await h.manager.inspect()).stage === 'ready')
+    }
+    assert.equal(h.connector.stops >= 3, true, 'Each retry retires the dead child before starting a new one')
+    h.connector.crash()
+    await until(async () => (await h.manager.inspect()).stage === 'error')
+    assert.match((await h.manager.inspect()).message, /自动重试已停止/)
+    assert.equal(h.connector.starts, base + 3, 'The exhausted budget must not start another process')
+    assert.equal((await h.manager.inspect()).connectorRunning, false)
+  } finally { await h.close() }
+})
+
+test('manual stops, the off switch and expired credentials never auto-restart', async () => {
+  const h = await fixture()
+  h.api.online = true
+  try {
+    await callback((await h.manager.begin()).url)
+    await until(async () => (await h.manager.inspect()).stage === 'ready')
+
+    await h.manager.controlConnector('stop')
+    const stopped = h.connector.starts
+    h.connector.crash()
+    await delay(40)
+    assert.equal(h.connector.starts, stopped, 'An explicit stop must stay stopped')
+
+    const settings = (await h.manager.inspect()).connector.settings
+    await h.manager.saveConnectorSettings({ ...settings, autoReconnect: false })
+    await h.manager.controlConnector('start')
+    await until(async () => (await h.manager.inspect()).stage === 'ready')
+    const beforeOff = h.connector.starts
+    h.connector.crash()
+    await delay(40)
+    assert.equal(h.connector.starts, beforeOff, 'The off switch must keep the Connector down')
+
+    await h.manager.saveConnectorSettings({ ...settings, autoReconnect: true })
+    assert.equal((await h.manager.inspect()).connector.settings.autoReconnect, true, 'The switch persists')
+    await h.manager.controlConnector('start')
+    await until(async () => (await h.manager.inspect()).stage === 'ready')
+    const beforeExpiry = h.connector.starts
+    h.connector.expire()
+    await delay(40)
+    assert.equal(h.connector.starts, beforeExpiry, 'An expired credential belongs to the recovery flow')
+  } finally { await h.close() }
+})
+
 

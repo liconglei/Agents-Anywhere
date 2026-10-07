@@ -186,6 +186,11 @@ export class SourceConnector implements ConnectorProcess {
     return readRuntimeLogPage(client, query, this.cachedLogsPath)
   }
 
+  onUnexpectedStop(listener: () => void): () => void {
+    this.unexpectedStop.add(listener)
+    return () => { this.unexpectedStop.delete(listener) }
+  }
+
   private updateState(value: unknown): void {
     if (!value || typeof value !== 'object') return
     const state = value as Partial<ControlState> & { logsPath?: unknown }
@@ -506,5 +511,10 @@ export class SourceConnector implements ConnectorProcess {
     const waiter = this.readyWaiter
     this.readyWaiter = null
     if (waiter) { clearTimeout(waiter.timer); waiter.reject(error) }
+    for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error) }
+    this.pending.clear()
+    // stop() rejects pending calls with report=false; anything reported while no
+    // stop is in flight is the child failing on its own and is restartable.
+    if (report && !this.stopping) for (const listener of this.unexpectedStop) listener()
   }
 }

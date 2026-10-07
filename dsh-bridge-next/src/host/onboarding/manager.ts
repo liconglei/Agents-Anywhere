@@ -39,6 +39,9 @@ interface Dependencies {
   systemLanguages?: () => Promise<string[]>
   diagnostics?: RuntimeDiagnostics
   logOutput?: RpcLogOutput
+  reconnectScheduleMs?: number[]
+  reconnectStableMs?: number
+  reconnectMaxAttempts?: number
 }
 
 export class OnboardingManager {
