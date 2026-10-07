@@ -115,7 +115,9 @@ const hostMessages = {
   "连接失败，请重试。": "Connection failed. Try again.",
   "本机连接已关闭。": "The local connection has closed.",
   "请重新加载插件后再试。": "Reload the plugin and try again.",
-  "本机连接已就绪": "The local connection is ready"
+  "本机连接已就绪": "The local connection is ready",
+  "本机连接已断开，正在自动重试…": "The local connection dropped; retrying automatically…",
+  "本机连接已多次断开，自动重试已停止。请在设置页手动启动 Connector。": "The local connection dropped repeatedly, so automatic retries stopped. Start the Connector manually from the settings page."
 } as const
 
 export const en = {
@@ -240,6 +242,10 @@ export const en = {
   "同步间隔": "Sync interval",
   "用于定时扫描的 Agent；DSH 消息实时同步": "For agents that use periodic scanning; DSH messages sync in real time",
   "{count} 秒": "{count} seconds",
+  "断线自动重连": "Reconnect automatically",
+  "Connector 意外退出后自动重启；多次失败会停止重试": "Restarts the Connector automatically after an unexpected exit; repeated failures stop retrying.",
+  "已开启": "On",
+  "已关闭": "Off",
   "设置已保存": "Settings saved",
   "正在保存…": "Saving…",
   "保存并重启": "Save and restart",

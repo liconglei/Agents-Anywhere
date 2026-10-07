@@ -28,6 +28,7 @@ export function validateConnectorSettings(value: unknown): ConnectorSettings {
   if (!Number.isInteger(settings.syncIntervalSeconds) || settings.syncIntervalSeconds < 1 || settings.syncIntervalSeconds > 3600) {
     throw new Error('同步间隔必须是 1–3600 之间的整数。')
   }
+  if (typeof settings.autoReconnect !== 'boolean') throw new Error('断线自动重连设置无效。')
   return settings
 }
 

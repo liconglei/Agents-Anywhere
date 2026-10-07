@@ -49,11 +49,24 @@ class FakeConnector implements ConnectorProcess {
   starts = 0
   stops = 0
   listeners = new Set<(state: ConnectorState) => void>()
+  unexpected = new Set<() => void>()
   onState(listener: (state: ConnectorState) => void) { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
-  expire() { this.running = false; for (const listener of this.listeners) listener({ running: false, authFailed: true }) }
+  onUnexpectedStop(listener: () => void) { this.unexpected.add(listener); return () => { this.unexpected.delete(listener) } }
+  private die(state: ConnectorState) {
+    this.running = false
+    for (const listener of this.listeners) listener(state)
+    for (const listener of this.unexpected) listener()
+  }
+  expire() { this.die({ running: false, authFailed: true }) }
+  crash() { this.die({ running: false, authFailed: false }) }
   async prepare() {}
   startError: Error | null = null
-  async start() { if (this.startError) throw this.startError; this.running = true; this.starts++ }
+  async start() {
+    if (this.startError) throw this.startError
+    this.running = true
+    this.starts++
+    for (const listener of this.listeners) listener({ running: true, authFailed: false })
+  }
   async stop() { this.running = false; this.stops++ }
   async assertHealthy() { if (!this.running) throw new Error('not running') }
 }
@@ -75,6 +88,7 @@ async function fixture() {
     api: base => base === api.baseUrl ? api : new FakeApi(base), connector, detect: async () => { detections++; return detection },
     checkServer: async (base) => { checkedServers.push(base); if (healthError) throw healthError },
     onlineTimeoutMs: 5000, pollIntervalMs: 10,
+    reconnectScheduleMs: [5], reconnectMaxAttempts: 3,
     machineState: {
       readConnectorIds: async () => localIds,
     },
@@ -682,9 +696,62 @@ test('failed device reconfiguration returns no browser destination and remains r
     assert.equal(await h.manager.recoverDevice('recreate'), null)
     assert.equal(h.api.registrations, 1)
     assert.equal((await h.manager.inspect()).deviceRecovery?.status, 'unavailable')
-    h.api.register = register
-    await h.manager.recoverDevice('check')
-    assert.ok((await h.manager.recoverDevice('recreate'))?.url)
-    assert.equal(h.api.registrations, 2)
-  } finally { await h.close() }
-})
+      h.api.register = register
+      await h.manager.recoverDevice('check')
+      assert.ok((await h.manager.recoverDevice('recreate'))?.url)
+      assert.equal(h.api.registrations, 2)
+    } finally { await h.close() }
+  })
+
+  test('an unexpected Connector exit restarts itself until the retry budget runs out', async () => {
+    const h = await fixture()
+    h.api.online = true
+    try {
+      await callback((await h.manager.begin()).url)
+      await until(async () => (await h.manager.inspect()).stage === 'ready')
+      const base = h.connector.starts
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        h.connector.crash()
+        await until(async () => h.connector.starts === base + attempt && (await h.manager.inspect()).stage === 'ready')
+      }
+      assert.equal(h.connector.stops >= 3, true, 'Each retry retires the dead child before starting a new one')
+      h.connector.crash()
+      await until(async () => (await h.manager.inspect()).stage === 'error')
+      assert.match((await h.manager.inspect()).message, /自动重试已停止/)
+      assert.equal(h.connector.starts, base + 3, 'The exhausted budget must not start another process')
+      assert.equal((await h.manager.inspect()).connectorRunning, false)
+    } finally { await h.close() }
+  })
+
+  test('manual stops, the off switch and expired credentials never auto-restart', async () => {
+    const h = await fixture()
+    h.api.online = true
+    try {
+      await callback((await h.manager.begin()).url)
+      await until(async () => (await h.manager.inspect()).stage === 'ready')
+
+      await h.manager.controlConnector('stop')
+      const stopped = h.connector.starts
+      h.connector.crash()
+      await delay(40)
+      assert.equal(h.connector.starts, stopped, 'An explicit stop must stay stopped')
+
+      const settings = (await h.manager.inspect()).connector.settings
+      await h.manager.saveConnectorSettings({ ...settings, autoReconnect: false })
+      await h.manager.controlConnector('start')
+      await until(async () => (await h.manager.inspect()).stage === 'ready')
+      const beforeOff = h.connector.starts
+      h.connector.crash()
+      await delay(40)
+      assert.equal(h.connector.starts, beforeOff, 'The off switch must keep the Connector down')
+
+      await h.manager.saveConnectorSettings({ ...settings, autoReconnect: true })
+      assert.equal((await h.manager.inspect()).connector.settings.autoReconnect, true, 'The switch persists')
+      await h.manager.controlConnector('start')
+      await until(async () => (await h.manager.inspect()).stage === 'ready')
+      const beforeExpiry = h.connector.starts
+      h.connector.expire()
+      await delay(40)
+      assert.equal(h.connector.starts, beforeExpiry, 'An expired credential belongs to the recovery flow')
+    } finally { await h.close() }
+  })

@@ -103,6 +103,13 @@ export function SettingsPanel({ t, host, state, snapshot, onConnection }: {
             options={[...new Set([...SYNC_INTERVALS, draft.syncIntervalSeconds])].sort((a, b) => a - b).map(value => ({ id: String(value), label: t('{count} 秒', { count: value }) }))}
             onChange={value => update('syncIntervalSeconds', Number(value))} />
         </div>
+        <div className={css.row}>
+          <div><span>{t('断线自动重连')}</span><p className={css.hint}>{t('Connector 意外退出后自动重启；多次失败会停止重试')}</p></div>
+          <Button variant="outline" aria-pressed={draft.autoReconnect} disabled={busy}
+            onClick={() => update('autoReconnect', !draft.autoReconnect)}>
+            {draft.autoReconnect ? t('已开启') : t('已关闭')}
+          </Button>
+        </div>
         <div className={css.save}>
           {saved && !dirty ? <span className={css.hint} role="status">{t('设置已保存')}</span> : null}
           <Button type="submit" variant="primary" disabled={busy || !dirty}>

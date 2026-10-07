@@ -33,7 +33,17 @@ interface Dependencies {
   pollIntervalMs?: number
   openFolder?: (path: string) => Promise<void>
   systemLanguages?: () => Promise<string[]>
+  reconnectScheduleMs?: number[]
+  reconnectStableMs?: number
+  reconnectMaxAttempts?: number
 }
+
+/** Backoff for a Connector child that died on its own; the server outage itself is retried inside the child. */
+const RECONNECT_SCHEDULE_MS = [1_000, 2_000, 4_000, 8_000, 15_000]
+/** A run that stayed up this long starts a new retry budget instead of continuing the old one. */
+const RECONNECT_STABLE_MS = 60_000
+/** After this many attempts the plugin stops on its own and waits for a manual start. */
+const RECONNECT_MAX_ATTEMPTS = 8
 
 export class OnboardingManager {
   private settings: ConnectionSettings
@@ -66,6 +76,15 @@ export class OnboardingManager {
   private roleCheck: Promise<void> | null = null
   private roleTimer: ReturnType<typeof setInterval> | null = null
   private resolvedUvPath: string | null = null
+  private readonly unsubscribeUnexpectedStop: () => void
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private reconnectTask: Promise<unknown> | null = null
+  private reconnectAttempts = 0
+  private connectedAt = 0
+  private connectorAuthFailed = false
+  private readonly reconnectScheduleMs: number[]
+  private readonly reconnectStableMs: number
+  private readonly reconnectMaxAttempts: number
 
   constructor(private readonly config: ResolvedConfig, private readonly dependencies: Dependencies = {}) {
     this.settings = { apiBaseUrl: config.apiBaseUrl }
@@ -75,10 +94,16 @@ export class OnboardingManager {
     this.launchDesktop = dependencies.launchDesktop ?? launchDesktop
     this.apiFactory = dependencies.api ?? (base => new AccountApi(base))
     this.unsubscribeConnector = this.connector.onState(state => {
+      // An expired credential exits the child too; the recovery flow owns that case.
+      this.connectorAuthFailed = state.authFailed
       if (state.authFailed && this.binding && this.account && !this.disposed) {
         void this.checkDeviceRecovery(this.binding.connectorId)
       }
     })
+    this.reconnectScheduleMs = dependencies.reconnectScheduleMs ?? RECONNECT_SCHEDULE_MS
+    this.reconnectStableMs = dependencies.reconnectStableMs ?? RECONNECT_STABLE_MS
+    this.reconnectMaxAttempts = dependencies.reconnectMaxAttempts ?? RECONNECT_MAX_ATTEMPTS
+    this.unsubscribeUnexpectedStop = this.connector.onUnexpectedStop?.(() => this.scheduleReconnect(true)) ?? (() => {})
   }
 
   initialize(): Promise<void> {
@@ -434,12 +459,72 @@ export class OnboardingManager {
       this.setProgress('starting', '正在启动 Connector…')
       await this.connector.start(this.binding, account.apiBaseUrl, controller.signal)
       await this.waitOnline(api, account, this.binding.connectorId, controller.signal)
+      this.connectedAt = Date.now()
       this.setProgress('ready', '本机设备已连接。')
     } catch (error) {
       await this.connectionFailed(error)
       await this.connector.stop()
       throw error
     } finally { if (this.controller === controller) this.controller = null }
+  }
+
+  /** A crash is only retryable while the connection was up; a failed retry keeps its own chain alive. */
+  private canRetryConnector(): boolean {
+    // flow/work/controller stay set after a successful connect, so the gate is the stage itself:
+    // a retry may resume from a crashed "ready" or a failed "error", never from a running flow.
+    return !this.disposed && Boolean(this.account) && Boolean(this.binding) && !this.recovery
+      && (this.stage === 'ready' || this.stage === 'error') && this.desktop.status === 'absent'
+      && !this.connectorAuthFailed && this.connectorSettings.get().autoReconnect
+  }
+
+  /**
+   * The child already retries the server on its own, so this only supervises a
+   * Connector process that died or failed by itself: bounded backoff, a fresh
+   * budget after a stable run, and a manual stop when the budget runs out.
+   */
+  private scheduleReconnect(fromCrash: boolean): void {
+    if (this.reconnectTimer || this.reconnectTask) return
+    if (fromCrash && this.stage !== 'ready') return
+    if (!this.canRetryConnector()) return
+    if (fromCrash && this.connectedAt && Date.now() - this.connectedAt >= this.reconnectStableMs) this.reconnectAttempts = 0
+    if (this.reconnectAttempts >= this.reconnectMaxAttempts) {
+      this.reconnectAttempts = 0
+      this.setProgress('error', '本机连接已多次断开，自动重试已停止。请在设置页手动启动 Connector。')
+      return
+    }
+    const base = this.reconnectScheduleMs[Math.min(this.reconnectAttempts, this.reconnectScheduleMs.length - 1)] ?? RECONNECT_SCHEDULE_MS[0] ?? 1_000
+    this.reconnectAttempts += 1
+    // Stage stays "ready" so settings and control actions are not locked while waiting.
+    this.message = '本机连接已断开，正在自动重试…'
+    const timer = setTimeout(() => { this.reconnectTimer = null; void this.runReconnect() },
+      Math.max(1, base + Math.round(base * 0.2 * (Math.random() * 2 - 1))))
+    timer.unref?.()
+    this.reconnectTimer = timer
+  }
+
+  private runReconnect(): Promise<void> {
+    const task = this.serial(async () => {
+      let failed = false
+      try {
+        if (!this.canRetryConnector()) return
+        // stop() clears a latched failure and the dead child before a fresh start.
+        await this.connector.stop()
+        if (!this.canRetryConnector()) return
+        await this.startConnector()
+      } catch { failed = true }
+      finally { if (this.reconnectTask === task) this.reconnectTask = null }
+      // Without this the chain would die here: startConnector already reported
+      // the failure, so no further crash event will arrive to schedule the next attempt.
+      if (failed) this.scheduleReconnect(false)
+    })
+    this.reconnectTask = task
+    return task
+  }
+
+  private cancelReconnect(): void {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
+    this.reconnectAttempts = 0
   }
 
   saveConnectorSettings(input: ConnectorSettings): Promise<null> {
@@ -519,6 +604,8 @@ export class OnboardingManager {
   }
 
   private async cancelFlow(): Promise<void> {
+    // Any explicit navigation supersedes a pending automatic retry.
+    this.cancelReconnect()
     this.recoveryController?.abort()
     this.recoveryCheck = null
     this.recoveryController = null
@@ -558,6 +645,8 @@ export class OnboardingManager {
     this.roleTimer = null
     this.mobile.clear()
     this.unsubscribeConnector()
+    this.unsubscribeUnexpectedStop()
+    this.cancelReconnect()
     this.controller?.abort()
     this.profileController.abort()
     await this.profileRefresh
@@ -572,6 +661,7 @@ export class OnboardingManager {
     this.disposed = true
     if (this.roleTimer) clearInterval(this.roleTimer)
     this.roleTimer = null
+    this.cancelReconnect()
     this.mobile.clear()
     this.controller?.abort()
     this.profileController.abort()

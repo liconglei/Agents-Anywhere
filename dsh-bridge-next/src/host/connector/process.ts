@@ -46,6 +46,8 @@ export interface ConnectorProcess {
   readonly running: boolean
   readonly lastError?: string | null
   onState(listener: (state: ConnectorState) => void): () => void
+  /** Fires only when the child fails or exits on its own, never for an explicit stop(). */
+  onUnexpectedStop?(listener: () => void): () => void
   prepare(settings?: ConnectorSettings): Promise<void>
   start(binding: BoundDevice, apiBaseUrl: string, signal: AbortSignal): Promise<void>
   stop(): Promise<void>
@@ -72,6 +74,7 @@ export class SourceConnector implements ConnectorProcess {
   private stopping: Promise<void> | null = null
   private state: ConnectorState = { running: false, authFailed: false }
   private listeners = new Set<(state: ConnectorState) => void>()
+  private readonly unexpectedStop = new Set<() => void>()
   private readonly closed = new WeakSet<ChildProcessWithoutNullStreams>()
   private readonly logs: ConnectorLogs
   /** 可写的项目副本；uv 只在这个目录里写 uv.lock，绝不碰插件包目录。 */
@@ -89,6 +92,11 @@ export class SourceConnector implements ConnectorProcess {
   onState(listener: (state: ConnectorState) => void): () => void {
     this.listeners.add(listener)
     return () => { this.listeners.delete(listener) }
+  }
+
+  onUnexpectedStop(listener: () => void): () => void {
+    this.unexpectedStop.add(listener)
+    return () => { this.unexpectedStop.delete(listener) }
   }
 
   private updateState(value: unknown): void {
@@ -291,5 +299,8 @@ export class SourceConnector implements ConnectorProcess {
     this.updateState({ ...this.state, running: false })
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error) }
     this.pending.clear()
+    // stop() rejects pending calls with report=false; anything reported while no
+    // stop is in flight is the child failing on its own and is restartable.
+    if (report && !this.stopping) for (const listener of this.unexpectedStop) listener()
   }
 }
