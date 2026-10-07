@@ -5513,6 +5513,39 @@ def test_send_message_records_active_run(tmp_path):
     assert active["params"]["content"] == "hi"
 
 
+def test_send_message_timeout_clears_run_and_allows_retry(tmp_path):
+    client = make_client(tmp_path)
+    connector_id, _, session_id, headers = create_connector_and_session(client)
+    fake_rpc = FakeLocalRpc()
+    client.app.state.rpc = fake_rpc
+    asyncio.run(client.app.state.store.set_connector_status(connector_id, "online"))
+    client.post(f"/sessions/{session_id}/takeover", headers=headers).raise_for_status()
+    fake_rpc.timeout_session_methods = {"session.send_message"}
+
+    response = client.post(
+        f"/sessions/{session_id}/runtime/messages",
+        headers=headers,
+        json={"content": "hi", "clientMessageId": "opt_timeout"},
+    )
+
+    assert response.status_code == 504, response.text
+    assert response.json()["detail"]["code"] == "runtime_send_timeout"
+    # Without the clear the row survives, the session derives to "waiting" and can
+    # never be sent to again: has_active_run -> waiting, and can_send_session_message
+    # only accepts idle. Nothing sweeps it afterwards.
+    assert asyncio.run(client.app.state.store.get_active_run(session_id)) is None
+
+    fake_rpc.timeout_session_methods.clear()
+    retry = client.post(
+        f"/sessions/{session_id}/runtime/messages",
+        headers=headers,
+        json={"content": "retry", "clientMessageId": "opt_timeout_retry"},
+    )
+
+    assert retry.status_code == 200, retry.text
+    assert asyncio.run(client.app.state.store.get_active_run(session_id)) is not None
+
+
 def test_send_message_rejects_persisted_runtime_archived_session(tmp_path):
     client = make_client(tmp_path)
     connector_id, _, session_id, headers = create_connector_and_session(client)
