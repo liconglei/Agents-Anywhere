@@ -2469,10 +2469,27 @@ class OpenCodeRuntime(AgentRuntime):
         # snapshot, which restates the same item ids from the message list.
         await self._finish_streaming_parts(platform_id, native_id)
         items = await self._publish_timeline_safe(platform_id, native_id)
+        if items is not None and not items:
+            # opencode reported the turn finished while the snapshot holds no items
+            # at all, so the platform records a completed turn with nothing to
+            # show. This has been observed when the provider produced no output:
+            # the turn is closed as "completed" and the real failure only surfaces
+            # later as a separate session.error, if at all. Warning here is the
+            # only place the gap is visible - reconcile's own status poll succeeded,
+            # so it has no error of its own to report. Outcome stays "completed"
+            # because an empty turn is not provably a failure.
+            logger.warning(
+                "opencode turn ended with no timeline items: platform={} native={} "
+                "outcome={} elapsed={}s - nothing was rendered for this turn",
+                platform_id,
+                native_id,
+                outcome,
+                self._turn_elapsed_s(native_id),
+            )
         # After the snapshot: it is the authoritative picture of what opencode
         # thinks finished, and anything still running in it will never be
         # corrected by a later event.
-        await self._settle_unfinished_items(platform_id, native_id, items, outcome)
+        await self._settle_unfinished_items(platform_id, native_id, items or (), outcome)
         self._pending_messages.unresolve(native_id)
         await self._report_turn_end(platform_id, native_id, outcome)
         await self._flush_unended_turns()
@@ -2554,7 +2571,14 @@ class OpenCodeRuntime(AgentRuntime):
 
     async def _publish_timeline_safe(
         self, session_id: str, external_session_id: str
-    ) -> tuple[RuntimeTimelineItem, ...]:
+    ) -> tuple[RuntimeTimelineItem, ...] | None:
+        """Publish the authoritative snapshot, or ``None`` when it could not be read.
+
+        ``None`` and ``()`` mean different things and callers must not confuse
+        them: an empty snapshot is evidence (the turn rendered nothing), while
+        ``None`` means we never learned what opencode holds, so emptiness proves
+        nothing.
+        """
         try:
             return await self._publish_timeline(session_id, external_session_id)
         except Exception as exc:  # noqa: BLE001 - snapshot failures must not block turn-end
@@ -2564,7 +2588,7 @@ class OpenCodeRuntime(AgentRuntime):
                 external_session_id,
                 exc,
             )
-            return ()
+            return None
 
     async def _settle_unfinished_items(
         self,

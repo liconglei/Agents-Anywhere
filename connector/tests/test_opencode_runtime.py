@@ -3706,6 +3706,46 @@ def test_turn_end_leaves_finished_items_alone() -> None:
     asyncio.run(run())
 
 
+def test_turn_end_with_empty_snapshot_is_logged_as_warning() -> None:
+    """A turn that rendered nothing has to be visible in the log.
+
+    Observed with an upstream model that produced no output: opencode reported the
+    turn finished, the snapshot held no items at all, and the platform recorded a
+    successful turn with nothing to show. The status poll that drives reconcile
+    succeeds in exactly this situation, so it has no error of its own to report -
+    the empty snapshot is the only evidence, and it used to pass silently.
+    """
+
+    from connector.logging import logger
+
+    messages: list[str] = []
+    sink_id = logger.add(
+        lambda _message: messages.append(str(_message)), level="INFO", format="{message}"
+    )
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+    runtime._remember_directory("ses_x", "/work")
+    runtime._active_turns.add("ses_x")
+
+    async def run() -> None:
+        try:
+            client.sessions["ses_x"] = {"id": "ses_x"}
+            client.messages["ses_x"] = []
+            await runtime._finish_turn("ses_x")
+        finally:
+            logger.remove(sink_id)
+
+    asyncio.run(run())
+
+    empty = [line for line in messages if "no timeline items" in line]
+    assert len(empty) == 1, messages
+    assert "platform=ses_x" in empty[0]
+    assert "outcome=completed" in empty[0]
+    # The outcome deliberately stays "completed": an empty turn is not provably a
+    # failure, and the point is to make it diagnosable, not to invent an error.
+    assert host.turn_ended[-1][1] == "completed"
+
+
 def test_info_log_names_every_step_and_item_transition() -> None:
     """The log has to answer "is it still working?" on its own.
 
