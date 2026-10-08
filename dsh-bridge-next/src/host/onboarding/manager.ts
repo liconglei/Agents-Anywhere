@@ -8,7 +8,7 @@ import { AccountApi, ApiError, publicProfile, type Account } from '../account/ap
 import { DeviceRecoveryRequired, ensureBinding, readBoundDevice, recoverBinding, verifyBoundDevice, type BoundDevice } from '../account/binding.js'
 import { checkServer, normalizeServerOrigin, resolveOAuthWebOrigin } from '../account/server.js'
 import type { ResolvedConfig } from '../config.js'
-import { ConnectorCredentialError, SourceConnector, type ConnectorProcess } from '../connector/process.js'
+import { ConnectorCredentialError, ConnectorOwnershipError, SourceConnector, type ConnectorProcess } from '../connector/process.js'
 import { detectDesktop } from '../desktop/detect.js'
 import { desktopOnboardingUrl, launchDesktop, newDesktopFlowId, type DesktopLauncher } from '../desktop/launch.js'
 import type { LocalMachineRegistry } from '../desktop/machine-state.js'
@@ -85,6 +85,7 @@ export class OnboardingManager {
   private reconnectAttempts = 0
   private connectedAt = 0
   private connectorAuthFailed = false
+  private ownershipConflict = false
   private readonly reconnectScheduleMs: number[]
   private readonly reconnectStableMs: number
   private readonly reconnectMaxAttempts: number
@@ -232,6 +233,7 @@ export class OnboardingManager {
   private async startFlow(input?: LoginRequest): Promise<{ url: string }> {
     await this.initialize()
     if (this.disposed) throw new Error('插件已关闭。')
+    this.ownershipConflict = false
     if (input && input.target !== 'cloud' && input.target !== 'server') throw new Error('请选择云端或自建服务器。')
     const next = this.validateSettings({ apiBaseUrl: input?.target === 'cloud' ? CLOUD_API_BASE_URL
       : input?.target === 'server' ? input.serverUrl : this.settings.apiBaseUrl })
@@ -361,6 +363,11 @@ export class OnboardingManager {
   }
 
   private async connectionFailed(error: unknown): Promise<void> {
+    if (error instanceof ConnectorOwnershipError) {
+      this.ownershipConflict = true
+      if (!this.recovery) this.setProgress('error', safeMessage(error))
+      return
+    }
     if (error instanceof DeviceRecoveryRequired) this.setRecovery(error.connectorId, error.reason, error.message)
     else if (error instanceof ConnectorCredentialError && this.binding) await this.checkDeviceRecovery(this.binding.connectorId)
     else if (error instanceof ApiError && error.status === 401 && this.binding) this.setRecovery(this.binding.connectorId, 'login_required', '账号登录已失效，请重新登录后恢复设备连接。')
@@ -454,6 +461,7 @@ export class OnboardingManager {
     await this.requireStandalone()
     if (this.disposed) throw new Error('插件已关闭。')
     const account = this.requireAccount()
+    this.ownershipConflict = false
     const controller = new AbortController()
     this.controller = controller
     try {
@@ -483,7 +491,8 @@ export class OnboardingManager {
     // a retry may resume from a crashed "ready" or a failed "error", never from a running flow.
     return !this.disposed && Boolean(this.account) && Boolean(this.binding) && !this.recovery
       && (this.stage === 'ready' || this.stage === 'error') && this.desktop.status === 'absent'
-      && !this.connectorAuthFailed && this.connectorSettings.get().autoReconnect
+      && !this.connectorAuthFailed && !this.ownershipConflict
+      && this.connectorSettings.get().autoReconnect
   }
 
   /**
@@ -538,7 +547,8 @@ export class OnboardingManager {
 
   private canResumeServer(): boolean {
     return !this.disposed && Boolean(this.account) && this.desktop.status === 'absent'
-      && !this.recovery && !this.connectorAuthFailed && this.stage === 'error'
+      && !this.recovery && !this.connectorAuthFailed && !this.ownershipConflict
+      && this.stage === 'error'
       && this.connectorSettings.get().autoReconnect
   }
 
@@ -559,8 +569,9 @@ export class OnboardingManager {
         if (!this.canResumeServer()) return
         await this.begin()
         this.resumeAttempts = 0
-      } catch { }
-      finally { if (this.resumeTask === task) this.resumeTask = null }
+      } catch (error) {
+        if (this.stage === 'idle' || this.stage === 'error') this.setProgress('error', safeMessage(error))
+      } finally { if (this.resumeTask === task) this.resumeTask = null }
       if (this.stage === 'error') this.scheduleResume()
     })
     this.resumeTask = task
@@ -578,6 +589,7 @@ export class OnboardingManager {
       await this.requireStandalone()
       if (this.stage === 'authorizing' || this.stage === 'pairing' || this.stage === 'starting') throw new Error('连接正在进行，请完成或取消后再保存设置。')
       const next = validateConnectorSettings(input)
+      this.ownershipConflict = false
       const previous = this.connectorSettings.get()
       if (JSON.stringify(next) === JSON.stringify(previous)) return null
       const restart = this.connector.running

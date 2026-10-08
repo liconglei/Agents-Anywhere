@@ -2,7 +2,7 @@ import { ConnectorOwnershipError } from '../../src/host/connector/process.js'
 import { readOnboardingTarget, restoreOnboardingStep, saveOnboardingStep } from '../../../web-next/src/features/onboarding/flow.ts'
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -71,11 +71,12 @@ class FakeConnector implements ConnectorProcess {
   async assertHealthy() { if (!this.running) throw new Error('not running') }
 }
 
-async function fixture() {
+async function fixture(overrides: { resumeScheduleMs?: number[] } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'aa-flow-'))
   const api = new FakeApi('https://api.example.test')
   const connector = new FakeConnector()
   const checkedServers: string[] = []
+  const checkedAt: number[] = []
   let healthError: Error | null = null
   let detection: DesktopDetection = { status: 'absent', message: 'not registered' }
   let localIds: string[] = []
@@ -86,17 +87,18 @@ async function fixture() {
   }, {
     systemLanguages: async () => ['en-US'],
     api: base => base === api.baseUrl ? api : new FakeApi(base), connector, detect: async () => { detections++; return detection },
-    checkServer: async (base) => { checkedServers.push(base); if (healthError) throw healthError },
+    checkServer: async (base) => { checkedServers.push(base); checkedAt.push(Date.now()); if (healthError) throw healthError },
     onlineTimeoutMs: 5000, pollIntervalMs: 10,
     reconnectScheduleMs: [5], reconnectMaxAttempts: 3,
     resumeScheduleMs: [5],
+    ...overrides,
     machineState: {
       readConnectorIds: async () => localIds,
     },
   })
   let manager = create()
   return {
-    root, api, connector, checkedServers,
+    root, api, connector, checkedServers, checkedAt,
     get manager() { return manager },
     get detections() { return detections },
     setDesktop(value: DesktopDetection) { detection = value },
@@ -583,6 +585,47 @@ test('a server that is unreachable at startup is retried until the saved connect
   } finally { await h.close() }
 })
 
+test('a resume retry advances its backoff instead of hammering the server', async () => {
+  const h = await fixture({ resumeScheduleMs: [5, 60] })
+  h.api.online = true
+  try {
+    await callback((await h.manager.begin()).url)
+    await until(async () => (await h.manager.inspect()).stage === 'ready')
+    h.failHealthCheck()
+    await h.reopen()
+    await h.manager.resume()
+    assert.equal((await h.manager.inspect()).stage, 'error')
+    const mark = h.checkedAt.length
+    await until(async () => h.checkedAt.length >= mark + 2)
+    const gap = h.checkedAt[mark + 1] - h.checkedAt[mark]
+    assert.ok(gap >= 40, `the second attempt must wait the longer ladder step, waited ${gap}ms`)
+  } finally { await h.close() }
+})
+
+test('a failed settings write during a resume attempt surfaces an error and keeps retrying', async () => {
+  const h = await fixture()
+  h.api.online = true
+  try {
+    await callback((await h.manager.begin()).url)
+    await until(async () => (await h.manager.inspect()).stage === 'ready')
+    h.failHealthCheck()
+    await h.reopen()
+    await h.manager.resume()
+    assert.equal((await h.manager.inspect()).stage, 'error')
+    await rm(join(h.root, 'settings.json'), { force: true })
+    await mkdir(join(h.root, 'settings.json'))
+    h.restoreHealthCheck()
+    await until(async () => {
+      const snapshot = await h.manager.inspect()
+      return snapshot.stage === 'error' && !/无法连接服务器/.test(snapshot.message)
+    })
+    assert.equal((await h.manager.inspect()).stage, 'error', 'a mid-resume failure must surface instead of dying silently')
+    await rm(join(h.root, 'settings.json'), { recursive: true, force: true })
+    await until(async () => (await h.manager.inspect()).stage === 'ready')
+    assert.equal(h.connector.running, true)
+  } finally { await h.close() }
+})
+
 test('the reconnect switch also gates waiting for a late server', async () => {
   const h = await fixture()
   h.api.online = true
@@ -678,7 +721,7 @@ test('saved accounts get profile details in the background, and late results can
   } finally { await h.close() }
 })
 
-test('a Connector RPC conflict is shown and retry reuses the saved device', async () => {
+test('a Connector RPC conflict is shown, never auto-retried, and cleared by a manual attempt', async () => {
   const h = await fixture()
   h.api.online = true
   h.connector.startError = new ConnectorOwnershipError()
@@ -688,11 +731,28 @@ test('a Connector RPC conflict is shown and retry reuses the saved device', asyn
     assert.match((await h.manager.inspect()).message, /已有其他 Connector/)
     assert.equal(h.api.registrations, 1)
     assert.equal(h.connector.starts, 0)
+    const checked = h.checkedServers.length
+    await delay(80)
+    assert.equal(h.checkedServers.length, checked, 'a conflict must not run a shadow login attempt')
+    assert.equal((await h.manager.inspect()).stage, 'error')
     h.connector.startError = null
     await h.manager.begin()
     await until(async () => (await h.manager.inspect()).stage === 'ready')
     assert.equal(h.api.registrations, 1)
     assert.equal(h.connector.starts, 1)
+    const restarted = h.connector.starts
+    h.connector.crash()
+    await until(async () => h.connector.starts === restarted + 1 && (await h.manager.inspect()).stage === 'ready')
+    h.connector.startError = new ConnectorOwnershipError()
+    await assert.rejects(h.manager.controlConnector('restart'), /已有其他 Connector/)
+    assert.equal((await h.manager.inspect()).stage, 'error')
+    const checkedAgain = h.checkedServers.length
+    await delay(80)
+    assert.equal(h.checkedServers.length, checkedAgain, 'a manual restart conflict must not auto-retry either')
+    assert.equal(h.connector.starts, restarted + 1)
+    h.connector.startError = null
+    await h.manager.controlConnector('start')
+    assert.equal((await h.manager.inspect()).stage, 'ready')
   } finally { await h.close() }
 })
 
@@ -770,6 +830,43 @@ test('failed device reconfiguration returns no browser destination and remains r
       assert.match((await h.manager.inspect()).message, /自动重试已停止/)
       assert.equal(h.connector.starts, base + 3, 'The exhausted budget must not start another process')
       assert.equal((await h.manager.inspect()).connectorRunning, false)
+    } finally { await h.close() }
+  })
+
+  test('a burst of stop events while the Connector runs restarts exactly once', async () => {
+    const h = await fixture()
+    h.api.online = true
+    try {
+      await callback((await h.manager.begin()).url)
+      await until(async () => (await h.manager.inspect()).stage === 'ready')
+      const base = h.connector.starts
+      h.connector.crash()
+      h.connector.crash()
+      await until(async () => h.connector.starts === base + 1 && (await h.manager.inspect()).stage === 'ready')
+      await delay(60)
+      assert.equal(h.connector.starts, base + 1, 'overlapping stop edges must collapse into one restart')
+      assert.equal(h.connector.running, true)
+    } finally { await h.close() }
+  })
+
+  test('a stop event outside a ready connection leaves the resume chain in charge', async () => {
+    const h = await fixture()
+    h.api.online = true
+    try {
+      await callback((await h.manager.begin()).url)
+      await until(async () => (await h.manager.inspect()).stage === 'ready')
+      h.failHealthCheck()
+      await h.reopen()
+      await h.manager.resume()
+      assert.equal((await h.manager.inspect()).stage, 'error')
+      const starts = h.connector.starts
+      h.connector.crash()
+      await delay(30)
+      assert.equal((await h.manager.inspect()).stage, 'error', 'a stale stop event must not claim the recovery')
+      assert.equal(h.connector.starts, starts)
+      h.restoreHealthCheck()
+      await until(async () => (await h.manager.inspect()).stage === 'ready')
+      assert.equal(h.connector.starts, starts + 1, 'the resume chain owns the single restart')
     } finally { await h.close() }
   })
 
