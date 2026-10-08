@@ -10,7 +10,7 @@ import { parseSelections } from './selections.js'
 import { projectHistoryAsync } from './history.js'
 import { sessionId, nativeSessionId } from './identity.js'
 import type { NativeRuntime } from './native.js'
-import { lastTurnEndKind } from './native.js'
+import { turnPhase } from './native.js'
 import { SyncFeed, type SyncBatch } from './sync.js'
 import type { TimelineItem } from './types.js'
 
@@ -142,8 +142,10 @@ export class RuntimeRouter {
           // A carrier without a Host answers from the query reader alone.
           const log = await this.reader.query.readSession(id)
           const liveStatus = this.reader.status(id)
+          const phase = turnPhase(log.events)
+          const fallback = phase.endedKind === 'error' ? 'error' : 'idle'
           return { runtime: 'dsh', sessionId: sessionId(this.namespace, id), externalSessionId: id,
-            status: liveStatus ?? (lastTurnEndKind(log.events) === 'error' ? 'error' : 'idle'), selections: {},
+            status: !phase.active && phase.endedKind !== undefined ? fallback : liveStatus ?? fallback, selections: {},
             metadata: { readOnly: true, attached: liveStatus !== undefined } }
         }
         // Only an unknown identity pays for a corpus listing; a known one is
@@ -157,8 +159,11 @@ export class RuntimeRouter {
         const facts = await native.stateFacts(id)
         signal.throwIfAborted()
         const liveStatus = this.reader.status(id)
+        const fallback = facts.lastTurnEndKind === 'error' ? 'error' : 'idle'
         return { runtime: 'dsh', sessionId: sessionId(this.namespace, id), externalSessionId: id, sourceState,
-          status: native.questions.waiting(id) || native.approvals.waiting(id) ? 'waiting_approval' : liveStatus ?? (facts.lastTurnEndKind === 'error' ? 'error' : 'idle'),
+          status: native.questions.waiting(id) || native.approvals.waiting(id) ? 'waiting_approval'
+            : !facts.turnActive && facts.lastTurnEndKind !== undefined ? fallback
+            : liveStatus ?? fallback,
           selections: facts.configuration.selections,
           metadata: { ...facts.configuration.metadata, readOnly: !native.ctx.get('sessionController'), attached: liveStatus !== undefined } }
       }

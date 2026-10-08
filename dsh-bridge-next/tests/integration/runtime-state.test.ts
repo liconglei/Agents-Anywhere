@@ -65,6 +65,27 @@ test('session.getState rereads a live session whose log changed', { timeout: 60_
   } finally { await f.close() }
 })
 
+test('a finished turn ignores a stale live agent status still saying running', { timeout: 60_000 }, async () => {
+  const f = await fixture('aa-dsh-stale-live-')
+  try {
+    const stuck = new RuntimeRouter({ native: f.runtime, query: f.ctx.sessionQuery, status: () => 'running' }, 'instance')
+    const request = (method: string, params: Record<string, unknown>) => stuck.request(method, params, new AbortController().signal)
+    const params = { sessionId: sessionId('instance', 'native-main'), externalSessionId: 'native-main' }
+
+    const ended = await request('session.getState', params) as StateResult
+    assert.equal(ended.status, 'idle', 'a completed turn reports idle while the agent still says running')
+
+    f.session.append('turn/start', { turn: 2 })
+    const active = await request('session.getState', params) as StateResult
+    assert.equal(active.status, 'running', 'an open turn follows the live agent status')
+
+    f.session.append('turn/end', { turn: 2, reason: { kind: 'error' } })
+    const failed = await request('session.getState', params) as StateResult
+    assert.equal(failed.status, 'error', 'a failed turn reports error while the agent still says running')
+    stuck.close()
+  } finally { await f.close() }
+})
+
 test('a blank visibility verdict is reused until that log changes', { timeout: 60_000 }, async () => {
   const f = await fixture('aa-dsh-visibility-')
   try {
