@@ -41,12 +41,25 @@ export const MAX_RETAINED_FACTS = 128
 export interface SessionFacts {
   configuration: Awaited<ReturnType<RuntimeConfiguration['state']>>
   lastTurnEndKind: string | undefined
+  turnActive: boolean
 }
 
-/** Last terminal turn outcome, which decides a cold session's status. */
-export function lastTurnEndKind(events: readonly SessionEvent[]): string | undefined {
-  const last = events.findLast(event => event.type === 'turn/end')
-  return last?.type === 'turn/end' ? last.data.reason.kind : undefined
+export interface TurnPhase {
+  active: boolean
+  endedKind: string | undefined
+}
+
+export function turnPhase(events: readonly SessionEvent[]): TurnPhase {
+  let active = false
+  let endedKind: string | undefined
+  for (const event of events) {
+    if (event.type === 'turn/start') active = true
+    else if (event.type === 'turn/end') {
+      active = false
+      endedKind = event.data.reason.kind
+    }
+  }
+  return { active, endedKind }
 }
 
 /** All native interpretation stays in the Host; observers never await transport work. */
@@ -211,9 +224,11 @@ export class NativeRuntime {
     const log = snapshot ?? (live !== undefined ? undefined : await this.source.readLog(id))
     const configuration = await this.configuration.state(id, log)
     const events = live?.snapshotEvents() ?? log!.events
+    const phase = turnPhase(events)
     const value: SessionFacts = {
       configuration,
-      lastTurnEndKind: lastTurnEndKind(events),
+      lastTurnEndKind: phase.endedKind,
+      turnActive: phase.active,
     }
     const actualRevision = log && 'bridgeRevision' in log && typeof log.bridgeRevision === 'string' ? log.bridgeRevision : revision
     if (actualRevision !== undefined) {
