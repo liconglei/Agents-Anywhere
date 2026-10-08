@@ -8,7 +8,7 @@ import { AccountApi, ApiError, publicProfile, type Account } from '../account/ap
 import { DeviceRecoveryRequired, ensureBinding, readBoundDevice, recoverBinding, verifyBoundDevice, type BoundDevice } from '../account/binding.js'
 import { checkServer, normalizeServerOrigin, resolveOAuthWebOrigin } from '../account/server.js'
 import type { ResolvedConfig } from '../config.js'
-import { ConnectorCredentialError, SourceConnector, type ConnectorProcess } from '../connector/process.js'
+import { ConnectorCredentialError, ConnectorOwnershipError, SourceConnector, type ConnectorProcess } from '../connector/process.js'
 import { detectDesktop } from '../desktop/detect.js'
 import { desktopOnboardingUrl, launchDesktop, newDesktopFlowId, type DesktopLauncher } from '../desktop/launch.js'
 import type { LocalMachineRegistry } from '../desktop/machine-state.js'
@@ -107,6 +107,7 @@ export class OnboardingManager {
   private reconnectAttempts = 0
   private connectedAt = 0
   private connectorAuthFailed = false
+  private ownershipConflict = false
   private readonly reconnectScheduleMs: number[]
   private readonly reconnectStableMs: number
   private readonly reconnectMaxAttempts: number
@@ -161,13 +162,6 @@ export class OnboardingManager {
       logsPath: this.connector.logsPath ?? null,
       updatedAt: new Date().toISOString(),
     }
-=======
-    this.reconnectScheduleMs = dependencies.reconnectScheduleMs ?? RECONNECT_SCHEDULE_MS
-    this.reconnectStableMs = dependencies.reconnectStableMs ?? RECONNECT_STABLE_MS
-    this.reconnectMaxAttempts = dependencies.reconnectMaxAttempts ?? RECONNECT_MAX_ATTEMPTS
-    this.resumeScheduleMs = dependencies.resumeScheduleMs ?? RESUME_SCHEDULE_MS
-    this.unsubscribeUnexpectedStop = this.connector.onUnexpectedStop?.(() => this.scheduleReconnect(true)) ?? (() => {})
->>>>>>> 49f0c80c (fix(dsh): retry the saved connection until a late server starts)
   }
 
   initialize(): Promise<void> {
@@ -288,6 +282,7 @@ export class OnboardingManager {
   private async startFlow(input?: LoginRequest): Promise<{ url: string }> {
     await this.initialize()
     if (this.disposed) throw new Error('插件已关闭。')
+    this.ownershipConflict = false
     if (input && input.target !== 'cloud' && input.target !== 'server') throw new Error('请选择云端或自建服务器。')
     const next = this.validateSettings({ apiBaseUrl: input?.target === 'cloud' ? CLOUD_API_BASE_URL
       : input?.target === 'server' ? input.serverUrl : this.settings.apiBaseUrl })
@@ -424,6 +419,11 @@ export class OnboardingManager {
 
   private async connectionFailed(error: unknown): Promise<void> {
     this.recordConnectionFailure(error)
+    if (error instanceof ConnectorOwnershipError) {
+      this.ownershipConflict = true
+      if (!this.recovery) this.setProgress('error', safeMessage(error))
+      return
+    }
     if (error instanceof DeviceRecoveryRequired) this.setRecovery(error.connectorId, error.reason, error.message)
     else if (error instanceof ConnectorCredentialError && this.binding) await this.checkDeviceRecovery(this.binding.connectorId)
     else if (error instanceof ApiError && error.status === 401 && this.binding) this.setRecovery(this.binding.connectorId, 'login_required', '账号登录已失效，请重新登录后恢复设备连接。')
@@ -525,6 +525,7 @@ export class OnboardingManager {
     await this.requireStandalone()
     if (this.disposed) throw new Error('插件已关闭。')
     const account = this.requireAccount()
+    this.ownershipConflict = false
     const controller = new AbortController()
     this.controller = controller
     try {
@@ -544,6 +545,54 @@ export class OnboardingManager {
     } catch (error) {
       if (!controller.signal.aborted) {
         await this.connectionFailed(error)
+      }
+      await this.connector.stop()
+      throw error
+    } finally { if (this.controller === controller) this.controller = null }
+  }
+
+  /** A crash is only retryable while the connection was up; a failed retry keeps its own chain alive. */
+  private canRetryConnector(): boolean {
+    // flow/work/controller stay set after a successful connect, so the gate is the stage itself:
+    // a retry may resume from a crashed "ready" or a failed "error", never from a running flow.
+    return !this.disposed && Boolean(this.account) && Boolean(this.binding) && !this.recovery
+      && (this.stage === 'ready' || this.stage === 'error') && this.desktop.status === 'absent'
+      && !this.connectorAuthFailed && !this.ownershipConflict
+      && this.connectorSettings.get().autoReconnect
+  }
+
+  /**
+   * The child already retries the server on its own, so this only supervises a
+   * Connector process that died or failed by itself: bounded backoff, a fresh
+   * budget after a stable run, and a manual stop when the budget runs out.
+   */
+  private scheduleReconnect(fromCrash: boolean): void {
+    if (this.reconnectTimer || this.reconnectTask) return
+    if (fromCrash && this.stage !== 'ready') return
+    if (!this.canRetryConnector()) return
+    if (fromCrash && this.connectedAt && Date.now() - this.connectedAt >= this.reconnectStableMs) this.reconnectAttempts = 0
+    if (this.reconnectAttempts >= this.reconnectMaxAttempts) {
+      this.reconnectAttempts = 0
+      this.setProgress('error', '本机连接已多次断开，自动重试已停止。请在设置页手动启动 Connector。')
+      return
+    }
+    const base = this.reconnectScheduleMs[Math.min(this.reconnectAttempts, this.reconnectScheduleMs.length - 1)] ?? RECONNECT_SCHEDULE_MS[0] ?? 1_000
+    this.reconnectAttempts += 1
+    // Stage stays "ready" so settings and control actions are not locked while waiting.
+    this.message = '本机连接已断开，正在自动重试…'
+    const timer = setTimeout(() => { this.reconnectTimer = null; void this.runReconnect() },
+      Math.max(1, base + Math.round(base * 0.2 * (Math.random() * 2 - 1))))
+    timer.unref?.()
+    this.reconnectTimer = timer
+  }
+
+  private runReconnect(): Promise<void> {
+    const task = this.serial(async () => {
+      let failed = false
+      try {
+        if (!this.canRetryConnector()) return
+        // stop() clears a latched failure and the dead child before a fresh start.
+>>>>>>> 99280316 (fix(dsh): keep retrying ownership conflicts and surface silent disconnects)
         await this.connector.stop()
         throw error
       }
@@ -554,7 +603,8 @@ export class OnboardingManager {
 
   private canResumeServer(): boolean {
     return !this.disposed && Boolean(this.account) && this.desktop.status === 'absent'
-      && !this.recovery && !this.connectorAuthFailed && this.stage === 'error'
+      && !this.recovery && !this.connectorAuthFailed && !this.ownershipConflict
+      && this.stage === 'error'
       && this.connectorSettings.get().autoReconnect
   }
 
@@ -575,8 +625,9 @@ export class OnboardingManager {
         if (!this.canResumeServer()) return
         await this.begin()
         this.resumeAttempts = 0
-      } catch { }
-      finally { if (this.resumeTask === task) this.resumeTask = null }
+      } catch (error) {
+        if (this.stage === 'idle' || this.stage === 'error') this.setProgress('error', safeMessage(error))
+      } finally { if (this.resumeTask === task) this.resumeTask = null }
       if (this.stage === 'error') this.scheduleResume()
     })
     this.resumeTask = task
@@ -594,6 +645,7 @@ export class OnboardingManager {
       await this.requireStandalone()
       if (this.stage === 'authorizing' || this.stage === 'pairing' || this.stage === 'starting') throw new Error('连接正在进行，请完成或取消后再保存设置。')
       const next = validateConnectorSettings(input)
+      this.ownershipConflict = false
       const previous = this.connectorSettings.get()
       if (JSON.stringify(next) === JSON.stringify(previous)) return null
       const restart = this.connector.running
@@ -689,12 +741,9 @@ export class OnboardingManager {
   }
 
   private async cancelFlow(): Promise<void> {
-<<<<<<< HEAD
-=======
     // Any explicit navigation supersedes a pending automatic retry.
     this.cancelReconnect()
     this.cancelResume()
->>>>>>> 49f0c80c (fix(dsh): retry the saved connection until a late server starts)
     this.recoveryController?.abort()
     this.recoveryCheck = null
     this.recoveryController = null
