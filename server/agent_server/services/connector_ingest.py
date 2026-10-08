@@ -329,12 +329,15 @@ class ConnectorIngestService:
             runtime_state: SessionRuntimeState | None = None
             if bucket["runtime_state"]:
                 bound_session = await self._store.get_session(session_id)
+                previous_runtime_state = await self._runtime_state_cache.get(
+                    session_id
+                )
                 runtime_state = runtime_state_from_ingest_effect(
                     bound_session,
                     next_seq,
                     bucket["runtime_state"],
+                    previous_runtime_state,
                 )
-                previous_runtime_state = await self._runtime_state_cache.get(session_id)
                 if runtime_states_semantically_equal(
                     previous_runtime_state,
                     runtime_state,
@@ -495,6 +498,7 @@ def runtime_state_from_ingest_effect(
     session: SessionView,
     next_seq: int,
     raw_state: dict[str, Any],
+    previous: SessionRuntimeState | None = None,
 ) -> SessionRuntimeState:
     now = utc_now()
     session_id, runtime, runtime_id = resolve_session_runtime_binding(
@@ -512,14 +516,14 @@ def runtime_state_from_ingest_effect(
             "status": raw_state.get("status") or "idle",
             "selections": raw_state.get("selections")
             if isinstance(raw_state.get("selections"), dict)
-            else {},
+            else (previous.selections if previous is not None else {}),
             "statusReason": raw_state.get("statusReason"),
             "error": raw_state.get("error")
             if isinstance(raw_state.get("error"), dict)
             else None,
             "metadata": raw_state.get("metadata")
             if isinstance(raw_state.get("metadata"), dict)
-            else {},
+            else (previous.metadata if previous is not None else {}),
             "updatedSeq": next_seq,
             "createdAt": now,
             "updatedAt": now,
