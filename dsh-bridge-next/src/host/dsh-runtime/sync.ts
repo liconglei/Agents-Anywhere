@@ -2,11 +2,12 @@ import { jsonBytes } from './json-size.js'
 import { randomUUID } from 'node:crypto'
 import { receiptKey } from './attachments.js'
 import { setTimeout as delay } from 'node:timers/promises'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionLogSnapshot } from '@deepseek-ai/dsh-session-query'
 import { createProjection, replayHistory, PROJECTION_VERSION, type SessionProjection } from './history.js'
 import { sessionId } from './identity.js'
 import type { NativeChange, NativeRuntime } from './native.js'
+import { turnPhase } from './native.js'
 import { record, type TimelineItem } from './types.js'
 import { BridgeError } from './errors.js'
 import type { SourceState } from './sessions/source.js'
@@ -23,6 +24,12 @@ function matchesCheckpoint(value: unknown, projection: SessionProjection): boole
 const MAX_BUFFER = 10_000
 const MAX_BYTES = 6 * 1024 * 1024
 export const SYNC_FLUSH_MS = Math.ceil(1000 / 30)
+
+/** DSH turn outcomes mapped onto the Connector contract every runtime shares. */
+function turnOutcome(kind: string): string {
+  if (kind === 'error') return 'failed'
+  return ['aborted', 'interrupted'].includes(kind) ? 'interrupted' : 'completed'
+}
 
 class SyncTransportError extends Error {}
 
@@ -208,6 +215,7 @@ export class SyncFeed {
         this.checkpointDirty.add(id)
         await this.notices(id)
         await this.state(id, log)
+        await this.turnEnded(id, log.events)
         this.native.diagnostics.log('info', 'sync.checkpoint_restored', { streamId: this.id, sessionId: id })
         return
       }
@@ -235,7 +243,22 @@ export class SyncFeed {
     this.sourceAvailability.set(id, 'available')
     await this.notices(id)
     await this.state(id, log)
+    await this.turnEnded(id, log.events)
     this.native.diagnostics.log('info', 'snapshot.completed', { streamId: this.id, sessionId: id, items: snapshotItems.length, elapsedMs: Math.round(performance.now() - start) })
+  }
+  /** A baseline imports history without replaying live turn/end changes, so the
+   * last finished turn must be announced or the platform keeps showing turn one. */
+  private async turnEnded(id: string, events: readonly SessionEvent[]): Promise<void> {
+    const last = events.findLast(event => event.type === 'turn/end')
+    const phase = turnPhase(events)
+    if (last?.type !== 'turn/end' || phase.active) return
+    if (!this.published.has(id) || !await this.native.visible(id)) return
+    await this.notification('session.turnEnded', {
+      sessionId: this.published.get(id),
+      externalSessionId: id,
+      sourceObservedAt: new Date(last.time).toISOString(),
+      outcome: turnOutcome(last.data.reason.kind),
+    })
   }
   private async notices(id: string): Promise<void> {
     for (const notice of [...this.native.questions.notices(this.namespace, id), ...this.native.approvals.notices(this.namespace, id)]) await this.notification('notice.upsert', notice)
@@ -243,14 +266,18 @@ export class SyncFeed {
   private async state(id: string, snapshot?: SessionLogSnapshot): Promise<void> {
     if (!this.published.has(id) || !await this.native.visible(id)) return
     const log = this.native.ctx.sessions.get(id as SessionId)
+    const events = log?.snapshotEvents() ?? []
     const pending = new Set<string>()
-    for (const e of log?.snapshotEvents() ?? []) {
+    for (const e of events) {
       if (String(e.type) === 'approval/asked') pending.add(String(record(e.data).id))
       if (String(e.type) === 'approval/decided') pending.delete(String(record(e.data).id))
     }
-    const last = log?.snapshotEvents().findLast(e => e.type === 'turn/end')
-    const status = pending.size || this.native.questions.waiting(id) || this.native.approvals.waiting(id) ? 'waiting_approval' : this.native.status(id as SessionId)
-      ?? (last?.type === 'turn/end' && last.data.reason.kind === 'error' ? 'error' : 'idle')
+    const phase = turnPhase(events)
+    const fallback = phase.endedKind === 'error' ? 'error' : 'idle'
+    const live = this.native.status(id as SessionId)
+    const status = pending.size || this.native.questions.waiting(id) || this.native.approvals.waiting(id) ? 'waiting_approval'
+      : !phase.active && phase.endedKind !== undefined ? fallback
+      : live ?? fallback
     let configuration: Awaited<ReturnType<NativeRuntime['configuration']['state']>>
     try {
       configuration = await this.native.diagnostics.measure('session.configuration_read', { sessionId: id }, async () => snapshot ? this.native.configuration.state(id as SessionId, snapshot) : (await this.native.stateFacts(id as SessionId)).configuration)
@@ -350,8 +377,7 @@ export class SyncFeed {
           if (change.event.type === 'turn/end') ended.push([id, {
             sessionId: this.published.get(id), externalSessionId: id,
             sourceObservedAt: new Date(change.event.time).toISOString(),
-            outcome: change.event.data.reason.kind === 'error' ? 'failed'
-              : ['aborted', 'interrupted'].includes(change.event.data.reason.kind) ? 'interrupted' : 'completed',
+            outcome: turnOutcome(change.event.data.reason.kind),
           }])
           if (['turn/start', 'turn/end', 'approval/asked', 'approval/decided', 'model/selection', 'request/header',
             'permission/preset', 'sandbox/mode', 'approval/policy', 'agent-preset/selected'].includes(change.event.type)) statuses.add(id)

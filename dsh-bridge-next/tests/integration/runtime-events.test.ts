@@ -84,6 +84,29 @@ test('one corrupt persisted session does not break inventory, healthy streaming 
   } finally { stream?.feed.close(); await fixture.ctx.fiber.dispose(); await rm(home, { recursive: true, force: true }) }
 })
 
+test('sync reports a finished turn from the log while the live agent still says running', { timeout: 30_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-stale-status-'))
+  const fixture = await nativeRuntime(home)
+  const native = fixture.ctx.agentsAnywhereRuntime.native
+  native.status = () => 'running'
+  let stream: ReturnType<typeof follow> | undefined
+  try {
+    stream = follow(native)
+    const notes = () => notifications(stream!.ops())
+    const mainStates = () => notes().filter(note => note.method === 'session.state.updated' && note.params.externalSessionId === 'native-main')
+    await until(() => notes().some(note => note.method === 'session.inventory.complete'), 'baseline inventory completes')
+    await until(() => mainStates().some(note => note.params.status === 'idle'),
+      'a completed turn pushes idle despite the stale running status')
+    const settled = mainStates().length
+
+    fixture.session.append('turn/start', { turn: 2 })
+    fixture.session.append('turn/end', { turn: 2, reason: { kind: 'error' } })
+    await until(() => mainStates().length > settled && mainStates().some(note => note.params.status === 'error'),
+      'a failed turn pushes error despite the stale running status')
+    assert.deepEqual(stream.errors, [])
+  } finally { stream?.feed.close(); await fixture.ctx.fiber.dispose(); await rm(home, { recursive: true, force: true }) }
+})
+
 test('fast mixed native events flush at 30 Hz with complete final text, tool results and ordered completion', { timeout: 30_000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'dsh-flush-'))
   const fixture = await nativeRuntime(home)
@@ -119,7 +142,7 @@ test('fast mixed native events flush at 30 Hz with complete final text, tool res
     fixture.session.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
     fixture.session.append('turn/start', { turn: 3 })
     fixture.session.append('turn/end', { turn: 3, reason: { kind: 'interrupted' } })
-    await until(() => notes().filter(note => note.method === 'session.turnEnded').length === 2, 'final tail flushes without another event')
+    await until(() => notes().filter(note => note.method === 'session.turnEnded').length >= 3, 'final tail flushes without another event')
     const live = notifications(batches.slice(firstLive).flatMap(batch => batch.operations))
     const upserts = live.filter(note => note.method === 'timeline.itemUpsert')
     const latest = new Map(upserts.map(note => { const item = note.params.item as { id: string }; return [item.id, item] }))
@@ -200,6 +223,34 @@ test('baseline buffers native changes and archive events without syncing native 
     assert.deepEqual(errors, [])
     assert.deepEqual(batches.map(b => b.batchSeq), batches.map((_, n) => n + 1))
   } finally { feed.close(); await fixture.ctx.fiber.dispose(); await rm(home, { recursive: true, force: true }) }
+})
+
+test('importing a session that already finished turns announces the last turn end', { timeout: 30_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-baseline-turn-end-'))
+  const fixture = await nativeRuntime(home)
+  const native = fixture.ctx.agentsAnywhereRuntime.native
+  native.status = () => 'running'
+  const stream = follow(native)
+  const notes = () => notifications(stream.ops())
+  const ends = (id: string) => notes().filter(n => n.method === 'session.turnEnded' && n.params.externalSessionId === id)
+  try {
+    await until(() => notes().some(n => n.method === 'session.inventory.complete'), 'baseline inventory completes')
+    await until(() => ends('native-main').length === 1, 'an imported multi-turn session announces its finished turn')
+    assert.equal(ends('native-main')[0]?.params.outcome, 'completed')
+    assert.ok(ends('persisted-only').length === 1, 'a cold imported session announces its finished turn too')
+
+    const open = fixture.ctx.sessions.prepare(SessionId('turn-in-flight'), { meta: { cwd: home, createdAt: 1 } })
+    const detach = fixture.ctx.sessions.enter(open)
+    fixture.ctx.sessions.announce(open)
+    open.append('turn/start', { turn: 1 })
+    open.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: '还在跑的一轮' }] }), { surfaceOp: 'append' })
+    await fixture.ctx.sessions.flush(open)
+    detach()
+    await native.source.refresh()
+
+    assert.equal(ends('turn-in-flight').length, 0, 'a turn that never ended is never announced')
+    assert.deepEqual(stream.errors, [])
+  } finally { stream.feed.close(); await fixture.ctx.fiber.dispose(); await rm(home, { recursive: true, force: true }) }
 })
 
 test('new native drafts sync once after their first real user message, including attachment-only messages', { timeout: 30_000 }, async () => {
