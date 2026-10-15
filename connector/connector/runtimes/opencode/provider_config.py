@@ -27,9 +27,11 @@ def opencode_config_schema() -> dict[str, Any]:
                 "type": "string",
                 "title": "Server password",
                 "description": (
-                    "Optional; HTTP Basic password used when opencode serve runs "
-                    "with OPENCODE_SERVER_PASSWORD. Auto-started serve inherits "
-                    "the local environment automatically."
+                    "Password for the serve instance's HTTP Basic auth. Required "
+                    "by opencode 2.x, which protects every /api route. Only "
+                    "needed for a serve the connector did not start; an "
+                    "auto-started serve inherits OPENCODE_SERVER_PASSWORD from "
+                    "the environment, or gets a generated password."
                 ),
             },
             "apiUser": {

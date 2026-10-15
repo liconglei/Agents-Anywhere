@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
-from typing import Any
+from pathlib import Path
+from typing import Any, ClassVar
 
 import pytest
 
@@ -37,6 +39,18 @@ from connector.runtimes.opencode.sdk.client import (
     OpenCodeClientError,
     append_directory_param,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_connector_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep auto-start's data-directory isolation out of the real home directory.
+
+    A serve the connector starts gets its own opencode data directory (its log
+    and database are held exclusively on 2.x), which normally lands under
+    ``~/.agents-anywhere``.
+    """
+
+    monkeypatch.setenv("AGENT_CONNECTOR_DATA_DIR", str(tmp_path / "connector-data"))
 
 # --------------------------------------------------------------------------- #
 # provider config
@@ -592,24 +606,81 @@ class _FakeStreamingHTTP:
         return _FakeSSEContext(self._response)
 
 
-def test_client_stream_events_unwraps_global_frames() -> None:
-    """``/global/event`` wraps every event and replays ``sync`` duplicates.
+def test_client_stream_events_adapts_v2_frames() -> None:
+    """``GET /api/event`` frames are V2-shaped and must be translated.
 
-    ``/event`` is instance-scoped (only the serve cwd's project), so sessions
-    in any other directory never surface their events there — the platform
-    session then never leaves "running" and the send button stays disabled.
-    The client must subscribe to the global stream, unwrap the envelope, and
-    drop sync replay frames.
+    opencode 2.x publishes ``{id, created?, type, location?, data}`` frames with
+    the session id inside ``data``; the runtime only knows the 1.x
+    ``{type, properties}`` events, so the client maps execution start, text and
+    reasoning streams, segment ends and step ends onto them — and drops frames
+    that carry no session (mcp/provider/model updates and the like).
     """
 
     client = OpenCodeClient("http://127.0.0.1:4096")
+
+    def frame(**payload: Any) -> str:
+        return f"data: {json.dumps(payload)}"
+
     http = _FakeStreamingHTTP(
         _FakeSSEResponse(
             [
-                'data: {"payload": {"type": "server.connected", "properties": {}}}',
-                'data: {"directory": "d", "project": "p", "payload": {"type": "sync", "syncEvent": {}}}',
-                'data: {"directory": "d", "project": "p", "payload": {"type": "session.idle", "properties": {"sessionID": "ses_1"}}}',
-                'data: {"type": "session.status", "properties": {"sessionID": "ses_2", "status": {"type": "idle"}}}',
+                frame(id="evt_1", type="server.connected", data={}),
+                frame(id="evt_2", type="mcp.status.changed", data={"server": "context7"}),
+                frame(
+                    id="evt_3",
+                    created=111,
+                    type="session.execution.started",
+                    data={"sessionID": "ses_1"},
+                ),
+                frame(
+                    id="evt_4",
+                    type="session.step.started",
+                    data={
+                        "sessionID": "ses_1",
+                        "assistantMessageID": "msg_1",
+                        "agent": "build",
+                    },
+                ),
+                frame(
+                    id="evt_5",
+                    type="session.text.delta",
+                    data={
+                        "sessionID": "ses_1",
+                        "assistantMessageID": "msg_1",
+                        "ordinal": 0,
+                        "delta": "PO",
+                    },
+                ),
+                frame(
+                    id="evt_6",
+                    type="session.text.delta",
+                    data={
+                        "sessionID": "ses_1",
+                        "assistantMessageID": "msg_1",
+                        "ordinal": 0,
+                        "delta": "NG",
+                    },
+                ),
+                frame(
+                    id="evt_7",
+                    type="session.text.ended",
+                    data={
+                        "sessionID": "ses_1",
+                        "assistantMessageID": "msg_1",
+                        "ordinal": 0,
+                        "text": "PONG",
+                    },
+                ),
+                frame(
+                    id="evt_8",
+                    created=222,
+                    type="session.step.ended",
+                    data={
+                        "sessionID": "ses_1",
+                        "assistantMessageID": "msg_1",
+                        "finish": "stop",
+                    },
+                ),
                 ": keep-alive comment",
                 "event: message",
             ]
@@ -622,18 +693,27 @@ def test_client_stream_events_unwraps_global_frames() -> None:
 
     events = asyncio.run(run())
     assert [event["type"] for event in events] == [
-        "server.connected",
-        "session.idle",
         "session.status",
+        "message.updated",
+        "message.part.delta",
+        "message.part.delta",
+        "message.part.updated",
+        "message.updated",
     ]
-    assert http.requested_url == "/global/event"
+    assert events[0]["properties"]["status"] == {"type": "busy"}
+    assert events[2]["properties"]["partID"] == "msg_1:text:0"
+    assert events[4]["properties"]["part"]["text"] == "PONG"
+    # step.ended finalizes the assistant message (what the runtime uses to flip
+    # streamed items from running to done).
+    assert events[5]["properties"]["info"]["time"]["completed"] == 222
+    assert http.requested_url == "/api/event"
 
 
 def test_probe_url_sends_http_basic_and_flags_401(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A credentialed serve answers even /global/health with 401; the probe
-    must authenticate like the client and not report that as "unreachable"."""
+    """A credentialed serve answers even /api/info with 401; the probe must
+    authenticate like the client and not report that as "unreachable"."""
     import base64
 
     import httpx
@@ -643,23 +723,26 @@ def test_probe_url_sends_http_basic_and_flags_401(
     captured: dict[str, Any] = {}
 
     class _Resp:
-        def __init__(self, status_code: int, body: dict[str, Any] | None = None) -> None:
+        def __init__(self, status_code: int) -> None:
             self.status_code = status_code
-            self.content = b"{}" if body is not None else b""
+            self.content = b"{}"
+            self.headers = {"content-type": "application/json"}
+            self.text = '{"version":"2.0.27"}'
 
         def json(self) -> dict[str, Any]:
-            return {"version": "1.18.34"}
+            return {"version": "2.0.27"}
 
     def fake_get(url: str, headers: dict[str, str] | None = None, timeout: float = 0.0):
         captured["url"] = url
         captured["headers"] = dict(headers or {})
-        return _Resp(captured.get("_next_status", 200), {"version": "1.18.34"})
+        return _Resp(captured.get("_next_status", 200))
 
     monkeypatch.setattr(httpx, "get", fake_get)
 
     token = base64.b64encode(b"lcl:pw").decode()
     result = provider_module._probe_url("http://127.0.0.1:4096", api_user="lcl", api_key="pw")
-    assert result == {"available": True, "version": "1.18.34"}
+    assert result == {"available": True, "version": "2.0.27"}
+    assert captured["url"].endswith("/api/info")
     assert captured["headers"]["Authorization"] == f"Basic {token}"
 
     captured["_next_status"] = 401
@@ -667,6 +750,33 @@ def test_probe_url_sends_http_basic_and_flags_401(
     assert denied["available"] is False
     assert denied["status"] == 401
     assert denied["reason"] == "authentication required"
+
+
+def test_probe_url_rejects_the_web_ui_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pre-2.x serve answers /api/info with 200 + the web UI.
+
+    That must read as "not a V2 opencode", not as a healthy instance: every
+    request would fail once the client speaks V2.
+    """
+
+    import httpx
+
+    from connector.runtimes.opencode import provider as provider_module
+
+    class _Resp:
+        status_code = 200
+        content = b"<!doctype html><html><body>opencode</body></html>"
+        headers: ClassVar[dict[str, str]] = {"content-type": "text/html; charset=utf-8"}
+        text = "<!doctype html><html><body>opencode</body></html>"
+
+        def json(self) -> dict[str, Any]:
+            return {}
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp())
+
+    result = provider_module._probe_url("http://127.0.0.1:4096")
+    assert result["available"] is False
+    assert "V2" in str(result["reason"])
 
 
 def test_default_probe_adopts_env_password(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -685,9 +795,11 @@ def test_default_probe_adopts_env_password(monkeypatch: pytest.MonkeyPatch) -> N
     class _Resp:
         status_code = 200
         content = b"{}"
+        headers: ClassVar[dict[str, str]] = {"content-type": "application/json"}
+        text = '{"version":"2.0.27"}'
 
         def json(self) -> dict[str, Any]:
-            return {"version": "1.18.34"}
+            return {"version": "2.0.27"}
 
     def fake_get(url: str, headers: dict[str, str] | None = None, timeout: float = 0.0):
         captured["headers"] = dict(headers or {})
@@ -697,7 +809,11 @@ def test_default_probe_adopts_env_password(monkeypatch: pytest.MonkeyPatch) -> N
 
     result = provider_module.default_probe()
     assert result["available"] is True
-    token = base64.b64encode(b"licon:secret").decode()
+    assert result["version"] == "2.0.27"
+    # opencode 2.x ignores OPENCODE_SERVER_USERNAME and always checks "opencode",
+    # so discovery must authenticate as that user even when the environment
+    # names another one.
+    token = base64.b64encode(b"opencode:secret").decode()
     assert captured["headers"]["Authorization"] == f"Basic {token}"
 
 
@@ -1099,43 +1215,42 @@ def test_lost_idle_reconciled_against_status_map() -> None:
     asyncio.run(run())
 
 
-def test_reconcile_queries_session_directory_scope() -> None:
-    """Reconcile must query /session/status in the session's own directory.
+def test_reconcile_reads_the_global_active_map() -> None:
+    """Reconcile ends a turn once the session leaves the active map.
 
-    ``/session/status`` is scoped by ``?directory=``. An unscoped query omits a
-    workspace-bound session, so it looked idle and the turn was "recovered"
-    seconds after it started — before ``opencode serve`` produced any reply —
-    leaving the answer blank. Codex ends turns only on a terminal event, never on
-    a missing status, so scoping the poll is both correct and consistent.
+    opencode 2.x replaced the directory-scoped ``/session/status`` with one
+    global ``/api/session/active`` map (``{ses_x: {type: "running"}}``, empty
+    when idle) and publishes no terminal ``session.idle`` event, so this poll
+    is the only turn-end signal — and it must not be scoped per directory.
     """
     client, host = FakeClient(), FakeHost()
     runtime = _make_runtime(client, host)
 
-    scope: dict[str, str | None] = {"dir": None}
+    calls: list[str | None] = []
 
-    async def scoped_status_map(directory: str | None = None) -> dict[str, Any]:
-        if directory is not None and directory == scope["dir"]:
-            return dict(client.status)
-        return {}
+    async def recording_status_map(directory: str | None = None) -> dict[str, Any]:
+        calls.append(directory)
+        return dict(client.status)
 
-    client.session_status_map = scoped_status_map  # type: ignore[method-assign]
+    client.session_status_map = recording_status_map  # type: ignore[method-assign]
 
     async def run() -> None:
         result = await runtime.create_and_start_session(
             "plat_scope", "hi", cwd="C:\\work\\proj", selections=None
         )
         native = result.result["externalSessionId"]
-        scope["dir"] = runtime._directory_for(native)
-        assert scope["dir"]
+        assert runtime._directory_for(native)
 
-        # serve reports it busy in its own scope: reconcile must not end the turn.
+        # serve reports it running: reconcile must not end the turn.
         client.status[native] = {"type": "busy"}
         await runtime._reconcile_active_turns()
         assert native in runtime._active_turns
         assert ("plat_scope", "completed") not in host.turn_ended
+        # One global query, not one per candidate session.
+        assert calls == [None]
 
-        # once serve reports it idle in that scope, reconcile recovers the end.
-        client.status[native] = {"type": "idle"}
+        # once it left the active map, reconcile recovers the end.
+        del client.status[native]
         await runtime._reconcile_active_turns()
         assert native not in runtime._active_turns
         assert ("plat_scope", "completed") in host.turn_ended
@@ -1483,7 +1598,7 @@ def test_serve_command_prefers_opencode_exe(monkeypatch: pytest.MonkeyPatch) -> 
         # opencode process holds the shared, exclusively-opened log file.
         "--print-logs",
         "--log-level",
-        "INFO",
+        "info",
         "--hostname",
         "127.0.0.1",
         "--port",
@@ -1504,7 +1619,7 @@ def test_serve_command_falls_back_to_npx(monkeypatch: pytest.MonkeyPatch) -> Non
         "serve",
         "--print-logs",
         "--log-level",
-        "INFO",
+        "info",
         "--hostname",
         "127.0.0.1",
         "--port",
@@ -1527,7 +1642,7 @@ def test_serve_command_falls_back_when_version_check_fails(monkeypatch: pytest.M
         "serve",
         "--print-logs",
         "--log-level",
-        "INFO",
+        "info",
         "--hostname",
         "127.0.0.1",
         "--port",
@@ -1638,7 +1753,12 @@ def test_auto_start_adopts_external_serve_on_port(monkeypatch: pytest.MonkeyPatc
 
 
 def test_auto_start_adopts_env_server_password(monkeypatch: pytest.MonkeyPatch) -> None:
-    """serve inherits OPENCODE_SERVER_PASSWORD/USERNAME -> health needs Basic auth."""
+    """serve inherits OPENCODE_SERVER_PASSWORD -> health needs Basic auth.
+
+    The username is pinned to ``opencode``: serve ignores
+    ``OPENCODE_SERVER_USERNAME``, so adopting the environment's ``lcl`` here is
+    exactly what made every health call answer 401 against 2.x.
+    """
     client, host = FakeClient(), FakeHost()
     runtime = _make_runtime(client, host)
     monkeypatch.setattr(
@@ -1650,8 +1770,14 @@ def test_auto_start_adopts_env_server_password(monkeypatch: pytest.MonkeyPatch) 
     async def run() -> None:
         await runtime._auto_start_serve("http://127.0.0.1:4096")
         assert client.api_key == "pw"
-        assert client.api_user == "lcl"
+        assert client.api_user == "opencode"
         assert runtime._serve is None  # precheck health passed once the key was applied
+        # Discovery probes the same URL without a runtime; it must be able to
+        # authenticate or it would report this healthy serve as unavailable.
+        assert serve_process.registered_serve_credentials("http://127.0.0.1:4096") == (
+            "opencode",
+            "pw",
+        )
 
     asyncio.run(run())
 
@@ -2826,26 +2952,49 @@ def _mock_client(
     return client, calls
 
 
-def test_client_question_reply_uses_the_v2_answers_payload() -> None:
+def test_client_question_reply_answers_the_form_fields() -> None:
+    """A V2 question is a form: the reply is keyed by field, not by question.
+
+    ``POST /api/session/{id}/form/{formID}/reply`` takes ``{answer: {key:
+    value}}``, so the client reads the form's field keys first and submits the
+    reply for each of them; dismissing the question is a DELETE on the form.
+    """
+
     import httpx
 
-    def ok(_: httpx.Request) -> httpx.Response:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": "frm_1",
+                        "sessionID": "ses_x",
+                        "title": "Pick a database",
+                        "fields": [
+                            {"key": "db", "type": "select", "title": "Database"},
+                            {"key": "note", "type": "text", "hidden": True},
+                        ],
+                    }
+                },
+            )
         return httpx.Response(204)
 
-    client, calls = _mock_client(ok)
+    client, calls = _mock_client(handler)
 
     async def run() -> None:
-        await client.reply_question(
-            "ses_x", "que_1", "PostgreSQL", directory="/work"
-        )
-        # opencode 1.18.34 rejects ``{"reply": ...}`` with
-        # ``Missing key at ["answers"]``; only the V2 route exists at all.
+        await client.reply_question("ses_x", "frm_1", "PostgreSQL", directory="/work")
         method, path, body = calls[0]
+        assert (method, path) == ("GET", "/api/session/ses_x/form/frm_1")
+        method, path, body = calls[1]
         assert method == "POST"
-        assert path == "/api/session/ses_x/question/que_1/reply"
-        assert json.loads(body) == {"answers": [["PostgreSQL"]]}
-        await client.reject_question("ses_x", "que_1", directory="/work")
-        assert calls[1][1] == "/api/session/ses_x/question/que_1/reject"
+        assert path == "/api/session/ses_x/form/frm_1/reply"
+        assert json.loads(body) == {
+            "answer": {"db": "PostgreSQL", "note": "PostgreSQL"}
+        }
+        await client.reject_question("ses_x", "frm_1", directory="/work")
+        assert calls[2][0] == "DELETE"
+        assert calls[2][1] == "/api/session/ses_x/form/frm_1"
         await client.close()
 
     asyncio.run(run())
@@ -3821,10 +3970,27 @@ def test_info_log_names_every_step_and_item_transition() -> None:
 
 
 def _server_reachable() -> bool:
+    """True when a serve this test can actually talk to answers on 4096.
+
+    opencode 2.x protects ``/api/info`` with HTTP Basic, and a serve the
+    connector auto-started has a generated password no test knows, so
+    "something is listening" is not enough — the probe has to authenticate with
+    the environment's credentials.
+    """
+
     import httpx
 
+    from connector.runtimes.opencode import serve_process
+
+    _user, password = serve_process.environment_server_credentials(dict(os.environ))
+    if not password:
+        return False
     try:
-        r = httpx.get("http://127.0.0.1:4096/global/health", timeout=3.0)
+        r = httpx.get(
+            "http://127.0.0.1:4096/api/info",
+            auth=httpx.BasicAuth(serve_process.SERVE_BASIC_USER, password),
+            timeout=3.0,
+        )
         return r.status_code == 200
     except httpx.HTTPError:
         return False
@@ -3832,7 +3998,7 @@ def _server_reachable() -> bool:
 
 @pytest.mark.skipif(
     not _server_reachable(),
-    reason="opencode serve not reachable at 127.0.0.1:4096",
+    reason="opencode serve not reachable/authenticable at 127.0.0.1:4096",
 )
 def test_e2e_full_lifecycle() -> None:
     """create -> turn -> wait -> snapshot -> interrupt against a live server."""
@@ -4122,9 +4288,11 @@ def test_create_session_uses_selected_workspace_directory() -> None:
 
 
 def test_list_runtime_commands_includes_builtins_before_skills() -> None:
-    """Built-in slash commands (model/compact/fork/share/undo) are injected
-    even when ``GET /command`` returns no skills, so the platform slash menu
-    can offer them — opencode's API only returns user-defined skills."""
+    """Built-in slash commands (model/compact/fork/undo) are injected
+    even when ``GET /api/command`` returns no skills, so the platform slash
+    menu can offer them — opencode's API only returns user-defined commands.
+    ``/share`` is gone with the opencode 2.x share route and must not be
+    offered at all."""
 
     client, host = FakeClient(), FakeHost()
     runtime = _make_runtime(client, host)
@@ -4132,11 +4300,12 @@ def test_list_runtime_commands_includes_builtins_before_skills() -> None:
     async def run() -> None:
         commands = await runtime.list_runtime_commands(limit=100)
         ids = [c.id for c in commands]
-        # All five builtins must be present.
-        for name in ("model", "compact", "fork", "share", "undo"):
+        # All four builtins must be present.
+        for name in ("model", "compact", "fork", "undo"):
             assert name in ids, f"builtin {name!r} missing from {ids}"
+        assert "share" not in ids
         # Builtins are emitted first, so the leading entries match exactly.
-        assert ids[:5] == ["model", "compact", "fork", "share", "undo"]
+        assert ids[:4] == ["model", "compact", "fork", "undo"]
         # /model must drive the platform selector UI, not an execute round-trip.
         model_cmd = next(c for c in commands if c.id == "model")
         assert model_cmd.accepts_args is False
@@ -4156,9 +4325,9 @@ def test_list_runtime_commands_includes_builtins_before_skills() -> None:
 
 
 def test_execute_command_dispatches_builtins_to_dedicated_endpoints() -> None:
-    """``/model``, ``/compact``, ``/fork``, ``/share``, ``/undo`` must NOT
-    hit ``POST /session/{id}/command`` (which only runs user skills); each
-    routes to its own opencode endpoint."""
+    """``/model``, ``/compact``, ``/fork``, ``/undo`` must NOT hit
+    ``POST /api/session/{id}/command`` (which only runs user skills); each
+    routes to its own opencode endpoint. ``/share`` no longer exists in 2.x."""
 
     client, host = FakeClient(), FakeHost()
     runtime = _make_runtime(client, host)
@@ -4198,11 +4367,13 @@ def test_execute_command_dispatches_builtins_to_dedicated_endpoints() -> None:
         assert client.forks == [(native, None, "/work")]
         assert "ses_forked" in str(r.result.get("text"))
 
-        # /share reports the share URL in the display text.
+        # /share was dropped in opencode 2.x: reported as unsupported, and it
+        # must not fall through to the skills endpoint either.
         r = await runtime.execute_command("plat_b", "share")
-        assert r.ok is True
-        assert client.shares == [(native, "/work")]
-        assert "https://opncd.ai/share/test123" in str(r.result.get("text"))
+        assert r.ok is False
+        assert r.code == "unsupported"
+        assert client.shares == []
+        assert client.skill_calls == []
 
         # /undo
         r = await runtime.execute_command("plat_b", "undo")

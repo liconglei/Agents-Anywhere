@@ -15,17 +15,21 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import secrets
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 from connector.launch import launch_target
 from connector.logging import logger
+from connector.paths import connector_data_dir
 
 LOGIN_SHELL_PATH_MARKER = "__AGENTS_ANYWHERE_PATH__"
 # Budget for one `<candidate> --version` probe. Kept short on purpose: the probe
@@ -45,16 +49,18 @@ PortInUseMarkers = ("EADDRINUSE", "address already in use", "already listening")
 # ``ServeProcess`` drains stderr into its ring buffer. It reduces the collision
 # with another opencode but is not a guarantee on 1.18.34 -- see
 # ``is_serve_log_lock_failure``.
-SERVE_LOG_FLAGS: tuple[str, ...] = ("--print-logs", "--log-level", "INFO")
+# ``--log-level`` is validated case-sensitively (effect/cli rejects "INFO";
+# accepted: all|trace|debug|info|warn|warning|error|fatal|none). Keep this
+# lowercase or every auto-started serve exits within ~100ms with code 1.
+SERVE_LOG_FLAGS: tuple[str, ...] = ("--print-logs", "--log-level", "info")
 
 # opencode keeps its own log file open while any instance runs (TUI, CLI or
-# serve). It used to be treated as a single-instance lock that made a second
-# ``serve`` die during boot, sometimes with a native fastfail and zero output.
-# On 1.18.34 that is not the case any more — a second ``opencode serve`` starts
-# and answers health while another instance holds the log — so this is now only
-# a diagnostic: the runtime probes for a serve to adopt, spawns anyway, and
-# attaches the hint below to a spawn that actually died. Surfacing it beats a
-# bare crash code, and it doubles as the user-facing hint.
+# serve). opencode 2.x opens ``<data>/opencode/log/opencode.log`` exclusively at
+# boot **regardless of --print-logs**, so on Windows a second ``serve`` dies
+# within ~1s with ``EPERM ... opencode.log`` (exit code 1) while the holder
+# lives. The runtime therefore probes for a serve to adopt, and if there is none
+# it spawns with an isolated data directory (see ``isolated_data_home``) so it
+# can still run. The hint below is what a spawn that died anyway gets.
 LOCK_HOLD_HINT = (
     "另一个 opencode 实例正在运行并持有 opencode 日志文件 "
     "(<data>/opencode/log/opencode.log)，刚启动的 serve 因此退出。"
@@ -83,12 +89,101 @@ def describe_exit_code(code: int | None) -> str:
     return f"code={code}"
 
 
-def opencode_log_path(environment: dict[str, str]) -> str:
+def opencode_data_home(environment: Mapping[str, str]) -> str:
+    """The ``<data>`` directory opencode keeps its log, database and sessions in.
+
+    Mirrors opencode's own XDG resolution: ``XDG_DATA_HOME/opencode`` when set,
+    otherwise ``~/.local/share/opencode``.
+    """
+
     xdg = str(environment.get("XDG_DATA_HOME") or "").strip()
     if xdg:
-        return os.path.join(xdg, "opencode", "log", "opencode.log")
+        return os.path.join(xdg, "opencode")
     home = str(environment.get("USERPROFILE") or "").strip() or os.path.expanduser("~")
-    return os.path.join(home, ".local", "share", "opencode", "log", "opencode.log")
+    return os.path.join(home, ".local", "share", "opencode")
+
+
+def opencode_log_path(environment: Mapping[str, str]) -> str:
+    return os.path.join(opencode_data_home(environment), "log", "opencode.log")
+
+
+# Credential files opencode keeps next to its database. A serve on an isolated
+# data directory starts without them, so they are mirrored from the user's own
+# data directory — otherwise the connector's serve would lose every provider
+# login the user configured in their interactive opencode.
+_CREDENTIAL_FILES = ("auth.json", "account.json")
+
+
+def isolate_data_home(environment: dict[str, str], *, tag: str) -> str:
+    """Point a serve this connector starts at its own ``XDG_DATA_HOME``.
+
+    opencode 2.x opens ``<data>/log/opencode.log`` exclusively at boot —
+    ``--print-logs`` does not prevent it — and holds the session database open,
+    so a second serve dies within ~1s with ``EPERM`` while any other opencode
+    (TUI, CLI, another serve) is running; pointing two serves at one database
+    fails the same way ("attempt to write a readonly database"). The 2.0.27
+    binary has no env knob for either path (``OPENCODE_TUI_CHANNEL`` only
+    affects the TUI, ``OPENCODE_DB`` at a held path fails as above), so the data
+    directory is the only lever.
+
+    The path is stable per ``tag`` (the configured port) so sessions survive
+    connector restarts: a per-spawn directory would make session sync treat
+    every previously synced session as deleted on each restart.
+    """
+
+    source = opencode_data_home(environment)
+    copied: list[str] = []
+    try:
+        # opencode appends its own "opencode" directory to XDG_DATA_HOME, so
+        # both its database/logs and the mirrored credentials live one level
+        # down.
+        target_root = str(connector_data_dir() / "opencode-serve" / tag)
+        target = os.path.join(target_root, "opencode")
+        os.makedirs(target, exist_ok=True)
+    except (OSError, RuntimeError) as exc:
+        # The connector's own data directory is normally writable; fall back to
+        # the temp directory rather than leaving the child on the shared data
+        # directory, where its boot would die on the log lock anyway.
+        target_root = os.path.join(
+            tempfile.gettempdir(), "agents-anywhere", f"opencode-serve-{tag}"
+        )
+        target = os.path.join(target_root, "opencode")
+        logger.warning(
+            "opencode isolate data dir failed: error={}; falling back to {}",
+            exc,
+            target_root,
+        )
+        try:
+            os.makedirs(target, exist_ok=True)
+        except OSError as fallback_exc:
+            logger.warning(
+                "opencode isolate data dir fallback failed: target={} error={}",
+                target,
+                fallback_exc,
+            )
+            return target_root
+    for name in _CREDENTIAL_FILES:
+        source_file = os.path.join(source, name)
+        target_file = os.path.join(target, name)
+        if not os.path.isfile(source_file):
+            continue
+        try:
+            if (
+                os.path.isfile(target_file)
+                and os.path.getmtime(target_file) >= os.path.getmtime(source_file)
+            ):
+                continue
+            shutil.copy2(source_file, target_file)
+            copied.append(name)
+        except OSError as exc:
+            logger.warning("opencode credential mirror failed: file={} error={}", name, exc)
+    environment["XDG_DATA_HOME"] = target_root
+    logger.info(
+        "opencode isolate data dir: {} (credentials mirrored: {})",
+        target_root,
+        ", ".join(copied) if copied else "none",
+    )
+    return target_root
 
 
 def is_serve_log_lock_held(environment: dict[str, str]) -> bool:
@@ -211,6 +306,80 @@ def serve_environment() -> dict[str, str]:
     if shell_path:
         env["PATH"] = shell_path
     return env
+
+
+# opencode 2.x authenticates HTTP Basic as this fixed user and **ignores
+# ``OPENCODE_SERVER_USERNAME``** (verified on 2.0.27: with it set to ``lcl`` the
+# very same password answers 401, and ``opencode`` answers 200). The connector
+# therefore pins the username on both sides — the spawn env and the client —
+# instead of trusting the environment. A serve someone else runs can still use
+# a different user through the runtime's ``apiUser`` setting.
+SERVE_BASIC_USER = "opencode"
+
+
+def generated_server_password() -> str:
+    """A fresh Basic-auth password for a serve this connector starts.
+
+    opencode 2.x has no unauthenticated mode: without ``OPENCODE_SERVER_PASSWORD``
+    it invents its own password, which no client can learn, so every request
+    (health included) answers 401. Generating one here lets the spawn and the
+    connector agree on the credential.
+    """
+
+    return secrets.token_urlsafe(24)
+
+
+def generated_server_credentials(
+    environment: dict[str, str],
+) -> tuple[str, str]:
+    """Write a generated Basic-auth credential into ``environment``.
+
+    Returns the ``(username, password)`` the child process will require.
+    """
+
+    password = generated_server_password()
+    environment["OPENCODE_SERVER_PASSWORD"] = password
+    environment["OPENCODE_SERVER_USERNAME"] = SERVE_BASIC_USER
+    return SERVE_BASIC_USER, password
+
+
+def environment_server_credentials(
+    environment: Mapping[str, str],
+) -> tuple[str | None, str]:
+    """Credentials a serve spawned with ``environment`` inherits.
+
+    ``OPENCODE_SERVER_PASSWORD`` enables Basic auth; an empty password means the
+    child picks its own, which no client can authenticate against. The username
+    is always ``SERVE_BASIC_USER`` because that is what ``serve`` checks.
+    """
+
+    password = str(environment.get("OPENCODE_SERVER_PASSWORD") or "").strip() or None
+    username = SERVE_BASIC_USER
+    return username, password
+
+
+# Basic-auth credentials of the serves this process started, keyed by server URL.
+# Discovery probes a serve without a runtime instance (``default_probe``), and on
+# 2.x an unauthenticated probe answers 401 — which would report a perfectly
+# healthy auto-started serve as unavailable and leave the client unable to use
+# it. Registering what auto-start generated lets the probe authenticate the way
+# the runtime does.
+_SERVE_CREDENTIALS: dict[str, tuple[str, str]] = {}
+
+
+def register_serve_credentials(server_url: str, username: str, password: str) -> None:
+    """Remember the credentials of a serve this connector started."""
+
+    if not server_url or not password:
+        return
+    _SERVE_CREDENTIALS[server_url.rstrip("/")] = (username, password)
+
+
+def registered_serve_credentials(server_url: str) -> tuple[str | None, str]:
+    """Credentials registered for ``server_url``, if this process started it."""
+
+    username, password = _SERVE_CREDENTIALS.get(server_url.rstrip("/"), ("", ""))
+    return (username or None), password
 
 
 _LAUNCHER_SUFFIXES = (".cmd", ".bat", ".ps1")

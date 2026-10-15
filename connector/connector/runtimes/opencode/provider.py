@@ -17,7 +17,7 @@ from connector.runtime_protocol import (
     RuntimeTypeDescriptor,
 )
 from connector.runtime_protocol.host import RuntimeHostClient
-from connector.runtimes.opencode import provider_config
+from connector.runtimes.opencode import provider_config, serve_process
 from connector.runtimes.opencode.runtime import OpenCodeRuntime
 
 OPENCODE_CONFIG_SCHEMA_REVISION = 2
@@ -28,30 +28,34 @@ Prober = Callable[[], dict[str, Any]]
 def _serve_credentials() -> tuple[str | None, str]:
     """Basic-auth credentials an auto-started serve inherits from the environment.
 
-    ``opencode serve`` protects itself with HTTP Basic and answers even
-    ``/global/health`` with 401 unless the matching credentials are sent. The
-    password is optional (a serve may run open), so a missing password yields
-    no Authorization header rather than a broken one.
+    ``opencode serve`` protects itself with HTTP Basic and answers every route
+    (including the health probe ``/api/info``) with 401 unless the matching
+    credentials are sent. The password is optional (a serve started without one
+    invents its own), so a missing password yields no Authorization header
+    rather than a broken one.
     """
 
-    password = str(os.environ.get("OPENCODE_SERVER_PASSWORD") or "").strip() or None
-    user = str(os.environ.get("OPENCODE_SERVER_USERNAME") or "").strip() or "opencode"
-    return user, password
+    return serve_process.environment_server_credentials(os.environ)
 
 
 def default_probe() -> dict[str, Any]:
     """Reachability probe for a serve instance at the configured URL.
 
     Runs synchronously against the default config values; discovery is a
-    lightweight config-time check, not a turn-critical path.
+    lightweight config-time check, not a turn-critical path. Credentials come
+    from the runtime config, then the environment, then — for a serve this
+    connector auto-started — the password auto-start generated (discovery has no
+    runtime instance to ask, and an unauthenticated probe would 401).
     """
 
     values = provider_config.default_config_values()
-    api_user, api_key = _serve_credentials()
+    server_url = str(values["serverUrl"])
+    env_user, env_key = _serve_credentials()
+    started_user, started_key = serve_process.registered_serve_credentials(server_url)
     return _probe_url(
-        str(values["serverUrl"]),
-        api_user=str(values.get("apiUser") or api_user),
-        api_key=str(values.get("apiKey") or api_key or ""),
+        server_url,
+        api_user=str(values.get("apiUser") or env_user or started_user or "opencode"),
+        api_key=str(values.get("apiKey") or env_key or started_key or ""),
     )
 
 
@@ -63,8 +67,19 @@ def _probe_url(url: str, *, api_user: str = "opencode", api_key: str = "") -> di
         token = base64.b64encode(f"{api_user}:{api_key}".encode()).decode()
         headers["Authorization"] = f"Basic {token}"
     try:
-        response = httpx.get(f"{url.rstrip('/')}/global/health", headers=headers, timeout=5.0)
+        # opencode 2.x only speaks ``/api/*``; unknown routes fall through to the
+        # web UI with HTTP 200 + HTML, which would read as a healthy 1.x serve.
+        response = httpx.get(f"{url.rstrip('/')}/api/info", headers=headers, timeout=5.0)
         if response.status_code == 200:
+            content_type = response.headers.get("content-type", "")
+            if "html" in content_type.lower() or response.text.lstrip()[:64].lower().startswith(
+                ("<!doctype html", "<html")
+            ):
+                return {
+                    "available": False,
+                    "status": 200,
+                    "reason": "this opencode does not expose the V2 API (/api/info)",
+                }
             payload = response.json() if response.content else {}
             return {
                 "available": True,

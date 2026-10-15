@@ -215,6 +215,129 @@ def test_log_lock_failure_is_recognised_in_all_its_shapes() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# data directory isolation and Basic auth
+# --------------------------------------------------------------------------- #
+
+
+def test_generated_server_password_is_unpredictable_and_url_safe() -> None:
+    first = serve_process.generated_server_password()
+    second = serve_process.generated_server_password()
+    assert first and second and first != second
+    assert len(first) >= 22
+    assert all(char.isalnum() or char in "-_" for char in first)
+
+
+def test_environment_credentials_follow_opencode_rules() -> None:
+    # The username is fixed: serve ignores OPENCODE_SERVER_USERNAME, so a custom
+    # value in the environment must not leak into the client's credentials.
+    assert serve_process.environment_server_credentials({}) == ("opencode", None)
+    assert serve_process.environment_server_credentials(
+        {"OPENCODE_SERVER_PASSWORD": "  pw  ", "OPENCODE_SERVER_USERNAME": "licon"}
+    ) == ("opencode", "pw")
+    # A blank password is no password: the child would invent one the client
+    # can never authenticate against.
+    assert serve_process.environment_server_credentials(
+        {"OPENCODE_SERVER_PASSWORD": "   "}
+    ) == ("opencode", None)
+
+
+def test_generated_server_credentials_pin_the_username_the_serve_checks() -> None:
+    env = {"OPENCODE_SERVER_USERNAME": "licon"}
+    user, password = serve_process.generated_server_credentials(env)
+    assert user == "opencode"
+    assert password and env["OPENCODE_SERVER_PASSWORD"] == password
+    # Both sides must agree, so the child's env is pinned too rather than
+    # inheriting a username serve would ignore.
+    assert env["OPENCODE_SERVER_USERNAME"] == "opencode"
+
+
+def test_registered_serve_credentials_let_discovery_authenticate() -> None:
+    """Discovery probes without a runtime; it must reuse what auto-start made.
+
+    An unauthenticated probe answers 401 on 2.x, which would report a healthy
+    auto-started serve as unavailable.
+    """
+
+    # A port of its own: the registry is process-wide and other tests register
+    # credentials for the default 4096 serve.
+    url = "http://127.0.0.1:4909"
+    assert serve_process.registered_serve_credentials(url) == (None, "")
+    serve_process.register_serve_credentials(url + "/", "opencode", "secret")
+    assert serve_process.registered_serve_credentials(url) == ("opencode", "secret")
+    # A trailing slash in the config must resolve to the same entry.
+    assert serve_process.registered_serve_credentials(url + "/") == ("opencode", "secret")
+    # An unrelated serve is untouched.
+    assert serve_process.registered_serve_credentials("http://127.0.0.1:4196") == (None, "")
+    # Empty credentials are never registered.
+    serve_process.register_serve_credentials("http://127.0.0.1:4197", "opencode", "")
+    assert serve_process.registered_serve_credentials("http://127.0.0.1:4197") == (None, "")
+
+
+def test_isolate_data_home_is_stable_per_tag_and_mirrors_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The child needs its own data dir, or its boot dies on the log lock.
+
+    opencode 2.x opens ``<data>/log/opencode.log`` and the session database
+    exclusively, so a serve started while the user's interactive opencode runs
+    dies within ~1s. The isolated directory must be *stable per port* (a new one
+    per spawn would make session sync delete everything it synced last time) and
+    must carry the user's provider logins.
+    """
+
+    connector_dir = tmp_path / "connector"
+    monkeypatch.setenv("AGENT_CONNECTOR_DATA_DIR", str(connector_dir))
+    user_data = tmp_path / "user-data" / "opencode"
+    user_data.mkdir(parents=True)
+    (user_data / "auth.json").write_text('{"anthropic":{}}', encoding="utf-8")
+    (user_data / "account.json").write_text('{"email":"me@example.com"}', encoding="utf-8")
+
+    env = {
+        "USERPROFILE": str(tmp_path),
+        "XDG_DATA_HOME": str(tmp_path / "user-data"),
+    }
+    first = serve_process.isolate_data_home(env, tag="4096")
+    assert first == str(connector_dir / "opencode-serve" / "4096")
+    assert env["XDG_DATA_HOME"] == first
+    # opencode appends its own directory, and that is where it looks for
+    # credentials — mirroring one level up would silently drop every login.
+    opencode_home = Path(first) / "opencode"
+    assert (opencode_home / "auth.json").read_text(encoding="utf-8") == '{"anthropic":{}}'
+    assert (opencode_home / "account.json").exists()
+    assert serve_process.opencode_log_path(env) == os.path.join(
+        first, "opencode", "log", "opencode.log"
+    )
+
+    # Same tag, new environment: same directory, so sessions survive restarts.
+    again = serve_process.isolate_data_home({"USERPROFILE": str(tmp_path)}, tag="4096")
+    assert again == first
+    # A different port gets its own directory (two serves must not share a db).
+    other = serve_process.isolate_data_home({"USERPROFILE": str(tmp_path)}, tag="4196")
+    assert other != first
+
+
+def test_isolate_data_home_keeps_a_newer_mirrored_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A credential opencode refreshed in the isolated dir must not be reverted."""
+
+    connector_dir = tmp_path / "connector"
+    monkeypatch.setenv("AGENT_CONNECTOR_DATA_DIR", str(connector_dir))
+    user_data = tmp_path / "user-data" / "opencode"
+    user_data.mkdir(parents=True)
+    auth = user_data / "auth.json"
+    auth.write_text("old", encoding="utf-8")
+    isolated = connector_dir / "opencode-serve" / "4096" / "opencode"
+    isolated.mkdir(parents=True)
+    (isolated / "auth.json").write_text("newer", encoding="utf-8")
+    os.utime(isolated / "auth.json", (os.path.getmtime(auth) + 60, os.path.getmtime(auth) + 60))
+
+    serve_process.isolate_data_home({"XDG_DATA_HOME": str(tmp_path / "user-data")}, tag="4096")
+
+    assert (isolated / "auth.json").read_text(encoding="utf-8") == "newer"
+
+
+# --------------------------------------------------------------------------- #
 # resolve_serve_command
 # --------------------------------------------------------------------------- #
 
