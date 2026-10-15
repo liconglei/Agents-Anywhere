@@ -1,35 +1,50 @@
-"""Async HTTP + SSE client for a local ``opencode serve`` instance.
+"""Async HTTP + SSE client for a local ``opencode serve`` (V2 API) instance.
 
-Endpoint map (verified against opencode 1.18.34). opencode serves two
-namespaces: most routes live at the root, while question replies and the
-per-session model switch only exist under ``/api``. A route that does not exist
-falls through to the web UI, which answers **HTTP 200 with an HTML body** — so
-a typo in a path looks like success. Both variants of the paths below were
-probed; the ones not listed here return the SPA fallback:
+Endpoint map (verified against opencode 2.0.27 by live probe on this machine:
+a password-protected serve, a real turn with a real model, and the bundled
+``/openapi.json``). Everything moved to ``/api/*``; the 1.x routes (including
+``/global/health`` and ``/session/status``) are gone. Two traps shape the code:
 
-- ``GET  /global/health``               health
-- ``GET  /session``                     list sessions
-- ``POST /session``                     create session (body optional)
-- ``GET  /session/{id}``                session info (carries ``agent``/``model``)
-- ``PATCH /session/{id}``               update (title; ``permission`` merges, see below)
-- ``GET  /session/{id}/message``        message list (info + parts)
-- ``POST /session/{id}/message``        synchronous prompt (blocks until done)
-- ``POST /session/{id}/prompt_async``   fire-and-forget prompt (204)
-- ``POST /session/{id}/abort``          abort the active turn
-- ``POST /session/{id}/command``        run a user-defined skill
-- ``POST /session/{id}/summarize``      compact the conversation
-- ``POST /session/{id}/fork``           fork the session
-- ``POST /session/{id}/share``          create a share link
-- ``POST /session/{id}/revert``         revert one message (needs ``messageID``)
-- ``POST /session/{id}/permissions/{id}`` answer a permission request
-- ``GET  /session/status``              busy/idle map for all sessions
-- ``GET  /agent``                       agents (primary/subagent + permissions)
-- ``GET  /provider``                    providers and their models
-- ``GET  /command``                     user-defined commands (**needs ``directory``**)
-- ``POST /api/session/{id}/model``      switch the session model (V2 only)
-- ``POST /api/session/{id}/question/{id}/reply`` answer a question (V2 only)
-- ``GET  /global/event``                global SSE stream (all project instances)
-- ``GET  /event``                       instance-scoped SSE (only the serve cwd's project)
+- **HTTP Basic is mandatory.** ``/api/*`` answers 401 unless
+  ``OPENCODE_SERVER_PASSWORD`` matches (username defaults to ``opencode``,
+  ``OPENCODE_SERVER_USERNAME`` overrides); there is no unauthenticated mode, so
+  the runtime injects a generated password when it auto-starts a serve.
+- **Unknown routes answer 200 + the web UI.** A mistyped path looks like a
+  successful call unless the body is inspected, so every JSON response is
+  checked (``_is_html``) and the HTML fallback is rejected.
+
+Routes used here:
+
+- ``GET  /api/info``                      health/identity (flat ``ServerInfo``)
+- ``GET  /api/session``                   list sessions (``{data, cursor}``)
+- ``POST /api/session``                   create session (``{title, location:{directory}}``)
+- ``GET  /api/session/{id}``              session info (``{data}``; ``location.directory``)
+- ``GET  /api/session/active``            busy map ``{ses_x: {type: "running"}}`` (global)
+- ``GET  /api/session/{id}/message``       message list (``{data, cursor}``, newest first)
+- ``POST /api/session/{id}/prompt``       admit a prompt (``{text, delivery}``)
+- ``POST /api/session/{id}/interrupt``    abort the turn
+- ``POST /api/session/{id}/model``        switch model (``{model: Model.Ref}``)
+- ``POST /api/session/{id}/agent``        switch agent (``{agent}``)
+- ``GET  /api/session/{id}/permission``   pending permission requests
+- ``POST /api/session/{id}/permission/{pid}/reply`` ``{decision: once|always|reject}``
+- ``GET  /api/session/{id}/form``         pending forms (opencode's "questions")
+- ``POST /api/session/{id}/form/{fid}/reply`` ``{answer: {fieldId: value}}``
+- ``DELETE /api/session/{id}/form/{fid}`` dismiss a form
+- ``POST /api/session/{id}/command``       run a user command
+- ``POST /api/session/{id}/compact``      compact the conversation
+- ``POST /api/session/{id}/fork``          fork the session
+- ``GET  /api/agent`` / ``/api/command``  catalogs (``{location, data}``)
+- ``GET  /api/model`` + ``/api/provider`` model catalog
+- ``GET  /api/event``                     live-only SSE (no replay)
+
+Shape adaptation lives here, not in the runtime, so the timeline projection
+(``timeline.py``) keeps the ``{info, parts}`` message contract:
+
+- message list: V2 flat ``Session.Message.Info`` union -> ``{info, parts}``,
+  chronological order, ``idle``/``model-switched``/... dropped;
+- busy map: ``{"type": "running"}`` -> ``{"type": "busy"}``;
+- event stream: V2 frames -> the ``{type, properties}`` events the runtime's
+  ``_handle_event`` dispatches on.
 """
 
 from __future__ import annotations
@@ -38,9 +53,27 @@ import base64
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import httpx
+
+# Read budget for the auto-start "is a serve already there?" precheck. The
+# client's default connect timeout is generous on purpose (a busy serve can be
+# slow to answer), but paying it while nothing is listening only delays the spawn.
+HEALTH_FAST_TIMEOUT_S = 1.5
+
+# Page size / bounds for the two paginated collections (sessions, messages).
+# V2 answers with ``{data, cursor}``; a single fetch is only the first page, and
+# treating it as the full inventory would make session sync delete everything
+# beyond the first page.
+PAGE_SIZE = 200
+MAX_PAGES = 25
+
+# Synthesized part ids for streamed assistant content. V2 streams deltas per
+# ``(assistantMessageID, kind, ordinal)`` and stores content parts **without**
+# ids, so the same scheme is used on both paths: a streamed item and the
+# turn-end snapshot describe the same platform item instead of duplicating it.
+_PART_KINDS = frozenset({"text", "reasoning"})
 
 
 class OpenCodeClientError(RuntimeError):
@@ -52,12 +85,12 @@ class OpenCodeClientError(RuntimeError):
 
 
 def append_directory_param(path: str, directory: str) -> str:
-    """Bind a request to one project directory.
+    """Append the project ``directory`` query parameter.
 
-    ``opencode serve`` multiplexes one instance per working directory; without
-    the ``directory`` parameter every request resolves to the serve process
-    cwd, silently ignoring the workspace the user selected. Some routes *require*
-    it: ``GET /command`` answers 503 without a directory.
+    V2 dropped the per-instance routing of 1.x (one serve serves every project)
+    and instead uses ``directory`` as a filter on the collection routes
+    (``GET /api/session``, ``/api/agent``, ``/api/command``). Kept as a helper so
+    the filter stays a single place.
     """
 
     separator = "&" if "?" in path else "?"
@@ -73,10 +106,281 @@ def _is_html(content_type: str, body: str) -> bool:
     return head.startswith(("<!doctype html", "<html"))
 
 
-# Read budget for the auto-start "is a serve already there?" precheck. The
-# client's default connect timeout is generous on purpose (a busy serve can be
-# slow to answer), but paying it while nothing is listening only delays the spawn.
-HEALTH_FAST_TIMEOUT_S = 1.5
+def _unwrap(payload: Any) -> Any:
+    """Unwrap the ``{"data": ...}`` envelope every V2 route answers with."""
+
+    if isinstance(payload, dict) and "data" in payload:
+        return payload["data"]
+    return payload
+
+
+def _as_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return str(value)
+    return ""
+
+
+def _tool_state(raw: Any) -> dict[str, Any]:
+    """Normalize a V2 tool state into the ``{status, input, output}`` shape.
+
+    V2 reports output either as a plain string or as a list of content blocks
+    (``[{"type": "text", "text": ...}]``); both collapse to one string. Status
+    vocabulary is ``running`` / ``streaming`` / ``completed`` / ``error`` /
+    ``pending`` and ``timeline._TOOL_STATUS_MAP`` understands all of them.
+    """
+
+    state = raw if isinstance(raw, dict) else {}
+    status = str(state.get("status") or "pending")
+    output = state.get("output")
+    if output is None and isinstance(state.get("content"), list):
+        chunks: list[str] = []
+        for block in state["content"]:
+            if isinstance(block, dict):
+                chunks.append(_as_text(block.get("text")))
+            elif isinstance(block, str):
+                chunks.append(block)
+        output = "".join(chunks)
+    if output is None and state.get("error"):
+        output = _as_text(state.get("error"))
+    return {"status": status, "input": state.get("input"), "output": output}
+
+
+def _adapt_user_message(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """V2 user message -> ``{info, parts}``.
+
+    V2 keeps the prompt text on the message itself (``text``) instead of a text
+    part; it is projected into a single non-synthetic text part so the timeline
+    mapper and the clientMessageId matcher see the shape they expect.
+    """
+
+    message_id = str(raw.get("id") or "")
+    created = (raw.get("time") or {}).get("created") if isinstance(raw.get("time"), dict) else None
+    parts: list[dict[str, Any]] = []
+    text = _as_text(raw.get("text"))
+    if text:
+        parts.append({"id": f"{message_id}:text:0", "type": "text", "text": text})
+    for index, file in enumerate(raw.get("files") or ()):
+        if not isinstance(file, Mapping):
+            continue
+        url = str(file.get("uri") or file.get("url") or "")
+        if not url:
+            continue
+        part: dict[str, Any] = {"id": f"{message_id}:file:{index}", "type": "file", "url": url}
+        name = str(file.get("name") or file.get("filename") or "")
+        if name:
+            part["filename"] = name
+        mime = file.get("mime") or file.get("mimeType")
+        if isinstance(mime, str) and mime:
+            part["mime"] = mime
+        parts.append(part)
+    return {
+        "info": {"id": message_id, "role": "user", "time": {"created": created}},
+        "parts": parts,
+    }
+
+
+def _adapt_assistant_message(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """V2 assistant message -> ``{info, parts}``.
+
+    ``content[]`` entries are projected to ``text`` / ``reasoning`` / ``tool``
+    parts; ``model`` (a ``Model.Ref``) is flattened into ``info.providerID`` /
+    ``info.modelID`` because the runtime reads those keys when it reports the
+    session's current model, and ``time.completed`` is what marks the message
+    finished (turn-boundary detection and "assistant still running" checks).
+    """
+
+    message_id = str(raw.get("id") or "")
+    time = raw.get("time") if isinstance(raw.get("time"), dict) else {}
+    model = raw.get("model") if isinstance(raw.get("model"), dict) else {}
+    parts: list[dict[str, Any]] = []
+    per_kind: dict[str, int] = {}
+    for entry in raw.get("content") or ():
+        if not isinstance(entry, Mapping):
+            continue
+        kind = str(entry.get("type") or "")
+        if kind not in _PART_KINDS and kind != "tool":
+            continue
+        index = per_kind.get(kind, 0)
+        per_kind[kind] = index + 1
+        if kind == "tool":
+            state = _tool_state(entry.get("state"))
+            name = str(entry.get("tool") or entry.get("name") or "tool")
+            parts.append(
+                {
+                    "id": str(entry.get("id") or f"{message_id}:tool:{index}"),
+                    "type": "tool",
+                    "tool": name,
+                    "state": state,
+                    "callID": str(entry.get("callID") or entry.get("id") or ""),
+                }
+            )
+            continue
+        part: dict[str, Any] = {
+            "id": f"{message_id}:{kind}:{index}",
+            "type": kind,
+            "text": _as_text(entry.get("text")),
+        }
+        time_entry = entry.get("time")
+        if isinstance(time_entry, dict):
+            part["time"] = dict(time_entry)
+        parts.append(part)
+    info: dict[str, Any] = {
+        "id": message_id,
+        "role": "assistant",
+        "time": {
+            "created": time.get("created"),
+            "completed": time.get("completed"),
+            "streamed": time.get("streamed"),
+        },
+    }
+    if model:
+        info["modelID"] = model.get("id")
+        info["providerID"] = model.get("providerID")
+        variant = model.get("variant")
+        if variant:
+            info["variant"] = variant
+    return {"info": info, "parts": parts}
+
+
+def _adapt_message(raw: Any) -> dict[str, Any] | None:
+    """One V2 message entry -> ``{info, parts}``, or ``None`` when not renderable.
+
+    The union also carries ``idle`` / ``model-switched`` / ``agent-switched`` /
+    ``system`` / ``compaction`` markers, none of which are timeline items.
+    """
+
+    if not isinstance(raw, Mapping):
+        return None
+    kind = str(raw.get("type") or "")
+    if kind == "user":
+        return _adapt_user_message(raw)
+    if kind == "assistant":
+        return _adapt_assistant_message(raw)
+    return None
+
+
+def _adapt_event(frame: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """One V2 SSE frame -> the runtime's ``{type, properties}`` events.
+
+    V2 publishes session work as ordered event types under ``data``:
+    ``session.execution.started`` opens a turn, ``session.text.delta`` /
+    ``session.reasoning.delta`` stream content keyed by
+    ``(assistantMessageID, ordinal)``, ``session.text.ended`` /
+    ``session.reasoning.ended`` restate it complete, and ``session.step.ended``
+    marks the assistant message complete. There is no terminal ``session.idle``
+    event; turn end is detected by polling the active map (see the runtime's
+    watchdog), which is also what an unanswered permission/question needs.
+    """
+
+    frame_type = str(frame.get("type") or frame.get("event") or "")
+    data = frame.get("data")
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError:
+            data = None
+    if not isinstance(data, Mapping):
+        data = {}
+    session_id = str(data.get("sessionID") or frame.get("sessionID") or "")
+    if not session_id:
+        return []
+    properties: dict[str, Any] = {"sessionID": session_id}
+    if frame_type == "session.execution.started":
+        return [{"type": "session.status", "properties": {**properties, "status": {"type": "busy"}}}]
+    if frame_type == "session.text.delta" or frame_type == "session.reasoning.delta":
+        delta = data.get("delta")
+        message_id = str(data.get("assistantMessageID") or "")
+        ordinal = data.get("ordinal")
+        if not isinstance(delta, str) or not delta or not message_id:
+            return []
+        kind = "text" if frame_type == "session.text.delta" else "reasoning"
+        return [
+            {
+                "type": "message.part.delta",
+                "properties": {
+                    **properties,
+                    "messageID": message_id,
+                    "partID": f"{message_id}:{kind}:{ordinal}",
+                    "field": "text",
+                    "delta": delta,
+                },
+            }
+        ]
+    if frame_type in {"session.text.ended", "session.reasoning.ended"}:
+        message_id = str(data.get("assistantMessageID") or "")
+        if not message_id:
+            return []
+        ordinal = data.get("ordinal")
+        kind = "text" if frame_type == "session.text.ended" else "reasoning"
+        return [
+            {
+                "type": "message.part.updated",
+                "properties": {
+                    **properties,
+                    "part": {
+                        "id": f"{message_id}:{kind}:{ordinal}",
+                        "type": kind,
+                        "messageID": message_id,
+                        "text": _as_text(data.get("text")),
+                    },
+                },
+            }
+        ]
+    if frame_type == "session.step.ended":
+        message_id = str(data.get("assistantMessageID") or "")
+        if not message_id:
+            return []
+        created = frame.get("created")
+        return [
+            {
+                "type": "message.updated",
+                "properties": {
+                    **properties,
+                    "info": {
+                        "id": message_id,
+                        "role": "assistant",
+                        "time": {"completed": created or 0},
+                    },
+                },
+            }
+        ]
+    if frame_type == "session.step.started":
+        message_id = str(data.get("assistantMessageID") or "")
+        if not message_id:
+            return []
+        return [
+            {
+                "type": "message.updated",
+                "properties": {**properties, "info": {"id": message_id, "role": "assistant"}},
+            }
+        ]
+    if frame_type == "session.error":
+        error = data.get("error")
+        return [
+            {
+                "type": "session.error",
+                "properties": {
+                    **properties,
+                    "error": error if isinstance(error, Mapping) else {"message": _as_text(data)},
+                },
+            }
+        ]
+    if frame_type.startswith("session.updated"):
+        return [
+            {
+                "type": "session.updated",
+                "properties": {
+                    **properties,
+                    "info": {
+                        "title": data.get("title"),
+                        "time": {"updated": frame.get("created")},
+                    },
+                },
+            }
+        ]
+    return []
 
 
 class OpenCodeClient:
@@ -91,10 +395,8 @@ class OpenCodeClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.api_user = api_user
-        self.timeout = timeout
-        # /event can legitimately go quiet for a whole turn; request timeouts
-        # must not cut the stream and drop events in the gap.
         self.stream_timeout = stream_timeout if stream_timeout is not None else timeout
+        self.timeout = timeout
         self._http: httpx.AsyncClient | None = None
 
     def _authorization(self) -> str:
@@ -126,7 +428,8 @@ class OpenCodeClient:
         ``opencode serve`` inherits ``OPENCODE_SERVER_PASSWORD`` (and possibly
         ``OPENCODE_SERVER_USERNAME``) from the environment, so an auto-started
         instance requires Basic auth even when the runtime config left
-        ``apiKey`` empty.
+        ``apiKey`` empty. The auto-start path generates a password and injects
+        it into the spawn environment when the user environment has none.
         """
 
         if not api_key:
@@ -158,7 +461,7 @@ class OpenCodeClient:
             raise OpenCodeClientError(f"opencode server unreachable: {exc}") from exc
         if response.status_code >= 400:
             # Surface the response body so callers see opencode's actual error
-            # detail (e.g. ``{"_tag":"BadRequest","data":{"message":"..."}}``)
+            # detail (e.g. ``{"_tag":"InvalidRequestError","message":"..."}``)
             # instead of just the bare status code, which is useless for triage.
             body_excerpt = (response.text or "").strip()
             if len(body_excerpt) > 400:
@@ -168,7 +471,7 @@ class OpenCodeClient:
                 + (f" body={body_excerpt}" if body_excerpt else ""),
                 status_code=response.status_code,
             )
-        # 204 / empty bodies are normal (prompt_async, model switch).
+        # 204 / empty bodies are normal (prompt admit, model switch, interrupt).
         if response.status_code == 204 or not response.content:
             return None
         # opencode answers unknown routes with the web UI (HTTP 200 + HTML), so
@@ -182,7 +485,7 @@ class OpenCodeClient:
         return response.json()
 
     async def health(self, *, fast: bool = False) -> dict[str, Any] | None:
-        """``GET /global/health``.
+        """``GET /api/info``.
 
         ``fast`` uses a short connect timeout for the "is anything listening?"
         precheck on the auto-start path: with the client's default (10s connect)
@@ -191,55 +494,99 @@ class OpenCodeClient:
         """
 
         timeout = httpx.Timeout(HEALTH_FAST_TIMEOUT_S, connect=1.0) if fast else None
-        return await self._request("GET", "/global/health", timeout=timeout)
+        payload = await self._request("GET", "/api/info", timeout=timeout)
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    async def _collect_pages(
+        self,
+        path: str,
+        *,
+        directory: str | None = None,
+    ) -> list[Any]:
+        """Follow ``cursor.next`` until the collection is exhausted."""
+
+        collected: list[Any] = []
+        cursor: str | None = None
+        for _ in range(MAX_PAGES):
+            params = {"limit": str(PAGE_SIZE)}
+            if cursor:
+                params["cursor"] = cursor
+            query = urlencode(params)
+            payload = await self._request("GET", f"{path}?{query}", directory=directory)
+            data = _unwrap(payload)
+            if isinstance(data, list):
+                collected.extend(data)
+            next_cursor = None
+            if isinstance(payload, Mapping):
+                cursor_entry = payload.get("cursor") or {}
+                if isinstance(cursor_entry, Mapping):
+                    raw_next = cursor_entry.get("next")
+                    if isinstance(raw_next, str) and raw_next:
+                        next_cursor = raw_next
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+        return collected
 
     async def list_sessions(self) -> list[dict[str, Any]]:
-        data = await self._request("GET", "/session")
-        return data if isinstance(data, list) else []
+        """All sessions across projects, newest first (V2 paginates)."""
+
+        data = await self._collect_pages("/api/session")
+        return [item for item in data if isinstance(item, dict)]
 
     async def list_agents(self, directory: str | None = None) -> list[dict[str, Any]]:
         """List opencode agents (build/plan/compaction/...).
 
         Each ``primary`` agent is a mode a user can switch to (``build`` is the
-        read-write default, ``plan`` is read-only) and carries the
-        ``permission`` ruleset opencode applies when that agent runs. The
-        connector uses the list to expose Build/Plan as permission presets and
-        to check that a selected mode exists in this project. Agents resolve
-        per project config, so ``directory`` selects which project's agents are
-        returned (without it, opencode answers for the serve cwd).
+        read-write default, ``plan`` is read-only). The connector uses the list
+        to expose Build/Plan as permission presets and to check that a selected
+        mode exists in this project. Agents resolve per project config, so
+        ``directory`` selects which project's agents are returned (without it,
+        opencode answers for the serve cwd).
         """
 
-        data = await self._request("GET", "/agent", directory=directory)
-        return data if isinstance(data, list) else []
-
-    # NOTE: there is deliberately no "switch session permission mode" method.
-    # ``PATCH /session/{id}`` with ``{"permission": [...]}`` looks like the
-    # obvious API (it is accepted and echoed back), but on serve 1.18.34 the
-    # array is appended to the session's existing rules instead of replacing
-    # it: switching Plan -> Build left Plan's ``edit * deny`` behind and grew
-    # the ruleset from 142 to 186 entries. The mode is switched by sending
-    # ``agent`` on the prompt instead (see ``prompt_async``), and opencode
-    # records it as ``session["agent"]``.
+        data = _unwrap(await self._request("GET", "/api/agent", directory=directory))
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
 
     async def get_session(self, session_id: str, directory: str | None = None) -> dict[str, Any]:
-        data = await self._request("GET", f"/session/{session_id}", directory=directory)
+        data = _unwrap(await self._request("GET", f"/api/session/{session_id}", directory=directory))
         if not isinstance(data, dict):
             raise OpenCodeClientError(f"session {session_id} not found")
         return data
 
     async def list_messages(self, session_id: str, directory: str | None = None) -> list[dict[str, Any]]:
-        data = await self._request("GET", f"/session/{session_id}/message", directory=directory)
-        return data if isinstance(data, list) else []
+        """Session messages as ``{info, parts}``, oldest first.
+
+        V2 stores one flat record per message with ``content[]`` instead of the
+        1.x ``{info, parts}`` pair, and answers newest-first. Adapting here
+        keeps ``timeline.py`` and the clientMessageId matcher on one shape.
+        """
+
+        entries = await self._collect_pages(f"/api/session/{session_id}/message", directory=directory)
+        messages: list[dict[str, Any]] = []
+        for entry in reversed(entries):
+            adapted = _adapt_message(entry)
+            if adapted is not None:
+                messages.append(adapted)
+        return messages
 
     async def create_session(
         self,
         title: str | None = None,
         directory: str | None = None,
     ) -> dict[str, Any]:
+        # V2 nests the project directory under ``location``; a flat ``directory``
+        # key is rejected (the request body is a closed schema).
         body: dict[str, Any] = {}
         if title:
             body["title"] = title
-        data = await self._request("POST", "/session", json_body=body or None, directory=directory)
+        if directory:
+            body["location"] = {"directory": directory}
+        data = _unwrap(
+            await self._request("POST", "/api/session", json_body=body or None, directory=directory)
+        )
         if not isinstance(data, dict) or "id" not in data:
             raise OpenCodeClientError("session create returned no session id")
         return data
@@ -253,26 +600,51 @@ class OpenCodeClient:
         directory: str | None = None,
         extra_parts: Sequence[Mapping[str, Any]] = (),
     ) -> None:
-        parts: list[dict[str, Any]] = []
-        if content:
-            parts.append({"type": "text", "text": content})
-        parts.extend(dict(part) for part in extra_parts)
-        if not parts:
+        """Admit a prompt; opencode executes the turn asynchronously.
+
+        V2 has no per-prompt model/agent override, so the selection is applied
+        to the session first (``POST /model`` verified 204; ``POST /agent``) and
+        the prompt itself only carries text plus ``files``. ``delivery:
+        "steer"`` interrupts an in-flight turn with the new text instead of
+        queueing behind it.
+        """
+
+        files: list[dict[str, str]] = []
+        for part in extra_parts:
+            if not isinstance(part, Mapping) or part.get("type") != "file":
+                continue
+            uri = str(part.get("url") or "")
+            if not uri:
+                continue
+            entry: dict[str, str] = {"uri": uri}
+            name = str(part.get("filename") or "")
+            if name:
+                entry["name"] = name
+            files.append(entry)
+        if not content and not files:
             return
-        body: dict[str, Any] = {"parts": parts}
         if model:
-            body["model"] = model
+            await self.switch_session_model(
+                session_id,
+                str(model.get("modelID") or model.get("id") or ""),
+                str(model.get("providerID") or ""),
+                variant=model.get("variant"),
+                directory=directory,
+            )
         if agent:
-            body["agent"] = agent
+            await self.switch_session_agent(session_id, agent, directory=directory)
+        body: dict[str, Any] = {"text": content, "delivery": "steer"}
+        if files:
+            body["files"] = files
         await self._request(
             "POST",
-            f"/session/{session_id}/prompt_async",
+            f"/api/session/{session_id}/prompt",
             json_body=body,
             directory=directory,
         )
 
     async def abort(self, session_id: str, directory: str | None = None) -> None:
-        await self._request("POST", f"/session/{session_id}/abort", directory=directory)
+        await self._request("POST", f"/api/session/{session_id}/interrupt", directory=directory)
 
     async def reply_permission(
         self,
@@ -281,7 +653,7 @@ class OpenCodeClient:
         response: str,
         directory: str | None = None,
     ) -> None:
-        """Respond to a permission request.
+        """Respond to a pending permission request.
 
         ``response`` is one of ``once`` (approve this once), ``always``
         (approve and remember for the session) or ``reject``.
@@ -289,10 +661,26 @@ class OpenCodeClient:
 
         await self._request(
             "POST",
-            f"/session/{session_id}/permissions/{permission_id}",
-            json_body={"response": response},
+            f"/api/session/{session_id}/permission/{permission_id}/reply",
+            json_body={"decision": response},
             directory=directory,
         )
+
+    async def list_pending_permissions(
+        self, session_id: str, directory: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Pending permission requests for one session (V2 keeps the list server-side)."""
+
+        data = _unwrap(
+            await self._request("GET", f"/api/session/{session_id}/permission", directory=directory)
+        )
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+    async def list_pending_forms(self, session_id: str, directory: str | None = None) -> list[dict[str, Any]]:
+        """Pending forms (opencode's mid-turn questions) for one session."""
+
+        data = _unwrap(await self._request("GET", f"/api/session/{session_id}/form", directory=directory))
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
 
     async def reply_question(
         self,
@@ -301,21 +689,38 @@ class OpenCodeClient:
         reply: str,
         directory: str | None = None,
     ) -> None:
-        """Answer a question the model asked mid-turn.
+        """Answer a form the model asked mid-turn.
 
-        Only the V2 route exists (``/api/session/{id}/question/{id}/reply``);
-        the V1 path falls through to the web UI with HTTP 200. The payload is
-        ``{"answers": [[...]]}`` — one array of answer labels per question, in
-        the order opencode asked them. A free-form reply is just a one-label
-        answer (opencode's own UI does the same for its "type your own answer"
-        option); sending ``{"reply": ...}`` is rejected with
-        ``Missing key at ["answers"]``.
+        V2 answers a form with ``{"answer": {fieldId: value}}`` — one entry per
+        form field — so the field ids are read from the form itself and the
+        reply is submitted for each of them (opencode's own UI does the same for
+        its free-text answer option).
         """
 
+        fields: list[str] = []
+        try:
+            detail = _unwrap(
+                await self._request(
+                    "GET", f"/api/session/{session_id}/form/{question_id}", directory=directory
+                )
+            )
+        except OpenCodeClientError:
+            detail = None
+        if isinstance(detail, Mapping):
+            for field in detail.get("fields") or ():
+                if not isinstance(field, Mapping):
+                    continue
+                # V2 form fields are keyed by ``key`` (``id`` on older builds).
+                field_id = str(field.get("key") or field.get("id") or "")
+                if field_id:
+                    fields.append(field_id)
+        if not fields:
+            raise OpenCodeClientError(f"form {question_id} has no answerable field")
+        answer = {field_id: reply for field_id in fields}
         await self._request(
             "POST",
-            f"/api/session/{session_id}/question/{question_id}/reply",
-            json_body={"answers": [[reply]]},
+            f"/api/session/{session_id}/form/{question_id}/reply",
+            json_body={"answer": answer},
             directory=directory,
         )
 
@@ -325,18 +730,15 @@ class OpenCodeClient:
         question_id: str,
         directory: str | None = None,
     ) -> None:
-        """Dismiss a question without answering it (V2 route)."""
+        """Dismiss a form without answering it."""
 
         await self._request(
-            "POST",
-            f"/api/session/{session_id}/question/{question_id}/reject",
-            json_body={},
-            directory=directory,
+            "DELETE", f"/api/session/{session_id}/form/{question_id}", directory=directory
         )
 
     async def list_commands(self, directory: str | None = None) -> list[dict[str, Any]]:
-        data = await self._request("GET", "/command", directory=directory)
-        return data if isinstance(data, list) else []
+        data = _unwrap(await self._request("GET", "/api/command", directory=directory))
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
 
     async def execute_command(
         self,
@@ -345,14 +747,23 @@ class OpenCodeClient:
         arguments: str = "",
         directory: str | None = None,
     ) -> dict[str, Any] | None:
-        body = {"command": command, "arguments": arguments}
+        """Run a user-defined command inside the session.
+
+        V2's body is ``{name, text}``: the command name and the rest of the
+        command line. The route answers 204, so nothing is returned.
+        """
+
+        body: dict[str, Any] = {"name": command}
+        if arguments:
+            body["text"] = arguments
         data = await self._request(
             "POST",
-            f"/session/{session_id}/command",
+            f"/api/session/{session_id}/command",
             json_body=body,
             directory=directory,
         )
-        return data if isinstance(data, dict) else None
+        payload = _unwrap(data)
+        return payload if isinstance(payload, dict) else None
 
     async def switch_session_model(
         self,
@@ -380,6 +791,21 @@ class OpenCodeClient:
             directory=directory,
         )
 
+    async def switch_session_agent(
+        self,
+        session_id: str,
+        agent: str,
+        directory: str | None = None,
+    ) -> None:
+        """Switch the agent subsequent turns run as (Build/Plan)."""
+
+        await self._request(
+            "POST",
+            f"/api/session/{session_id}/agent",
+            json_body={"agent": agent},
+            directory=directory,
+        )
+
     async def summarize_session(
         self,
         session_id: str,
@@ -387,21 +813,19 @@ class OpenCodeClient:
         model_id: str,
         directory: str | None = None,
     ) -> bool:
-        """Compact the session conversation (``POST /session/{id}/summarize``).
+        """Compact the session conversation (``POST /api/session/{id}/compact``).
 
-        The V2 ``POST /api/session/{id}/compact`` exists in the OpenAPI
-        document but answers 503 "Session compact is not available yet" on
-        1.18.34; summarize is the V1 endpoint the web UI's ``/compact``
-        drives. It requires the model that should write the summary.
+        V2 compacts with the session's own model, so no model reference is sent
+        (the body only accepts an optional message id and a delivery mode).
         """
 
-        data = await self._request(
+        await self._request(
             "POST",
-            f"/session/{session_id}/summarize",
-            json_body={"providerID": provider_id, "modelID": model_id},
+            f"/api/session/{session_id}/compact",
+            json_body={},
             directory=directory,
         )
-        return bool(data)
+        return True
 
     async def fork_session(
         self,
@@ -409,30 +833,23 @@ class OpenCodeClient:
         message_id: str | None = None,
         directory: str | None = None,
     ) -> dict[str, Any] | None:
-        """Fork a session at ``message_id`` (``POST /session/{id}/fork``).
+        """Fork a session before ``message_id`` (``POST /api/session/{id}/fork``).
 
-        Returns the new session object. ``message_id`` is optional; when
-        omitted opencode forks at the latest message.
+        Returns the new session object. V2's boundary is expressed as ``before``
+        (the fork starts at that message); ``message_id`` is optional, and
+        without it opencode forks at the latest message.
         """
 
         body: dict[str, Any] = {}
         if message_id:
-            body["messageID"] = message_id
-        data = await self._request(
-            "POST",
-            f"/session/{session_id}/fork",
-            json_body=body,
-            directory=directory,
-        )
-        return data if isinstance(data, dict) else None
-
-    async def share_session(
-        self, session_id: str, directory: str | None = None
-    ) -> dict[str, Any] | None:
-        """Create a shareable link for the session (``POST /session/{id}/share``)."""
-
-        data = await self._request(
-            "POST", f"/session/{session_id}/share", directory=directory
+            body["before"] = message_id
+        data = _unwrap(
+            await self._request(
+                "POST",
+                f"/api/session/{session_id}/fork",
+                json_body=body or None,
+                directory=directory,
+            )
         )
         return data if isinstance(data, dict) else None
 
@@ -442,14 +859,13 @@ class OpenCodeClient:
         message_id: str | None = None,
         directory: str | None = None,
     ) -> bool:
-        """Revert a model message (``POST /session/{id}/revert``).
+        """Revert one model message (V2's staged undo).
 
-        Mirrors opencode's ``/undo`` slash command. ``message_id`` is the
-        target message to revert to; if omitted, opencode requires the id of
-        the latest model message, so this method falls back to the most
-        recent assistant message found via ``GET /session/{id}/message``.
-        Returns ``True`` if the revert actually ran, ``False`` if there was
-        no model message to revert (clean session).
+        Mirrors opencode's ``/undo``: stage the revert against the target
+        message, then commit it. ``message_id`` is the target message to revert
+        to; if omitted, the most recent assistant message found via
+        ``GET /api/session/{id}/message`` is used. Returns ``True`` if the
+        revert ran, ``False`` if there was no model message to revert.
         """
 
         target = message_id
@@ -459,8 +875,6 @@ class OpenCodeClient:
             for msg in reversed(messages):
                 if not isinstance(msg, dict):
                     continue
-                # opencode's message shape: ``{"info": {"id", "role", ...},
-                # "parts": [...]}``. The role lives under ``info.role``.
                 info = msg.get("info") if isinstance(msg.get("info"), dict) else msg
                 role = info.get("role")
                 mid = info.get("id") or info.get("messageID")
@@ -472,53 +886,139 @@ class OpenCodeClient:
             target = latest_assistant
         await self._request(
             "POST",
-            f"/session/{session_id}/revert",
+            f"/api/session/{session_id}/revert/stage",
             json_body={"messageID": target},
+            directory=directory,
+        )
+        # The commit route takes no body: it commits whatever was staged.
+        await self._request(
+            "POST",
+            f"/api/session/{session_id}/revert/commit",
             directory=directory,
         )
         return True
 
     async def provider_overview(self) -> dict[str, Any]:
-        data = await self._request("GET", "/provider")
-        return data if isinstance(data, dict) else {}
+        """V1-shaped provider overview rebuilt from V2's model + provider lists.
+
+        V2 splits the catalog: ``GET /api/provider`` lists provider ids and
+        activation, ``GET /api/model`` lists every model with its capabilities,
+        variants and limits. Callers expect ``{connected, all: [{id, models}]}``
+        so the shape is rebuilt here.
+        """
+
+        try:
+            providers_payload = await self._request("GET", "/api/provider")
+        except OpenCodeClientError:
+            providers_payload = None
+        try:
+            models_payload = await self._request("GET", "/api/model")
+        except OpenCodeClientError:
+            models_payload = None
+        providers = _unwrap(providers_payload)
+        models = _unwrap(models_payload)
+        provider_entries = [item for item in providers if isinstance(item, dict)] if isinstance(providers, list) else []
+        model_entries = [item for item in models if isinstance(item, dict)] if isinstance(models, list) else []
+        by_provider: dict[str, dict[str, Any]] = {}
+        for provider in provider_entries:
+            provider_id = str(provider.get("id") or "")
+            if not provider_id:
+                continue
+            by_provider[provider_id] = {"id": provider_id, "name": provider.get("name"), "models": {}}
+        for model in model_entries:
+            provider_id = str(model.get("providerID") or "")
+            model_id = str(model.get("modelID") or model.get("id") or "")
+            if not provider_id or not model_id:
+                continue
+            entry = by_provider.setdefault(provider_id, {"id": provider_id, "models": {}})
+            variants = {}
+            for variant in model.get("variants") or ():
+                if not isinstance(variant, Mapping):
+                    continue
+                variant_id = str(variant.get("id") or "")
+                if not variant_id:
+                    continue
+                settings = variant.get("settings")
+                variants[variant_id] = dict(settings) if isinstance(settings, Mapping) else {}
+            raw_capabilities = model.get("capabilities") if isinstance(model.get("capabilities"), Mapping) else {}
+            # V2 reports capabilities as ``{tools: bool, input: [...], output: [...]}``;
+            # the catalog filter looks for a 1.x-style ``toolcall`` flag plus
+            # ``output.text`` / ``input.text`` booleans.
+            capabilities: dict[str, Any] = {"toolcall": bool(raw_capabilities.get("tools"))}
+            for side in ("input", "output"):
+                values = raw_capabilities.get(side)
+                names = [str(value) for value in values] if isinstance(values, list) else []
+                capabilities[side] = {name: True for name in names}
+            entry["models"][model_id] = {
+                "name": model.get("name"),
+                "limit": model.get("limit") or {},
+                "variants": variants,
+                "capabilities": capabilities,
+            }
+        # ``connected`` mirrors 1.x "configured providers": V2 reports
+        # activation per provider, so a provider that is not disabled counts as
+        # available. Providers that only exist because a model named them are
+        # still listed (models are the reason the catalog is useful).
+        activation_by_id = {str(item.get("id") or ""): item.get("activation") for item in provider_entries}
+        connected = [
+            provider_id
+            for provider_id, provider in by_provider.items()
+            if provider_id in activation_by_id or provider["models"]
+        ]
+        disabled = {
+            provider_id
+            for provider_id, activation in activation_by_id.items()
+            if str(activation or "") == "disabled" and not by_provider.get(provider_id, {}).get("models")
+        }
+        connected = [provider_id for provider_id in connected if provider_id not in disabled]
+        return {"connected": connected, "all": list(by_provider.values())}
 
     async def session_status_map(self, directory: str | None = None) -> dict[str, Any]:
-        data = await self._request("GET", "/session/status", directory=directory)
-        return data if isinstance(data, dict) else {}
+        """Busy/idle map for every running session (``GET /api/session/active``).
+
+        V2 answers ``{ses_x: {type: "running"}}`` for active sessions and an
+        empty map when idle; the map is global (no directory scoping). The
+        ``running`` marker is translated to the ``busy`` shape the runtime
+        checks for.
+        """
+
+        data = _unwrap(await self._request("GET", "/api/session/active"))
+        if not isinstance(data, dict):
+            return {}
+        status_map: dict[str, Any] = {}
+        for session_id, entry in data.items():
+            if isinstance(entry, Mapping):
+                entry_type = str(entry.get("type") or "")
+                status_map[str(session_id)] = {"type": "busy" if entry_type == "running" else entry_type}
+        return status_map
 
     # ------------------------------------------------------------------ #
     # SSE
     # ------------------------------------------------------------------ #
 
     async def stream_events(self) -> AsyncIterator[dict[str, Any]]:
-        """Yield parsed SSE events from the global ``/global/event`` stream.
+        """Yield normalized events from the live ``GET /api/event`` stream.
 
-        ``/event`` is instance-scoped: it only carries events for the project
-        the serve process was launched in. Sessions bound to any other
-        directory (the common case — the workspace the user picked) publish
-        their ``session.status`` / ``session.idle`` events to *their own*
-        instance, so an instance-scoped subscription never sees them and the
-        platform session can never leave "running" on its own.
-
-        ``/global/event`` carries every instance's events, each wrapped as
-        ``{"directory", "project", "payload": {...}}``. The inner ``payload``
-        is the same event object the instance-scoped stream yields, so both
-        shapes are handled here and callers only ever see the bare event.
+        V2's stream is live-only (no replay), global across projects, and each
+        frame is ``{id, created?, type, location?, data, durable?}`` with the
+        session id inside ``data``. Frames are translated here so callers only
+        ever see the ``{type, properties}`` events the runtime dispatches on.
 
         The underlying connection is long-lived; callers must iterate this
         generator inside a task and handle ``OpenCodeClientError`` to
         reconnect.
         """
+
         client = await self._client()
         async with client.stream(
             "GET",
-            "/global/event",
+            "/api/event",
             timeout=httpx.Timeout(self.stream_timeout, connect=10.0),
         ) as response:
             if response.status_code >= 400:
                 await response.aread()
                 raise OpenCodeClientError(
-                    f"opencode /global/event failed: {response.status_code}",
+                    f"opencode /api/event failed: {response.status_code}",
                     status_code=response.status_code,
                 )
             async for line in response.aiter_lines():
@@ -529,17 +1029,10 @@ class OpenCodeClient:
                 if not payload:
                     continue
                 try:
-                    event = json.loads(payload)
+                    frame = json.loads(payload)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(event, dict):
+                if not isinstance(frame, dict):
                     continue
-                inner = event.get("payload")
-                if not isinstance(inner, dict):
-                    # Instance-scoped shape (no wrapper) — accept as-is.
-                    inner = event
-                if inner.get("type") == "sync":
-                    # Replay frames duplicate the primary events; handling
-                    # both would double-process every state change.
-                    continue
-                yield inner
+                for event in _adapt_event(frame):
+                    yield event

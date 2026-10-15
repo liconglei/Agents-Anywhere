@@ -3,14 +3,22 @@
 Self-contained: talks directly to a local ``opencode serve`` instance over
 REST + SSE. No plugin bridge required (unlike DSH).
 
-Session model:
+Session model (opencode 2.x / V2 API, see ``sdk/client.py`` for the endpoint
+map and the shape adaptation):
 - The opencode native id (``ses_...``) is used as both the platform
   ``session_id`` and ``external_session_id`` (single-instance runtime).
-- Turns are driven by ``POST /session/{id}/prompt_async``; the global SSE
-  stream reports progress and ``session.idle`` marks turn completion.
-- Timeline: ``message.part.delta`` / ``message.part.updated`` are streamed into
-  the platform timeline live (throttled, one stable item id per opencode part);
-  ``GET /session/{id}/message`` rebuilds the authoritative snapshot at turn end.
+- Turns are driven by ``POST /api/session/{id}/prompt`` (a durable inbox admit);
+  the model/agent selection is applied to the session first, because V2 dropped
+  per-prompt overrides.
+- V2 publishes no terminal ``session.idle`` event, so turn completion is
+  detected by polling ``GET /api/session/active`` (the watchdog tightens its
+  cadence while a turn is in flight).
+- Timeline: ``session.text.delta`` / ``session.reasoning.delta`` are streamed
+  into the platform timeline live (throttled, one stable item id per streamed
+  part); ``GET /api/session/{id}/message`` rebuilds the authoritative snapshot
+  at turn end.
+- Permission requests and questions are opencode's pending ``/permission`` and
+  ``/form`` lists in V2, so they are polled rather than event-driven.
 """
 
 from __future__ import annotations
@@ -75,11 +83,11 @@ PERMISSION_SELECTION_KEY = "permission"
 # ``summary``, ``title``) are opencode internals, not user-selectable modes.
 #
 # opencode has no separate "mode" field — the mode *is* the primary agent that
-# runs the turn, so a selection is applied by sending ``agent: <preset>`` on the
-# prompt (``POST /session/{id}/prompt_async``). opencode persists the agent on
-# the session record, which is also how the current mode is read back.
+# runs the turn, so a selection is applied with ``POST /api/session/{id}/agent``
+# right before the prompt. opencode persists the agent on the session record,
+# which is also how the current mode is read back.
 #
-# Do NOT try to switch modes by PATCHing ``{"permission": [...]}`` onto the
+# Do NOT try to switch modes by PATCHing ``{"permissions": [...]}`` onto the
 # session (that looks like the obvious API): on serve 1.18.34 the array is
 # *appended* to the session's existing rules instead of replacing it, so
 # switching Plan → Build leaves Plan's ``edit * deny`` behind (read-only Build)
@@ -146,19 +154,9 @@ _OPENCODE_BUILTIN_COMMANDS: tuple[dict[str, Any], ...] = (
             }
         },
     },
-    {
-        "name": "share",
-        "title": "分享会话",
-        "description": "为当前会话创建可分享链接",
-        "accepts_args": False,
-        "metadata": {
-            "ui": {
-                "kind": "execute",
-                "allowedStatuses": ["idle", "error"],
-                "acceptsMultiline": False,
-            }
-        },
-    },
+    # opencode 2.x dropped session sharing (``POST /session/{id}/share`` is
+    # gone — unknown routes answer with the web UI), so ``/share`` is no longer
+    # offered: a menu entry that can only fail is worse than none.
     {
         "name": "undo",
         "title": "撤销最近消息",
@@ -176,6 +174,10 @@ _OPENCODE_BUILTIN_COMMANDS: tuple[dict[str, Any], ...] = (
 _OPENCODE_BUILTIN_COMMAND_NAMES = frozenset(
     command["name"] for command in _OPENCODE_BUILTIN_COMMANDS
 )
+# Commands opencode itself used to expose and 2.x dropped: not offered in the
+# menu, but answered explicitly instead of falling through to the skills
+# endpoint (which would report a confusing 400 from a route that never worked).
+_REMOVED_BUILTIN_COMMAND_NAMES = frozenset({"share"})
 _BUILTIN_UI = {command["name"]: command["metadata"] for command in _OPENCODE_BUILTIN_COMMANDS}
 # opencode's session.summarize needs the model that writes the summary; when
 # nothing was picked for the platform session, fall back to the model of the
@@ -187,6 +189,11 @@ _COMPACT_MODEL_FALLBACK_ERROR = (
 STREAM_FAILURE_RECOVERY_THRESHOLD = 3
 SERVE_RESTART_INITIAL_BACKOFF_S = 1.0
 SERVE_RESTART_MAX_BACKOFF_S = 30.0
+# V2 emits no terminal ``session.idle`` event, so the active-session map is the
+# only turn-end signal. While a turn is in flight the watchdog polls at this
+# cadence (turn end lands within ~2.5s of opencode going idle); when nothing is
+# running it falls back to the slow reconcile interval.
+TURN_POLL_INTERVAL_S = 2.5
 PORT_ADOPTION_WAIT_S = 15.0
 # ...and the shorter grace used when the port is free: a serve that is still
 # booting has not bound it yet, so this wait covers the peer-is-about-to-appear
@@ -222,6 +229,52 @@ def _iso_ms(ms: float | None) -> str | None:
     if not ms:
         return None
     return datetime.fromtimestamp(ms / 1000, tz=UTC).isoformat()
+
+
+def _session_directory(session: Mapping[str, Any]) -> str | None:
+    """The project directory of a session record.
+
+    V2 nests it under ``location``; the flat ``directory`` key is still accepted
+    because older opencode builds (and the session records written before the
+    2.x upgrade) answer with it.
+    """
+
+    nested = (session.get("location") or {}).get("directory")
+    return str(nested or session.get("directory") or "") or None
+
+
+def _form_to_question_props(form: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a V2 form into the question-notice props.
+
+    opencode 2.x replaced 1.x's ``question`` events with forms: a titled set of
+    typed fields (``{key, type, title?, options?}``). The notice builder already
+    renders "one question with selectable options", so each visible field
+    becomes one question and the form title becomes the prompt.
+    """
+
+    questions: list[dict[str, Any]] = []
+    for form_field in form.get("fields") or ():
+        if not isinstance(form_field, Mapping) or form_field.get("hidden"):
+            continue
+        options: list[str] = []
+        for option in form_field.get("options") or ():
+            if isinstance(option, Mapping):
+                label = option.get("label") or option.get("title") or option.get("value")
+            else:
+                label = option
+            if label:
+                options.append(str(label))
+        questions.append(
+            {
+                "question": str(form_field.get("title") or form_field.get("key") or ""),
+                "options": options,
+            }
+        )
+    return {
+        "id": str(form.get("id") or ""),
+        "question": str(form.get("title") or ""),
+        "questions": questions,
+    }
 
 
 def _capability_flag(capabilities: Mapping[str, Any] | None, name: str) -> bool:
@@ -557,8 +610,9 @@ class OpenCodeRuntime(AgentRuntime):
         return (
             "opencode serve 已运行但认证失败(401)：serve 使用 HTTP Basic 认证。"
             "请在运行时配置中填写 apiKey(密码)和 apiUser(用户名, 默认 opencode)；"
-            "连接器自动拉起的 serve 会自动继承环境变量 "
-            "OPENCODE_SERVER_PASSWORD / OPENCODE_SERVER_USERNAME。"
+            "连接器自动拉起的 serve 会继承环境变量 "
+            "OPENCODE_SERVER_PASSWORD / OPENCODE_SERVER_USERNAME，"
+            "两者都没有时连接器会自行生成密码注入 serve。"
         )
 
     async def start(self) -> None:
@@ -737,16 +791,33 @@ class OpenCodeRuntime(AgentRuntime):
         host, port = self._serve_target(server_url)
         if self._serve_env is None:
             self._serve_env = await asyncio.to_thread(serve_process.serve_environment)
-        # A spawned serve inherits OPENCODE_SERVER_PASSWORD (and optionally
-        # OPENCODE_SERVER_USERNAME) from the user environment; without the
-        # matching Basic credentials every request, including health, is
-        # answered with 401.
+        # A spawned serve always protects itself with HTTP Basic. It reads the
+        # password from OPENCODE_SERVER_PASSWORD (and the username from
+        # OPENCODE_SERVER_USERNAME) out of the environment it inherits; with no
+        # password set, opencode 2.x invents one the connector can never learn,
+        # so every request — including the health probe — answers 401 and the
+        # runtime never comes up. Inherit the user's password when there is one
+        # and generate one otherwise, so the child and the client always agree.
         if not self._client.api_key:
-            env_password = str(self._serve_env.get("OPENCODE_SERVER_PASSWORD") or "")
+            env_user, env_password = serve_process.environment_server_credentials(
+                self._serve_env
+            )
             if env_password:
-                env_user = str(self._serve_env.get("OPENCODE_SERVER_USERNAME") or "opencode")
                 self._client.set_credentials(env_user, env_password)
                 logger.info("opencode auto-start: inherited serve Basic auth user={}", env_user)
+            else:
+                env_user, generated = serve_process.generated_server_credentials(
+                    self._serve_env
+                )
+                self._client.set_credentials(env_user, generated)
+                logger.info(
+                    "opencode auto-start: generated serve Basic auth user={} "
+                    "(no OPENCODE_SERVER_PASSWORD in the environment)",
+                    env_user,
+                )
+            # Discovery probes this URL without a runtime instance; without the
+            # password it would 401 and report a healthy serve as unavailable.
+            serve_process.register_serve_credentials(server_url, env_user, env_password or generated)
         # A concurrent recovery pass may already have brought serve up. A 401
         # here means a serve is already listening with credentials we do not
         # have; spawning another instance would only die on the shared log
@@ -774,15 +845,15 @@ class OpenCodeRuntime(AgentRuntime):
         lock_held = await lock_task
         # Another opencode process (TUI, CLI, a foreign serve, CherryStudio, or a
         # dying orphan serve from a previous connector) holds opencode's log
-        # file open. Our spawn logs to stderr instead of taking that file
-        # (``SERVE_LOG_FLAGS``), so the holder no longer dooms it — but the
-        # holder may still be a serve worth adopting. Wait for one, with the
-        # window chosen by what the port says: a serve that already answered the
-        # precheck with a connection error may be booting, and it binds the port
-        # only when ready, so "nothing listening" cannot rule that out — but on
-        # a machine where some opencode always holds the log (a TUI, CherryStudio)
-        # that same silence is the normal case, and waiting the full window made
-        # the runtime unavailable for 1.5-2.5 minutes on every restart.
+        # file open — which on 2.x kills a serve that starts on the same data
+        # directory. The holder may still be a serve worth adopting, so wait for
+        # one, with the window chosen by what the port says: a serve that
+        # already answered the precheck with a connection error may be booting,
+        # and it binds the port only when ready, so "nothing listening" cannot
+        # rule that out — but on a machine where some opencode always holds the
+        # log (a TUI, CherryStudio) that same silence is the normal case, and
+        # waiting the full window made the runtime unavailable for 1.5-2.5
+        # minutes on every restart.
         if lock_held:
             listening = await self._port_listening(host, port)
             logger.warning(
@@ -803,8 +874,18 @@ class OpenCodeRuntime(AgentRuntime):
             if hint is not None:
                 raise RuntimeError(hint) from last_exc
             logger.info(
-                "opencode auto-start: no serve answered; spawning despite the log holder"
+                "opencode auto-start: no serve answered; spawning on an isolated data dir"
             )
+        # Whatever the probe said, a serve this connector starts gets its own
+        # data directory: opencode 2.x takes ``<data>/log/opencode.log`` and the
+        # session database exclusively, so sharing them with the user's
+        # interactive opencode (or another serve) means dying at boot. The
+        # directory is stable per port, so the sessions this runtime owns are
+        # the same set across restarts — a per-spawn directory would make
+        # session sync delete everything it synced last time.
+        await asyncio.to_thread(
+            serve_process.isolate_data_home, self._serve_env, tag=str(port)
+        )
         if self._cached_serve_command is None:
             self._cached_serve_command = await asyncio.to_thread(
                 serve_process.resolve_serve_command,
@@ -1245,7 +1326,12 @@ class OpenCodeRuntime(AgentRuntime):
     async def _load_primary_agents(
         self, directory: str | None = None
     ) -> dict[str, dict[str, Any]]:
-        """Fetch and cache the ``primary`` agents of one project directory."""
+        """Fetch and cache the ``primary`` agents of one project directory.
+
+        Keyed by agent **id** (``build`` / ``plan``), which is what the prompt
+        and the permission presets address; V2's ``name`` is the display label
+        (``Build`` / ``Plan``) and must not be mistaken for the key.
+        """
 
         cached = self._primary_agents.get(directory)
         if cached is not None:
@@ -1262,7 +1348,7 @@ class OpenCodeRuntime(AgentRuntime):
         for agent in agents:
             if not isinstance(agent, Mapping):
                 continue
-            name = agent.get("name")
+            name = agent.get("id") or agent.get("name")
             if not isinstance(name, str) or not name:
                 continue
             if agent.get("mode") != "primary":
@@ -1278,11 +1364,11 @@ class OpenCodeRuntime(AgentRuntime):
     ) -> str | None:
         """Resolve the opencode agent the next turn must run as.
 
-        opencode switches Build/Plan per prompt (and remembers the agent on the
-        session), so there is nothing to push here — the returned agent name is
-        what ``prompt_async`` carries. ``None`` means "leave opencode's own
-        default alone": a session the platform never put a mode on keeps the
-        mode the user picked in the opencode TUI.
+        opencode has no per-prompt agent field in V2, so ``prompt_async`` applies
+        the returned name to the session (``POST /api/session/{id}/agent``) before
+        admitting the prompt. ``None`` means "leave opencode's own default
+        alone": a session the platform never put a mode on keeps the mode the
+        user picked in the opencode TUI.
 
         The preset must exist in this project, because serve accepts an unknown
         agent name silently and then runs no turn at all. A mode the platform
@@ -1347,7 +1433,9 @@ class OpenCodeRuntime(AgentRuntime):
             sid = str(session.get("id") or "")
             if not sid:
                 continue
-            self._remember_directory(sid, session.get("directory"))
+            # V2 nests the project directory under ``location``.
+            directory = _session_directory(session)
+            self._remember_directory(sid, directory)
             model = session.get("model") or {}
             metas.append(
                 SessionMeta(
@@ -1355,12 +1443,11 @@ class OpenCodeRuntime(AgentRuntime):
                     external_session_id=sid,
                     runtime="opencode",
                     title=session.get("title"),
-                    cwd=session.get("directory"),
+                    cwd=directory,
                     ordering_time=_iso_ms((session.get("time") or {}).get("updated")),
                     source_state=SessionSourceState(availability="available"),
                     metadata={
                         "model": f"{model.get('providerID')}/{model.get('id')}" if model else None,
-                        "version": session.get("version"),
                     },
                 )
             )
@@ -1371,10 +1458,12 @@ class OpenCodeRuntime(AgentRuntime):
         page_size: int = 100,
         force: bool = False,
     ) -> tuple[SessionMeta, ...]:
-        """opencode's ``GET /session`` returns every session in one call.
+        """Every session opencode knows about, across all projects.
 
-        No server-side pagination exists, so a single fetch is the full
-        inventory; ``page_size`` only caps the returned slice.
+        ``GET /api/session`` paginates, and the client walks ``cursor.next`` to
+        exhaustion, so one call is the complete inventory — treating the first
+        page as the whole set would make session sync "delete" everything beyond
+        it. ``page_size`` only caps the returned slice.
         """
 
         return await self.list_sessions(limit=page_size, force=force)
@@ -1577,9 +1666,9 @@ class OpenCodeRuntime(AgentRuntime):
             return RuntimeOperationResult(ok=False, code="create_failed", message=str(exc))
         native_id = str(session["id"])
         self._bind_session(session_id, native_id)
-        self._remember_directory(
-            native_id, str(session.get("directory") or cwd) if session.get("directory") or cwd else None
-        )
+        # V2 nests the project directory under ``location``.
+        created_directory = _session_directory(session)
+        self._remember_directory(native_id, str(created_directory or cwd) if (created_directory or cwd) else None)
         # Persist the selections the session was created with. Without this the
         # pickers have nothing to show for a brand-new session (the opencode
         # session record carries neither the model nor the permission mode yet)
@@ -1599,7 +1688,7 @@ class OpenCodeRuntime(AgentRuntime):
             "opencode",
             external_session_id=native_id,
             title=title or (content[:60] if content else None),
-            cwd=session.get("directory"),
+            cwd=created_directory,
             ordering_time=_iso_ms((session.get("time") or {}).get("created")),
         )
         await self._start_turn(
@@ -1664,10 +1753,10 @@ class OpenCodeRuntime(AgentRuntime):
     ) -> RuntimeOperationResult:
         """Steer the active turn.
 
-        opencode has no dedicated steer endpoint; sending a new message via
-        ``prompt_async`` while a turn is busy interrupts the current turn and
-        resumes with the new input (verified against 1.18.34). When the
-        session is idle this behaves identically to ``start_turn``.
+        opencode has no dedicated steer endpoint; a prompt admitted with
+        ``delivery: "steer"`` interrupts the in-flight turn and resumes with the
+        new input (the same call serves an idle session). When the session is
+        idle this behaves identically to ``start_turn``.
         """
 
         native_id = self._adopt_session_binding(session_id, external_session_id)
@@ -1792,11 +1881,13 @@ class OpenCodeRuntime(AgentRuntime):
             len(parts),
         )
         idle_before = self._idle_seq.get(native_id, 0)
-        # Mark the turn active BEFORE awaiting prompt_async. If serve emits
-        # session.idle while this await is in flight (a fast turn or a stale
-        # idle replayed on SSE connect), _finish_turn must see it in
-        # _active_turns so the turn is properly ended instead of being dropped
-        # as "untracked" and leaving the platform session stuck in "running".
+        # Mark the turn active BEFORE admitting the prompt. V2's admit is
+        # durable (``POST /api/session/{id}/prompt`` returns as soon as the
+        # message is queued) and the watchdog may reconcile the session idle
+        # while this await is still in flight for a very fast turn; _finish_turn
+        # must see it in _active_turns so the turn is properly ended instead of
+        # being dropped as "untracked" and leaving the platform session stuck in
+        # "running".
         self._active_turns.add(native_id)
         self._pushed_idle.discard(native_id)
         await self._client.prompt_async(
@@ -2028,6 +2119,13 @@ class OpenCodeRuntime(AgentRuntime):
         # Built-in slash commands map to dedicated opencode endpoints, not
         # ``POST /session/{id}/command`` (which only runs user-defined skills).
         builtin = command.lstrip("/")
+        if builtin in _REMOVED_BUILTIN_COMMAND_NAMES:
+            return RuntimeCommandResult(
+                command=command,
+                ok=False,
+                code="unsupported",
+                message="当前 opencode 版本不再提供会话分享接口",
+            )
         if builtin in _OPENCODE_BUILTIN_COMMAND_NAMES:
             return await self._execute_builtin_command(
                 session_id, native_id, builtin, arguments, directory, command
@@ -2122,11 +2220,6 @@ class OpenCodeRuntime(AgentRuntime):
                 new_id = (forked or {}).get("id")
                 text = f"已创建分叉会话 {new_id}" if new_id else "已创建分叉会话"
                 return self._command_ok(command, text)
-            elif builtin == "share":
-                shared = await self._client.share_session(native_id, directory=directory)
-                url = ((shared or {}).get("share") or {}).get("url")
-                text = f"分享链接: {url}" if url else "会话已创建分享链接"
-                return self._command_ok(command, text, **({"url": url} if url else {}))
             elif builtin == "undo":
                 # /undo accepts an optional messageID arg; without one, the
                 # client auto-resolves the latest model message. ``False``
@@ -2358,30 +2451,41 @@ class OpenCodeRuntime(AgentRuntime):
                 backoff = min(backoff * 2, 30.0)
 
     async def _state_watchdog(self) -> None:
-        """Periodically reconcile in-flight turns against ``/session/status``.
+        """Reconcile in-flight turns and poll opencode's pending interactions.
 
-        A ``session.idle`` event lost while the SSE stream was down (or before
-        this process started) would otherwise leave the platform session stuck
-        in "running" forever, disabling the client send button.
+        A turn-end missed while the SSE stream was down (or before this process
+        started) would otherwise leave the platform session stuck in "running"
+        forever, disabling the client send button. V2 publishes no terminal
+        ``session.idle`` event at all, so this loop is the primary turn-end
+        detector and runs at ``TURN_POLL_INTERVAL_S`` whenever a turn is in
+        flight; idle sessions fall back to the slow reconcile interval.
+
+        The same tick polls each busy session's pending permission/question
+        lists: in V2 those are opencode's ``/permission`` and ``/form`` routes
+        rather than events, and an unanswered request blocks the turn.
         """
 
         while not self._stopping:
-            await asyncio.sleep(self._state_reconcile_interval_s)
+            interval = (
+                TURN_POLL_INTERVAL_S
+                if self._active_turns
+                else self._state_reconcile_interval_s
+            )
+            await asyncio.sleep(interval)
             if self._stopping:
                 break
             with suppress(Exception):
                 await self._reconcile_active_turns()
+            with suppress(Exception):
+                await self._poll_pending_interactions()
             with suppress(Exception):
                 await self._flush_unended_turns()
 
     async def _reconcile_active_turns(self) -> None:
         """Emit the missing turn-end for turns opencode no longer reports busy.
 
-        The status query must run in the same ``directory`` scope the prompt
-        used (exactly like ``get_session_state``): ``/session/status`` is scoped
-        by ``?directory=``, so an unscoped query omits a workspace-bound session,
-        it looks idle, and the turn is "recovered" seconds after it started —
-        before ``opencode serve`` produced any reply, so nothing was rendered.
+        ``GET /api/session/active`` is a single global map (``{ses_x: {type:
+        "running"}}``), so one request covers every candidate session.
         """
 
         # Primary set: turns this process started and has not ended.
@@ -2396,15 +2500,13 @@ class OpenCodeRuntime(AgentRuntime):
                 candidates.add(native_id)
         if not candidates:
             return
+        try:
+            status_map = await self._client.session_status_map()
+        except OpenCodeClientError as exc:
+            logger.debug("opencode reconcile skipped: {}", exc)
+            return
         recovered = []
         for native_id in list(candidates):
-            try:
-                status_map = await self._client.session_status_map(
-                    self._directory_for(native_id)
-                )
-            except OpenCodeClientError as exc:
-                logger.debug("opencode reconcile skipped native={}: {}", native_id, exc)
-                continue
             entry = status_map.get(native_id)
             if isinstance(entry, dict) and entry.get("type") == "busy":
                 continue
@@ -2433,6 +2535,99 @@ class OpenCodeRuntime(AgentRuntime):
                     await self.host.session_state_update(
                         platform_id, "opencode", status="idle", external_session_id=native_id
                     )
+
+    async def _poll_pending_interactions(self) -> None:
+        """Mirror opencode's pending permission requests and questions as notices.
+
+        opencode 2.x keeps both lists server-side (``GET /api/session/{id}/
+        permission`` and ``.../form``) instead of publishing events for them, and
+        an unanswered request blocks the turn: the model waits for the user while
+        the platform session sits in "running" forever. Each tick compares the
+        pending ids with the notices already shown, raises a notice for anything
+        new, and resolves notices opencode closed on its own.
+        """
+
+        targets: list[str] = []
+        for native_id in self._active_turns:
+            if self._platform_id(native_id):
+                targets.append(native_id)
+        for platform_id, notices in self._notices.items():
+            native_id = self._native_id(platform_id, None)
+            if not any(entry.interaction_type for entry in notices.values()):
+                continue
+            if native_id not in targets and self._directory_for(native_id):
+                targets.append(native_id)
+        for native_id in targets:
+            with suppress(OpenCodeClientError):
+                await self._sync_pending_permissions(native_id)
+            with suppress(OpenCodeClientError):
+                await self._sync_pending_forms(native_id)
+
+    async def _sync_pending_permissions(self, native_id: str) -> None:
+        platform_id = self._platform_id(native_id)
+        if not platform_id:
+            return
+        pending = await self._client.list_pending_permissions(
+            native_id, self._directory_for(native_id)
+        )
+        notices = self._notices.get(platform_id, {})
+        pending_ids = {
+            str(item.get("id") or "")
+            for item in pending
+            if str(item.get("id") or "")
+        }
+        for item in pending:
+            permission_id = str(item.get("id") or "")
+            notice_id = f"notice_opencode_perm_{permission_id}"
+            if not permission_id or notice_id in notices:
+                continue
+            # A V2 permission request carries the same fields a 1.x
+            # ``permission.asked`` event did (action + resources).
+            await self._handle_permission_asked(platform_id, native_id, dict(item))
+        for permission_id in list(self._noticed_permission_ids(platform_id) - pending_ids):
+            await self._handle_permission_replied(
+                platform_id, native_id, {"id": permission_id}
+            )
+
+    async def _sync_pending_forms(self, native_id: str) -> None:
+        platform_id = self._platform_id(native_id)
+        if not platform_id:
+            return
+        pending = await self._client.list_pending_forms(
+            native_id, self._directory_for(native_id)
+        )
+        pending_ids = {
+            str(item.get("id") or "")
+            for item in pending
+            if str(item.get("id") or "")
+        }
+        notices = self._notices.get(platform_id, {})
+        for item in pending:
+            form_id = str(item.get("id") or "")
+            notice_id = f"notice_opencode_que_{form_id}"
+            if not form_id or notice_id in notices:
+                continue
+            await self._handle_question_asked(
+                platform_id, native_id, _form_to_question_props(item)
+            )
+        for form_id in list(self._noticed_question_ids(platform_id) - pending_ids):
+            await self._handle_question_closed(platform_id, {"id": form_id})
+
+    def _noticed_permission_ids(self, platform_id: str) -> set[str]:
+        prefix = "notice_opencode_perm_"
+        return {
+            notice_id.removeprefix(prefix)
+            for notice_id in self._notices.get(platform_id, {})
+            if notice_id.startswith(prefix)
+        }
+
+    def _noticed_question_ids(self, platform_id: str) -> set[str]:
+        prefix = "notice_opencode_que_"
+        return {
+            notice_id.removeprefix(prefix)
+            for notice_id in self._notices.get(platform_id, {})
+            if notice_id.startswith(prefix)
+        }
 
     async def _finish_turn(self, native_id: str) -> None:
         """End the tracked turn; aborts report ``interrupted``, rest ``completed``.
