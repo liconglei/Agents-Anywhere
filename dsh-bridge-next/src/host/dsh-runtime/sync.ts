@@ -21,7 +21,17 @@ function matchesCheckpoint(value: unknown, projection: SessionProjection): boole
   return checkpoint.version === 1 && checkpoint.projectionVersion === PROJECTION_VERSION && checkpoint.settled === true
     && projection.settled && checkpoint.throughSeq === projection.throughSeq && checkpoint.historyHash === projection.historyHash
 }
-const MAX_BUFFER = 10_000
+
+function matchesCachedCheckpoint(value: unknown, projection: SessionProjection): boolean {
+  // The cached projection is the very object the previous feed ingested through
+  // this Connector, so a hash match alone proves the stored state already equals
+  // it. Unlike the replay-resume path there is no second replay whose mid-turn
+  // state could diverge, so an unsettled (mid-turn) checkpoint is accepted here.
+  const checkpoint = record(value)
+  return checkpoint.version === 1 && checkpoint.projectionVersion === PROJECTION_VERSION
+    && checkpoint.throughSeq === projection.throughSeq && checkpoint.historyHash === projection.historyHash
+}
+export const MAX_BUFFER = 10_000
 const MAX_BYTES = 6 * 1024 * 1024
 export const SYNC_FLUSH_MS = Math.ceil(1000 / 30)
 
@@ -57,7 +67,7 @@ export class SyncFeed {
 
   constructor(private native: NativeRuntime, private namespace: string,
     private notify: (batch: SyncBatch) => void, private failed: (error: unknown) => void,
-    private ackTimeoutMs = 60_000, private durableCheckpoints = false) {
+    private ackTimeoutMs = 60_000, private durableCheckpoints = false, private heavyAckTimeoutMs = 600_000) {
     this.unwatch = native.watch(change => {
       if (this.closed) return
       try { this.queuedBytes += jsonBytes(change) }
@@ -66,7 +76,26 @@ export class SyncFeed {
         if (!('id' in change)) return
         change = { type: 'refresh', id: change.id }
       }
-      if (this.queue.length >= MAX_BUFFER || this.queuedBytes > 16 * 1024 * 1024) { this.fail(new Error('DSH event buffer full; resubscribe for a fresh baseline')); return }
+      if (this.queue.length >= MAX_BUFFER || this.queuedBytes > 16 * 1024 * 1024) {
+        // Stream chunks are transient projection drafts that the durable events
+        // reconstruct anyway; dropping them keeps one chatty turn from killing
+        // the whole feed. Only a queue that stays over the limit afterwards
+        // (durable events alone) genuinely needs a fresh baseline.
+        if (change.type === 'stream') {
+          this.queuedBytes -= jsonBytes(change)
+          this.native.diagnostics.log('debug', 'sync.stream_dropped', { streamId: this.id, sessionId: change.id })
+          return
+        }
+        const kept = this.queue.filter(entry => entry.type !== 'stream')
+        const dropped = this.queue.length - kept.length
+        this.queue = kept
+        this.queuedBytes = kept.reduce((total, entry) => total + jsonBytes(entry), 0)
+        if (dropped) this.native.diagnostics.log('debug', 'sync.stream_compacted', { streamId: this.id, dropped })
+        if (this.queue.length >= MAX_BUFFER || this.queuedBytes > 16 * 1024 * 1024) {
+          this.fail(new Error('DSH event buffer full; resubscribe for a fresh baseline'))
+          return
+        }
+      }
       this.queue.push(change)
       this.wake?.(); this.wake = undefined
     })
@@ -130,11 +159,16 @@ export class SyncFeed {
     this.abort.signal.throwIfAborted()
     const batch: SyncBatch = { streamId: this.id, batchSeq: ++this.batchSeq, projectionVersion: PROJECTION_VERSION, operations }
     if (jsonBytes(batch) > 7 * 1024 * 1024) throw new Error('DSH sync batch exceeds frame size')
+    // History-bearing batches are ACKed only after the Connector synchronously
+    // ingests them, so a large session can take well past the liveness window.
+    // Judge by content, not batchSeq, so a big commit still gets its budget.
+    const heavy = operations.some(op => op.kind === 'snapshot.commit' || op.kind === 'checkpoint.save')
+    const timeoutMs = heavy ? this.heavyAckTimeoutMs : this.ackTimeoutMs
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.waitAck = undefined
         reject(new SyncTransportError('DSH event acknowledgement timed out'))
-      }, this.ackTimeoutMs)
+      }, timeoutMs)
       timer.unref()
       this.waitAck = { seq: batch.batchSeq,
         resolve: () => { clearTimeout(timer); resolve() },
@@ -178,6 +212,39 @@ export class SyncFeed {
   private async publishBaseline(id: string, restore: boolean): Promise<void> {
     if (!await this.native.visible(id)) { await this.unavailable(id); return }
     const start = performance.now()
+    const platformId = sessionId(this.namespace, id)
+    let checkpoint: Record<string, unknown> | undefined
+    if (restore && this.durableCheckpoints) {
+      await this.send([{ kind: 'checkpoint.load', externalSessionId: id }])
+      checkpoint = record(this.receivedCheckpoint)
+      const cached = this.native.syncBaselines.get(id)
+      // No new events since the last baseline and the Connector still holds
+      // exactly this projection: reuse the live projection and re-publish only
+      // the idempotent session facts. This is what keeps a resubscription
+      // O(changed sessions) instead of O(all sessions × full log replay).
+      // The settled gate is intentionally absent here: no replay happens, and
+      // the hash equality alone proves the stored Timeline already equals the
+      // cached projection — including a projection checkpointed mid-turn.
+      if (cached && cached.revision === await this.native.source.freshRevisionOf(id)
+        && matchesCachedCheckpoint(checkpoint, cached.projection)) {
+        this.projections.set(id, cached.projection)
+        this.published.set(id, platformId)
+        this.sourceAvailability.set(id, 'available')
+        this.failedSessions.delete(id)
+        await this.notification('session.meta.upsert', { sessionId: platformId, ...cached.meta })
+        await this.notices(id)
+        await this.state(id)
+        if (!cached.turn.active && cached.turn.endedKind !== undefined) {
+          await this.notification('session.turnEnded', {
+            sessionId: platformId, externalSessionId: id,
+            sourceObservedAt: new Date(cached.turn.endedAt ?? Date.now()).toISOString(),
+            outcome: turnOutcome(cached.turn.endedKind),
+          })
+        }
+        this.native.diagnostics.log('info', 'sync.baseline_reused', { streamId: this.id, sessionId: id, elapsedMs: Math.round(performance.now() - start) })
+        return
+      }
+    }
     let log: Awaited<ReturnType<NativeRuntime['read']>>
     try { log = await this.native.read(id as SessionId) }
     catch (error) {
@@ -187,23 +254,25 @@ export class SyncFeed {
       await this.unavailable(id)
       return
     }
-    const platformId = sessionId(this.namespace, id)
     const projection = createProjection(id, platformId, this.durableCheckpoints)
     let resumed = false
-    if (restore && this.durableCheckpoints) {
-      await this.send([{ kind: 'checkpoint.load', externalSessionId: id }])
-      const checkpoint = record(this.receivedCheckpoint)
-      if (Number.isSafeInteger(checkpoint.throughSeq) && Number(checkpoint.throughSeq) >= -1) {
-        await replayHistory(projection, log, this.abort.signal, Number(checkpoint.throughSeq))
-        resumed = matchesCheckpoint(checkpoint, projection)
-        if (resumed) projection.drain()
-      }
+    if (checkpoint !== undefined && Number.isSafeInteger(checkpoint.throughSeq) && Number(checkpoint.throughSeq) >= -1) {
+      await replayHistory(projection, log, this.abort.signal, Number(checkpoint.throughSeq))
+      resumed = matchesCheckpoint(checkpoint, projection)
+      if (resumed) projection.drain()
     }
     await replayHistory(projection, log, this.abort.signal)
     const title = log.events.findLast(event => event.type === 'session/title')
     const meta = { externalSessionId: id, title: title?.type === 'session/title' ? title.data.title : null,
       sourceState: await this.native.source.state(id), cwd: log.session.cwd ?? null,
       lastActivityAt: new Date(log.events.at(-1)?.time ?? log.session.createdAt).toISOString() }
+    // The memo's identity is the exact log cut the projection was replayed from,
+    // never a freshly read one; a missing revision simply disables reuse.
+    const revision = log.bridgeRevision ?? await this.native.source.freshRevisionOf(id)
+    const lastTurnEnd = log.events.findLast(event => event.type === 'turn/end')
+    const turn = { active: turnPhase(log.events).active,
+      endedKind: lastTurnEnd?.type === 'turn/end' ? lastTurnEnd.data.reason.kind : undefined,
+      endedAt: lastTurnEnd?.time }
     if (resumed) {
       const delta = projection.drain()
       if (!delta.removed.length && await this.native.visible(id)) {
@@ -216,6 +285,7 @@ export class SyncFeed {
         await this.notices(id)
         await this.state(id, log)
         await this.turnEnded(id, log.events)
+        if (revision !== undefined) this.native.syncBaselines.set(id, { revision, projection, meta, turn })
         this.native.diagnostics.log('info', 'sync.checkpoint_restored', { streamId: this.id, sessionId: id })
         return
       }
@@ -241,6 +311,7 @@ export class SyncFeed {
     this.checkpointDirty.add(id)
     this.published.set(id, platformId)
     this.sourceAvailability.set(id, 'available')
+    if (revision !== undefined) this.native.syncBaselines.set(id, { revision, projection, meta, turn })
     await this.notices(id)
     await this.state(id, log)
     await this.turnEnded(id, log.events)
@@ -307,6 +378,9 @@ export class SyncFeed {
     }
     if (this.durableCheckpoints) await this.send([{ kind: 'checkpoint.delete', externalSessionId: id }])
     this.published.delete(id); this.projections.delete(id)
+    // The checkpoint is gone and the projection was dropped; the next baseline
+    // is a fresh import and must not reuse a cached projection.
+    this.native.syncBaselines.delete(id)
   }
   private async sourceState(id: string): Promise<SourceState> {
     const source = await this.native.source.state(id)

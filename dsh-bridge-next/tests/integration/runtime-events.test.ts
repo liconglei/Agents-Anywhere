@@ -11,7 +11,7 @@ import { createAssistantMessage, createToolResultMessage, createUserMessage, Too
 import { bridgePath, nativeRuntime } from '../fixtures/native-runtime.js'
 import { corruptHistory } from '../fixtures/corrupt-history.js'
 import { mountAgents, TextAdapter, initialSelections } from '../fixtures/agent-runtime.js'
-import { SyncFeed, SYNC_FLUSH_MS, type SyncBatch, type SyncOperation } from '../../src/host/dsh-runtime/sync.js'
+import { SyncFeed, SYNC_FLUSH_MS, MAX_BUFFER, type SyncBatch, type SyncOperation } from '../../src/host/dsh-runtime/sync.js'
 import { projectHistory } from '../../src/host/dsh-runtime/history.js'
 import { nativeSessionId, sessionId } from '../../src/host/dsh-runtime/identity.js'
 import { createConnection } from 'node:net'
@@ -583,7 +583,7 @@ test('checkpoint mismatches and active turns recalibrate only the affected sessi
   const complete = () => notifications(stream.ops()).some(n => n.method === 'session.inventory.complete')
   try {
     await until(complete, 'initial checkpoints')
-    for (const mutation of [{ historyHash: '0'.repeat(64) }, { projectionVersion: 2 }, { projectionVersion: 99 }, { settled: false }]) {
+    for (const mutation of [{ historyHash: '0'.repeat(64) }, { projectionVersion: 2 }, { projectionVersion: 99 }]) {
       stream.feed.close()
       checkpoints.set('native-main', { ...checkpoints.get('native-main') as object, ...mutation })
       stream = follow(native, checkpoints)
@@ -591,6 +591,16 @@ test('checkpoint mismatches and active turns recalibrate only the affected sessi
       assert.deepEqual(stream.ops().filter(op => op.kind === 'snapshot.commit').map(op => op.sessionId), [sessionId('test', 'native-main')])
       assert.deepEqual(stream.errors, [])
     }
+    // A mid-turn (unsettled) checkpoint whose prefix hash still matches is not
+    // a mismatch: the cached baseline is the very projection that produced the
+    // stored hash, so the resubscription reuses it instead of recalibrating.
+    stream.feed.close()
+    checkpoints.set('native-main', { ...checkpoints.get('native-main') as object, settled: false })
+    stream = follow(native, checkpoints)
+    await until(complete, 'unsettled matching checkpoint reuses the cached baseline')
+    assert.equal(stream.ops().filter(op => op.kind === 'snapshot.begin').length, 0,
+      'an unsettled but hash-matching checkpoint must not re-publish the snapshot')
+    assert.deepEqual(stream.errors, [])
     fixture.session.append('turn/start', { turn: 2 })
     await until(() => (checkpoints.get('native-main') as { settled: boolean }).settled === false, 'active turn never claims a settled checkpoint')
     stream.feed.close()
@@ -601,4 +611,107 @@ test('checkpoint mismatches and active turns recalibrate only the affected sessi
     await until(() => stream.ops().some(op => op.kind === 'snapshot.commit' && op.sessionId === sessionId('test', 'persisted-only')), 'manual refresh bypasses a matching checkpoint')
     assert.deepEqual(stream.errors, [])
   } finally { stream.feed.close(); await fixture.ctx.fiber.dispose(); await rm(home, { recursive: true, force: true }) }
+})
+
+test('an unchanged resubscription reuses cached baselines without re-reading native logs', { timeout: 30_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-baseline-reuse-'))
+  const fixture = await nativeRuntime(home)
+  const native = fixture.ctx.agentsAnywhereRuntime.native
+  const checkpoints = new Map<string, unknown>()
+  const reads: string[] = []
+  const read = native.read.bind(native)
+  native.read = async (id: SessionId) => { reads.push(String(id)); return read(id) }
+  let stream = follow(native, checkpoints)
+  const complete = () => notifications(stream.ops()).some(n => n.method === 'session.inventory.complete')
+  try {
+    await until(complete, 'first inventory')
+    assert.deepEqual(new Set(reads), new Set(['native-main', 'persisted-only']), 'the first inventory reads every visible session')
+    stream.feed.close()
+    reads.length = 0
+    stream = follow(native, checkpoints)
+    await until(complete, 'reconnected inventory')
+    assert.deepEqual(reads, [], 'an unchanged resubscription replays no native log at all')
+    assert.equal(stream.ops().filter(op => op.kind === 'snapshot.begin').length, 0)
+    const notes = notifications(stream.ops())
+    assert.ok(notes.some(n => n.method === 'session.meta.upsert' && n.params.externalSessionId === 'native-main'), 'idempotent facts are re-published')
+    assert.ok(notes.some(n => n.method === 'session.turnEnded' && n.params.externalSessionId === 'native-main'), 'the finished turn is announced again')
+    assert.deepEqual(stream.errors, [])
+    stream.feed.close()
+    fixture.session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'only one session changed' }] }), { surfaceOp: 'append' })
+    await fixture.ctx.sessions.flush(fixture.session)
+    reads.length = 0
+    stream = follow(native, checkpoints)
+    await until(complete, 'partially changed inventory')
+    assert.deepEqual(reads, ['native-main'], 'only the changed session pays for a full log read')
+    assert.ok(notifications(stream.ops()).some(n => n.method === 'timeline.itemUpsert' && JSON.stringify(n.params.item).includes('only one session changed')))
+    assert.deepEqual(stream.errors, [])
+  } finally { stream.feed.close(); await fixture.ctx.fiber.dispose(); await rm(home, { recursive: true, force: true }) }
+})
+
+test('buffer overflow drops transient stream chunks instead of killing the feed', { timeout: 60_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-overflow-'))
+  const fixture = await nativeRuntime(home)
+  const native = fixture.ctx.agentsAnywhereRuntime.native
+  const batches: SyncBatch[] = [], errors: unknown[] = []
+  let held: SyncBatch | undefined
+  let amended = false
+  const feed = new SyncFeed(native, 'test', batch => {
+    batches.push(batch)
+    if (!amended && batch.operations[0]?.kind === 'snapshot.items') { amended = true; held = batch }
+    else queueMicrotask(() => feed.ack(batch.batchSeq))
+  }, error => errors.push(error))
+  const ops = () => batches.flatMap(b => b.operations)
+  try {
+    feed.start()
+    await until(() => !!held, 'first page was held')
+    // Flood the buffered feed past MAX_BUFFER with transient agent-stream
+    // chunks: before the drop policy any overflow failed the feed, and every
+    // resubscription then re-baselined every session — the observed livelock.
+    // The -1 cut (seq 0) keeps the chunks out of any projection by guard.
+    const emit = (payload: unknown) => (fixture.ctx as unknown as { emit: (event: string, payload: unknown) => void })
+      .emit('agent/assistant-stream', payload)
+    const agent = { id: 'native-main', session: { seq: 0 } }
+    emit({ agent, frame: { type: 'start', attemptId: 'flood', turn: 9, step: 1 } })
+    for (let index = 0; index < MAX_BUFFER + 100; index++) {
+      emit({ agent, frame: { type: 'chunk', attemptId: 'flood', chunk: { type: 'text-delta', index: 0, text: '溢' }, time: Date.now() } })
+    }
+    // One durable event must compact the queue instead of failing it.
+    fixture.session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'durable after flood' }] }), { surfaceOp: 'append' })
+    assert.deepEqual(errors, [], 'the queue overflow must not fail the feed')
+    feed.ack(held!.batchSeq)
+    await until(() => notifications(ops()).some(n => n.method === 'session.inventory.complete'), 'inventory completes after the held page is released')
+    await until(() => notifications(ops()).some(n => n.method === 'timeline.itemUpsert' && JSON.stringify(n.params.item).includes('durable after flood')), 'the durable event survives the compaction')
+    assert.ok(!JSON.stringify(ops()).includes('溢'), 'dropped transient chunks never reach the platform')
+    assert.deepEqual(errors, [])
+  } finally { feed.close(); await fixture.ctx.fiber.dispose(); await rm(home, { recursive: true, force: true }) }
+})
+
+test('history-bearing batches keep their ACK budget beyond the liveness timeout', { timeout: 30_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-ack-budget-'))
+  const fixture = await nativeRuntime(home)
+  const native = fixture.ctx.agentsAnywhereRuntime.native
+  const batches: SyncBatch[] = [], errors: unknown[] = []
+  const held = new Map<number, SyncBatch>()
+  let holdHeavy = false
+  const feed = new SyncFeed(native, 'test', batch => {
+    batches.push(batch)
+    // A checkpoint save is only ACKed after the Connector persisted it, so it
+    // must not be judged by the light liveness window (120ms here).
+    if (holdHeavy && batch.operations.some(op => op.kind === 'checkpoint.save')) held.set(batch.batchSeq, batch)
+    else queueMicrotask(() => feed.ack(batch.batchSeq))
+  }, error => errors.push(error), 120, true, 30_000)
+  const notes = () => notifications(batches.flatMap(b => b.operations))
+  try {
+    feed.start()
+    await until(() => notes().some(n => n.method === 'session.inventory.complete'), 'baseline with ordinary acks')
+    holdHeavy = true
+    fixture.session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'checkpoint save is heavy' }] }), { surfaceOp: 'append' })
+    await until(() => held.size > 0, 'a checkpoint.save batch is held')
+    await delay(400)
+    assert.deepEqual(errors, [], 'the heavy batch must survive well past the light ACK timeout')
+    for (const [seq] of held) feed.ack(seq)
+    held.clear()
+    await until(() => notes().some(n => n.method === 'timeline.itemUpsert' && JSON.stringify(n.params.item).includes('checkpoint save is heavy')), 'the feed continues after the heavy acknowledgement')
+    assert.deepEqual(errors, [])
+  } finally { feed.close(); await fixture.ctx.fiber.dispose(); await rm(home, { recursive: true, force: true }) }
 })
