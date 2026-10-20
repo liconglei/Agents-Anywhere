@@ -4,6 +4,7 @@ import asyncio
 import pickle
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import ExitStack
@@ -129,6 +130,7 @@ class SyncRelay:
         # unchanged refused capture is not uploaded again and again.
         self.quarantined: dict[str, _Quarantine] = {}
         self.retry_tasks: set[asyncio.Task[None]] = set()
+        self.accept_timeout = accept_timeout
         self.task: asyncio.Task[None] | None = None
         self.snapshot: dict[str, Any] | None = None
         self.file = None
@@ -137,15 +139,46 @@ class SyncRelay:
         self.item_bytes = 0
         self.item_ids: set[str] = set()
         self.durable_checkpoints = False
+<<<<<<< HEAD
+=======
+        self.loaded_checkpoint: dict[str, Any] | None = None
+        # First inventory latched running: resubscriptions after it must not pull
+        # the instance back into "starting" while history is recalibrated.
+        self._inventory_complete = False
+        self._baselines = 0
+        self._last_progress_at = 0.0
+        self._retry_attempt = 0
+>>>>>>> 8e57807c (fix(connector): DSH 会话同步增量化与重订阅防抖（连接器侧）)
 
     def start(self) -> None:
         self.task = asyncio.create_task(self.run(), name="dsh-event-sync")
         self.task.add_done_callback(self._finished)
 
+<<<<<<< HEAD
     def _finished(self, task: asyncio.Task[None]) -> None:
         # Whatever ended the loop, the owner gets to decide whether to start a
         # new relay; a relay must never disappear silently.
         if task.cancelled():
+=======
+    async def accept(self, payload: Mapping[str, Any]) -> None:
+        # The feed ACKs each batch only after ingesting it, so a momentarily full
+        # queue is an ingest backlog, not a dead peer. Wait for capacity first;
+        # only a queue that stays blocked forces the resubscription.
+        batch = dict(payload)
+        try:
+            self.queue.put_nowait(batch)
+            return
+        except asyncio.QueueFull:
+            pass
+        try:
+            await asyncio.wait_for(self.queue.put(batch), self.accept_timeout)
+        except TimeoutError:
+            logger.warning("DSH sync batches stayed queued for {}s; resubscribing", self.accept_timeout)
+            self.restart()
+
+    def restart(self, stream_id: str | None = None) -> None:
+        if stream_id and self.stream_id and stream_id != self.stream_id:
+>>>>>>> 8e57807c (fix(connector): DSH 会话同步增量化与重订阅防抖（连接器侧）)
             return
         error = task.exception()
         if error is not None:
@@ -194,7 +227,66 @@ class SyncRelay:
 
     async def operation(self, op: dict[str, Any]) -> None:
         kind = op.get("kind")
+<<<<<<< HEAD
         if kind == "notifications":
+=======
+        if kind in {"checkpoint.load", "checkpoint.save", "checkpoint.delete"}:
+            if not self.durable_checkpoints or self.snapshot is not None:
+                raise ValueError("Checkpoint operation outside a committed sync boundary")
+            external_id = op.get("externalSessionId")
+            if not isinstance(external_id, str) or not external_id:
+                raise ValueError("Checkpoint requires an external session identity")
+            key = f"dsh/sync/checkpoints/{external_id}"
+            if kind == "checkpoint.load":
+                self.loaded_checkpoint = _checkpoint(await self.host.sync_state_read(key))
+                # Every durable-mode baseline begins with its checkpoint load,
+                # restored or republished; it is the one reliable progress count.
+                self._baselines += 1
+                await self._publish_progress_health()
+            elif kind == "checkpoint.delete":
+                await self.host.sync_state_delete(key)
+            else:
+                checkpoint = _checkpoint(op.get("checkpoint"))
+                if checkpoint is None:
+                    raise ValueError("Invalid DSH checkpoint")
+                # All preceding history operations were synchronously ingested.
+                # The Host's periodic/final flush uses the same JSON as scanners.
+                await self.host.sync_state_write(key, checkpoint)
+        elif kind == "snapshot.begin":
+            self.clear_snapshot()
+            self.snapshot = op
+
+        elif kind in {"snapshot.items", "snapshot.commit", "snapshot.abort"}:
+            if not self.snapshot or any(op.get(k) != self.snapshot.get(k) for k in ("snapshotId", "sessionId")):
+                raise ValueError("Snapshot page has a different capture identity")
+            if kind == "snapshot.items":
+                for raw in op["items"]:
+                    item = timeline_item(raw)
+                    if item.session_id != op["sessionId"] or item.id in self.item_ids:
+                        raise ValueError("Invalid snapshot item identity")
+                    self.item_ids.add(item.id)
+                await self.store_items(op["items"])
+            elif kind == "snapshot.commit":
+                if len(self.item_ids) != op.get("totalItems") or op.get("throughSeq") != self.snapshot["throughSeq"]:
+                    raise ValueError("Incomplete snapshot; previous backend history remains intact")
+                items = await self.load_items()
+                meta = self.snapshot["meta"]
+                # Reuse the existing complete snapshot API only after every page is received.
+                await self.host.publish_runtime_notifications("dsh", [
+                    {"method": "session.meta.upsert", "params": {"sessionId": op["sessionId"], **meta}},
+                    {"method": "timeline.sync", "params": {"sessionId": op["sessionId"],
+                        "externalSessionId": meta["externalSessionId"], "items": items, "complete": True}},
+                ])
+                self.clear_snapshot()
+                if not self.durable_checkpoints:
+                    # Without checkpoints the committed capture is the only
+                    # observable baseline completion for the progress report.
+                    self._baselines += 1
+                    await self._publish_progress_health()
+            else:
+                self.clear_snapshot()
+        elif kind == "notifications":
+>>>>>>> 8e57807c (fix(connector): DSH 会话同步增量化与重订阅防抖（连接器侧）)
             pending: list[dict[str, Any]] = []
             for raw in op["notifications"]:
                 notice = self.unquarantined(raw)
@@ -327,8 +419,17 @@ class SyncRelay:
         if not notifications:
             return
         await self.host.publish_runtime_notifications("dsh", notifications)
+<<<<<<< HEAD
         if any(n["method"] == "session.inventory.complete" and n["params"].get("complete") is True for n in notifications):
             await self._report_health("running")
+=======
+        for notice in notifications:
+            if notice["method"] == "session.inventory.begin":
+                self._baselines = 0
+            elif notice["method"] == "session.inventory.complete" and notice["params"].get("complete") is True:
+                self._inventory_complete = True
+                await self.host.runtime_health_update("running")
+>>>>>>> 8e57807c (fix(connector): DSH 会话同步增量化与重订阅防抖（连接器侧）)
 
     async def store_items(self, items: list[dict[str, Any]]) -> None:
         self.item_bytes += object_bytes(items)
@@ -409,10 +510,31 @@ class SyncRelay:
             await self.host.permission_catalog_update(permission_catalog(params))
         elif method in {"session.inventory.begin", "session.inventory.complete"}:
             await self.host.publish_runtime_notifications("dsh", [notice])
+<<<<<<< HEAD
             if method == "session.inventory.complete" and params.get("complete") is True:
                 await self._report_health("running")
+=======
+            if method == "session.inventory.begin":
+                self._baselines = 0
+            elif params.get("complete") is True:
+                self._inventory_complete = True
+                await self.host.runtime_health_update("running")
+>>>>>>> 8e57807c (fix(connector): DSH 会话同步增量化与重订阅防抖（连接器侧）)
         else:
             raise ValueError(f"Unsupported runtime notification: {method}")
+
+    async def _publish_progress_health(self) -> None:
+        if self._inventory_complete:
+            return
+        now = time.monotonic()
+        if now - self._last_progress_at < 1.0:
+            return
+        self._last_progress_at = now
+        await self.host.runtime_health_update("starting", {
+            "code": "runtime_initializing",
+            "message": f"正在同步 DSH 会话…（已同步 {self._baselines} 个会话）",
+            "retryable": True,
+        })
 
     async def run(self) -> None:
         try:
@@ -422,6 +544,7 @@ class SyncRelay:
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:  # noqa: BLE001 - isolate and recover a failed feed
+<<<<<<< HEAD
                     self.failures += 1
                     delay = min(self.retry_delay * 2 ** (self.failures - 1), MAX_RETRY_DELAY_SECONDS)
                     logger.warning(
@@ -435,6 +558,22 @@ class SyncRelay:
                         return
                     self.clear_snapshot()
                     await asyncio.sleep(delay)
+=======
+                    logger.warning("DSH event sync interrupted; resubscribing for history calibration ({})", type(error).__name__)
+                    # After the first inventory the instance is already usable:
+                    # recalibrating history must not flip it back to "starting".
+                    if not self._inventory_complete:
+                        await self.host.runtime_health_update("starting", {
+                            "code": "runtime_sync_interrupted", "message": "DSH 会话同步中断，正在重试…", "retryable": True,
+                        })
+                    if not self.client.connected:
+                        return
+                    self.clear_snapshot()
+                    await asyncio.sleep(min(self.retry_delay * 2**self._retry_attempt, 30.0))
+                    self._retry_attempt += 1
+                    while not self.queue.empty():
+                        self.queue.get_nowait()
+>>>>>>> 8e57807c (fix(connector): DSH 会话同步增量化与重订阅防抖（连接器侧）)
         finally:
             self.clear_snapshot()
 
@@ -447,6 +586,7 @@ class SyncRelay:
         self.expected_batch = 1
         self.confirmed.clear()
         try:
+<<<<<<< HEAD
             await self._report_health("starting", {
                 "code": "syncing", "message": "正在同步 DSH 会话…", "retryable": True,
             })
@@ -459,6 +599,40 @@ class SyncRelay:
                 self.projection_version = event["projectionVersion"]
                 self.confirmed.set()
             raise RuntimeError("The DSH plugin ended the sync stream")
+=======
+            if not self._inventory_complete:
+                await self.host.runtime_health_update("starting", {
+                    "code": "runtime_initializing", "message": "正在同步 DSH 会话…", "retryable": True,
+                })
+            subscription = await self.client.request("runtime.sync.subscribe", {"checkpointVersion": 1})
+            projection_version = subscription.get("projectionVersion")
+            if projection_version not in (2, 3):
+                raise ValueError("Unsupported DSH projection version")
+            stream_id, expected = subscription["streamId"], 1
+            self.durable_checkpoints = subscription.get("checkpointVersion") == 1
+            self.stream_id = stream_id
+            while True:
+                batch = await self.queue.get()
+                if batch is None:
+                    raise RuntimeError("The DSH sync stream needs a new subscription")
+                if batch.get("streamId") != stream_id:
+                    continue
+                if batch.get("batchSeq") != expected:
+                    raise ValueError("Out-of-order event batch; reconnect to recalibrate")
+                if batch.get("projectionVersion") != projection_version or not isinstance(batch.get("operations"), list) or not batch["operations"]:
+                    raise ValueError("Invalid DSH event batch")
+                self.loaded_checkpoint = None
+                for operation in batch["operations"]:
+                    await self.operation(operation)
+                ack = {"streamId": stream_id, "batchSeq": expected}
+                if any(op.get("kind") == "checkpoint.load" for op in batch["operations"]):
+                    ack["checkpoint"] = self.loaded_checkpoint
+                await self.client.request("runtime.sync.ack", ack)
+                expected += 1
+                # A delivered batch proves the resubscribe loop is making
+                # progress; the next interruption may retry fast again.
+                self._retry_attempt = 0
+>>>>>>> 8e57807c (fix(connector): DSH 会话同步增量化与重订阅防抖（连接器侧）)
         finally:
             self.registry.remove(subscription_id, self)
             self.subscription_id = None

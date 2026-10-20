@@ -11,17 +11,10 @@ from connector.runtime_protocol import (
     RuntimeInstanceSpec,
     timeline_content_hash,
 )
-from connector.runtimes.dsh.bridge.host import (
-    SnapshotPage,
-    SnapshotRequest,
-    SubscriptionRegistry,
-    SyncBatch,
-)
 from connector.runtimes.dsh.bridge.sync import SyncRelay
 from connector.runtimes.dsh.runtime import DshRuntime
 from connector.server.runtime_host import ConnectorRuntimeHost
 from connector.server.runtime_sync import RuntimeSyncRunner
-from tests.dsh_sync_helpers import add_page, begin_snapshot, ingest, ready_relay
 
 
 def item(item_id="one", session_id="session"):
@@ -33,36 +26,34 @@ def item(item_id="one", session_id="session"):
 
 
 def host():
-    receiver = SimpleNamespace(publish_runtime_notifications=AsyncMock(), sync_state_write=AsyncMock(), runtime_health_update=AsyncMock())
-    async def snapshot(runtime, session_id, meta, items, **kwargs):
-        await receiver.publish_runtime_notifications(runtime, [
-            {"method": "session.meta.upsert", "params": {"sessionId": session_id, **meta}},
-            {"method": "timeline.sync", "params": {"sessionId": session_id, "externalSessionId": meta["externalSessionId"], "items": list(items), "complete": True}},
-        ], **kwargs)
-    receiver.publish_runtime_snapshot = snapshot
-    return receiver
+    return SimpleNamespace(publish_runtime_notifications=AsyncMock(), sync_state_write=AsyncMock(),
+                           sync_state_read=AsyncMock(return_value=None), runtime_health_update=AsyncMock())
+
+
+def operation(kind, **values):
+    return {"kind": kind, "sessionId": "session", "snapshotId": "capture", **values}
 
 
 def test_snapshot_replacement_waits_for_complete_capture_and_preserves_empty_snapshot():
     async def exercise():
         receiver = host()
-        relay = ready_relay(receiver)
+        relay = SyncRelay(Mock(), receiver)
         try:
-            await begin_snapshot(relay, session_id="session", through_seq=12,
-                meta={"externalSessionId": "native", "cwd": "/repo"})
-            await add_page(relay, [item()])
-            # Streamed pages are buffered; nothing replaces the previous history before commit.
+            await relay.operation(operation("snapshot.begin", throughSeq=12,
+                meta={"externalSessionId": "native", "cwd": "/repo"}))
+            await relay.operation(operation("snapshot.items", items=[item()]))
             receiver.publish_runtime_notifications.assert_not_awaited()
-            await add_page(relay, [item("two")])
+            with pytest.raises(ValueError, match="Incomplete snapshot"):
+                await relay.operation(operation("snapshot.commit", totalItems=2, throughSeq=12))
             receiver.publish_runtime_notifications.assert_not_awaited()
-            result = await relay.commit_snapshot()
-            assert result.accepted is True
+            await relay.operation(operation("snapshot.items", items=[item("two")]))
+            await relay.operation(operation("snapshot.commit", totalItems=2, throughSeq=12))
             notices = receiver.publish_runtime_notifications.call_args.args[1]
             assert [n["method"] for n in notices] == ["session.meta.upsert", "timeline.sync"]
             assert notices[1]["params"]["complete"] is True
             assert [i["id"] for i in notices[1]["params"]["items"]] == ["one", "two"]
-            await begin_snapshot(relay, session_id="session", through_seq=0, meta={"externalSessionId": "native"})
-            await relay.commit_snapshot()
+            await relay.operation(operation("snapshot.begin", throughSeq=0, meta={"externalSessionId": "native"}))
+            await relay.operation(operation("snapshot.commit", totalItems=0, throughSeq=0))
             assert receiver.publish_runtime_notifications.call_args.args[1][1]["params"]["items"] == []
         finally:
             await relay.close()
@@ -72,17 +63,16 @@ def test_snapshot_replacement_waits_for_complete_capture_and_preserves_empty_sna
 def test_snapshot_abort_foreign_items_and_duplicate_pages_do_not_publish_partial_history():
     async def exercise():
         receiver = host()
-        relay = ready_relay(receiver)
+        relay = SyncRelay(Mock(), receiver)
         try:
-            await begin_snapshot(relay, session_id="session", through_seq=1, meta={"externalSessionId": "native"})
+            await relay.operation(operation("snapshot.begin", throughSeq=1, meta={"externalSessionId": "native"}))
             with pytest.raises(ValueError, match="identity"):
-                await add_page(relay, [item(session_id="other")])
-            await add_page(relay, [item()])
+                await relay.operation(operation("snapshot.items", items=[item(session_id="other")]))
+            await relay.operation(operation("snapshot.items", items=[item()]))
             with pytest.raises(ValueError, match="identity"):
-                await add_page(relay, [item()])
-            await relay.abort_snapshot()
-            assert relay.file is None and relay.snapshot is None
-            assert relay.items == [] and relay.item_ids == set()
+                await relay.operation(operation("snapshot.items", items=[item()]))
+            await relay.operation(operation("snapshot.abort"))
+            assert relay.file is None
             receiver.publish_runtime_notifications.assert_not_awaited()
         finally:
             await relay.close()
@@ -93,88 +83,49 @@ def test_snapshot_abort_foreign_items_and_duplicate_pages_do_not_publish_partial
 @pytest.mark.parametrize("projection_version", [2, 3])
 def test_relay_failure_resubscribes_without_closing_concurrent_rpc(reject, projection_version):
     async def exercise():
-        entered, release = asyncio.Event(), asyncio.Event()
-        stream_failed, resubscribed = asyncio.Event(), asyncio.Event()
+        entered, release, acknowledged = asyncio.Event(), asyncio.Event(), asyncio.Event()
         acks = []
-        streams = 0
-        deliveries = 0
+        subscriptions = 0
+        resubscribed = asyncio.Event()
 
         async def publish(*args, **kwargs):
-            nonlocal deliveries
             assert kwargs["session_id"] == "session" and kwargs["runtime"] == "dsh"
             entered.set()
             await release.wait()
-            deliveries += 1
-            if reject and deliveries == 1:
+            if reject and subscriptions == 1:
                 raise RuntimeError("delivery failed")
 
-        async def stream(method, params=None):
-            nonlocal streams
-            assert method == "sync"
-            streams += 1
-            if streams == 1:
-                yield {"kind": "subscribed", "projectionVersion": projection_version}
-                await stream_failed.wait()
-                raise RuntimeError("sync stream interrupted")
-            resubscribed.set()
-            yield {"kind": "subscribed", "projectionVersion": projection_version}
-            await asyncio.Event().wait()  # keep the replacement feed open
+        async def request(method, params=None):
+            nonlocal subscriptions
+            if method == "runtime.sync.subscribe":
+                subscriptions += 1
+                if subscriptions > 1:
+                    resubscribed.set()
+                return {"streamId": f"stream-{subscriptions}", "projectionVersion": projection_version}
+            acks.append(params["batchSeq"])
+            acknowledged.set()
 
-        registry = SubscriptionRegistry()
-        client = SimpleNamespace(stream=stream, connected=True, host=SimpleNamespace(registry=registry))
+        client = SimpleNamespace(request=request, writer=Mock(), connected=True)
         relay = SyncRelay(client, SimpleNamespace(session_state_update=publish, runtime_health_update=AsyncMock()), retry_delay=0.01)
         relay.start()
-        op = {"kind": "notifications", "notifications": [{"method": "session.state.updated", "params": {"sessionId": "session", "status": "idle"}}]}
-
-        async def deliver():
-            await ingest(relay, op)
-            acks.append(relay.expected_batch - 1)
-
         try:
-            await asyncio.wait_for(relay.confirmed.wait(), 1)
-            first = relay.subscription_id
-            batch = asyncio.create_task(deliver())
+            op = {"kind": "notifications", "notifications": [{"method": "session.state.updated", "params": {"sessionId": "session", "status": "idle"}}]}
+            await asyncio.sleep(0)
+            await relay.accept({"streamId": "stream-1", "batchSeq": 1, "projectionVersion": projection_version, "operations": [op]})
             await asyncio.wait_for(entered.wait(), 1)
-            # The batch is only acknowledged after delivery completed.
-            assert not batch.done() and acks == []
+            assert not acks
             release.set()
-            if reject:
-                with pytest.raises(RuntimeError, match="delivery failed"):
-                    await batch
-                assert acks == []
-            else:
-                await batch
-                assert acks == [1]
-            stream_failed.set()
+            if not reject:
+                await asyncio.wait_for(acknowledged.wait(), 1)
+                await relay.accept({"streamId": "stream-1", "batchSeq": 3, "projectionVersion": projection_version, "operations": [op]})
             await asyncio.wait_for(resubscribed.wait(), 1)
-            # A batch delayed on the old subscription cannot touch the new feed.
-            with pytest.raises(ValueError, match="already ended"):
-                await relay.ingest(SyncBatch(
-                    subscriptionId=first or "", batchSeq=1,
-                    projectionVersion=projection_version, operations=[op],
-                ))
-            await deliver()
+            assert acks == ([] if reject else [1])
+            acknowledged.clear()
+            relay.restart("stream-1")  # A delayed old error cannot stop the new feed.
+            await relay.accept({"streamId": "stream-2", "batchSeq": 1, "projectionVersion": projection_version, "operations": [op]})
+            await asyncio.wait_for(acknowledged.wait(), 1)
             assert acks == ([1] if reject else [1, 1])
-        finally:
-            await relay.close()
-    asyncio.run(exercise())
-
-
-def test_replayed_batch_after_a_lost_acknowledgement_is_idempotent():
-    async def exercise():
-        relay = ready_relay(host())
-        try:
-            replay = SyncBatch(subscriptionId="sub", batchSeq=1, projectionVersion=3,
-                               operations=[{"kind": "workspace.inventory"}])
-            await relay.ingest(replay)
-            assert relay.expected_batch == 2
-            # The Router may redeliver a batch whose acknowledgement was lost;
-            # the original application already advanced the sequence.
-            await relay.ingest(replay)
-            assert relay.expected_batch == 2
-            with pytest.raises(ValueError, match="Out-of-order"):
-                await relay.ingest(SyncBatch(subscriptionId="sub", batchSeq=3, projectionVersion=3,
-                                             operations=[{"kind": "workspace.inventory"}]))
+            client.writer.close.assert_not_called()
         finally:
             await relay.close()
     asyncio.run(exercise())
@@ -290,12 +241,12 @@ def test_snapshot_buffer_reuses_small_objects_and_spills_large_captures_without_
             small = item()
             await relay.store_items([small])
             assert relay.file is None
-            assert next(iter(relay.iter_items())) is small
+            assert (await relay.load_items())[0] is small
             large = {"payload": "x" * (9 * 1024 * 1024)}
             await relay.store_items([large])
             assert relay.file is not None
             assert relay.items == []
-            assert list(relay.iter_items()) == [small, large]
+            assert await relay.load_items() == [small, large]
             relay.clear_snapshot()
             assert relay.file is None
             assert relay.items == []
@@ -351,27 +302,92 @@ def test_inventory_does_not_report_healthy_while_delivery_is_pending_or_incomple
     asyncio.run(run())
 
 
-def test_snapshot_pages_and_aborts_from_another_capture_are_ignored():
-    async def exercise():
-        receiver = host()
-        relay = ready_relay(receiver)
-        await relay.begin_snapshot(SnapshotRequest(
-            captureId="new", subscriptionId="sub", sessionId="session",
-            meta={"externalSessionId": "native"}, throughSeq=3,
-        ))
-        with pytest.raises(ValueError, match="capture"):
-            await relay.add_snapshot_page(SnapshotPage(captureId="old", items=[item()]))
-        # A cancelled stream from the previous capture must not clear the new one.
-        await relay.abort_snapshot("old")
-        assert relay.snapshot is not None
-        assert relay.snapshot["captureId"] == "new"
-        with pytest.raises(ValueError, match="capture"):
-            await relay.commit_snapshot("old")
-        await relay.add_snapshot_page(SnapshotPage(captureId="new", items=[item()]))
-        result = await relay.commit_snapshot("new")
-        assert result.accepted is True
-        assert [n["method"] for n in receiver.publish_runtime_notifications.call_args.args[1]] == [
-            "session.meta.upsert", "timeline.sync",
-        ]
+def test_accept_waits_for_capacity_and_restarts_only_after_the_timeout():
+    async def run():
+        relay = SyncRelay(Mock(), host(), retry_delay=0.01)
+        relay.accept_timeout = 0.05
+        try:
+            await relay.accept({"streamId": "stream", "batchSeq": 1})
+            await relay.accept({"streamId": "stream", "batchSeq": 2})
+            assert relay.queue.full()
+            # A third batch has to wait for the consumer; when nothing drains in
+            # time the feed is restarted instead of silently dropping the stream.
+            await relay.accept({"streamId": "stream", "batchSeq": 3})
+            drained = []
+            while not relay.queue.empty():
+                drained.append(relay.queue.get_nowait())
+            assert drained == [None]
+        finally:
+            await relay.close()
+    asyncio.run(run())
 
-    asyncio.run(exercise())
+
+@pytest.mark.parametrize("already_complete", [False, True])
+def test_resubscription_reports_starting_only_until_the_first_inventory(already_complete):
+    async def run():
+        subscriptions = 0
+        subscribed, resubscribed = asyncio.Event(), asyncio.Event()
+
+        async def request(method, params=None):
+            nonlocal subscriptions
+            if method == "runtime.sync.subscribe":
+                subscriptions += 1
+                if subscriptions == 1:
+                    subscribed.set()
+                else:
+                    resubscribed.set()
+                return {"streamId": f"stream-{subscriptions}", "projectionVersion": 3, "checkpointVersion": 1}
+            return {}
+
+        health = []
+
+        async def health_update(status, detail=None):
+            health.append((status, (detail or {}).get("code")))
+
+        client = SimpleNamespace(request=request, connected=True)
+        relay = SyncRelay(client, SimpleNamespace(
+            publish_runtime_notifications=AsyncMock(), sync_state_read=AsyncMock(return_value=None),
+            runtime_health_update=health_update), retry_delay=0.01)
+        if already_complete:
+            await relay.publish_notification({"method": "session.inventory.complete",
+                                              "params": {"scanToken": "s", "complete": True, "sessions": []}})
+            health.clear()
+        relay.start()
+        try:
+            await asyncio.wait_for(subscribed.wait(), 1)
+            # An out-of-order batch forces the feed to fail and resubscribe once.
+            relay.queue.put_nowait({"streamId": "stream-1", "batchSeq": 99, "projectionVersion": 3, "operations": [{}]})
+            await asyncio.wait_for(resubscribed.wait(), 2)
+        finally:
+            await relay.close()
+        starting = [code for status, code in health if status == "starting"]
+        if already_complete:
+            # Recalibrating history after the instance is usable must not pull
+            # it back into "starting" (the client would show "读取中" forever).
+            assert starting == []
+        else:
+            assert starting and starting[0] == "runtime_initializing"
+    asyncio.run(run())
+
+
+def test_baseline_progress_is_reported_only_until_the_first_inventory_completes():
+    async def run():
+        receiver = host()
+        relay = SyncRelay(Mock(), receiver)
+        relay.durable_checkpoints = True
+
+        def starting_details():
+            return [call.args[1] for call in receiver.runtime_health_update.await_args_list
+                    if call.args and call.args[0] == "starting"]
+
+        await relay.operation({"kind": "checkpoint.load", "externalSessionId": "native-1"})
+        assert any("已同步 1" in detail["message"] for detail in starting_details())
+        # Throttled: a second baseline inside the window must not spam health.
+        await relay.operation({"kind": "checkpoint.load", "externalSessionId": "native-2"})
+        assert len(starting_details()) == 1
+        await relay.publish_notification({"method": "session.inventory.complete",
+                                          "params": {"complete": True, "sessions": []}})
+        count = len(starting_details())
+        await relay.operation({"kind": "checkpoint.load", "externalSessionId": "native-3"})
+        assert len(starting_details()) == count
+    asyncio.run(run())

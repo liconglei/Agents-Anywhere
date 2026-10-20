@@ -541,6 +541,25 @@ class DshRuntime(AgentRuntime):
         if self._relay_restart_task is None or self._relay_restart_task.done():
             self._relay_restart_task = asyncio.create_task(self._restart_relay(relay), name="dsh-event-sync-restart")
 
+    async def _handle_notification(
+        self, method: str, params: Mapping[str, Any]
+    ) -> None:
+        # Additive 1.x notification support stays mechanical; never interpret native DSH events here.
+        if method == "runtime.capabilities.update":
+            await self.host.runtime_capabilities_update(
+                models.capability_set(params, connector_id=self.host.connector_id)
+            )
+        elif method == "timeline.item.upsert" and self.sync_mode != "events":
+            await self.host.timeline_item_upsert(
+                models.timeline_item(params.get("item", params))
+            )
+        elif method == "runtime.sync.batch" and self._sync is not None:
+            await self._sync.accept(params)
+        elif method == "runtime.error" and self._sync is not None:
+            data = params.get("data")
+            stream_id = data.get("streamId") if isinstance(data, dict) else None
+            self._sync.restart(stream_id if isinstance(stream_id, str) else None)
+
     async def _restart_relay(self, failed: SyncRelay) -> None:
         await asyncio.sleep(RELAY_RESTART_DELAY_SECONDS)
         async with self._connect_lock:

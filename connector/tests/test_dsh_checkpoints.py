@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from connector.runtime_protocol import (
-    RuntimeInstanceHost,
-    RuntimeInstanceSpec,
-    timeline_content_hash,
-)
+from connector.runtime_protocol import RuntimeInstanceHost, RuntimeInstanceSpec, timeline_content_hash
+from connector.runtimes.dsh.bridge.sync import SyncRelay
 from connector.server.runtime_host import ConnectorRuntimeHost
 from connector.server.sync_state import JsonSyncStateStore
-from tests.dsh_sync_helpers import ingest, ready_relay
+
 
 CHECKPOINT = {"version": 1, "projectionVersion": 2, "throughSeq": 12, "historyHash": "a" * 64, "settled": True}
 KEY = "dsh/sync/checkpoints/native"
@@ -38,10 +36,10 @@ def timeline_notice():
 def test_ingestion_precedes_checkpoint_and_ack_and_json_survives_restart(tmp_path, fail, projection_version):
     checkpoint = {**CHECKPOINT, "projectionVersion": projection_version}
     async def run():
-        entered, release = asyncio.Event(), asyncio.Event()
-        forwarded = []
+        entered, release, acked = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        forwarded, acks = [], []
 
-        async def ingest_notifications(notifications):
+        async def ingest(notifications):
             entered.set()
             await release.wait()
             if fail:
@@ -49,38 +47,50 @@ def test_ingestion_precedes_checkpoint_and_ack_and_json_survives_restart(tmp_pat
             forwarded.extend(notifications)
 
         path = tmp_path / "connector-state.json"
-        host, store = bound_host(path, ingest_notifications)
-        relay = ready_relay(host, projection=projection_version)
+        host, store = bound_host(path, ingest)
+
+        async def request(method, params=None):
+            if method == "runtime.sync.subscribe":
+                assert params == {"checkpointVersion": 1}
+                return {"streamId": "stream", "projectionVersion": projection_version, "checkpointVersion": 1}
+            acks.append(params)
+            acked.set()
+
+        relay = SyncRelay(SimpleNamespace(request=request), host)
+        task = asyncio.create_task(relay.consume())
         try:
-            batch = asyncio.create_task(ingest(relay, {"kind": "notifications", "notifications": [timeline_notice()]}))
+            await relay.accept({"streamId": "stream", "batchSeq": 1, "projectionVersion": projection_version, "operations": [
+                {"kind": "notifications", "notifications": [timeline_notice()]},
+                {"kind": "checkpoint.save", "externalSessionId": "native", "checkpoint": checkpoint},
+            ]})
             await asyncio.wait_for(entered.wait(), 1)
-            # The batch is not acknowledged before ingestion completes.
-            assert not batch.done()
             assert await host.sync_state_read(KEY) is None
             assert store.flush() is False
+            assert not acks
             release.set()
             if fail:
                 with pytest.raises(RuntimeError, match="ingestion rejected"):
-                    await batch
+                    await task
                 assert await host.sync_state_read(KEY) is None
-                assert store.flush() is False
+                assert not acks
                 return
-            await batch  # returning from ingest is the acknowledgement
+            await asyncio.wait_for(acked.wait(), 1)
             assert forwarded[0]["params"]["runtimeId"] == "rti_dsh"
-            # The plugin only saves the checkpoint once the batch was acknowledged.
-            await relay.save_checkpoint("native", checkpoint)
             assert await host.sync_state_read(KEY) == checkpoint
             # A crash before flush can only cause safe retransmission.
             cold_before_flush, _ = bound_host(path, AsyncMock())
             assert await cold_before_flush.sync_state_read(KEY) is None
             assert store.flush() is True
             cold, _ = bound_host(path, AsyncMock())
-            restarted = ready_relay(cold)
-            assert await restarted.load_checkpoint("native") == checkpoint
+            restarted = SyncRelay(SimpleNamespace(), cold)
+            restarted.durable_checkpoints = True
+            await restarted.operation({"kind": "checkpoint.load", "externalSessionId": "native"})
+            assert restarted.loaded_checkpoint == checkpoint
             other, _ = bound_host(path, AsyncMock(), runtime_id="rti_another_dsh")
             assert await other.sync_state_read(KEY) is None
         finally:
-            await relay.close()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
     asyncio.run(run())
 
 
@@ -89,24 +99,41 @@ def test_load_ack_returns_checkpoint_and_invalid_version_falls_back(tmp_path):
         host, store = bound_host(tmp_path / "connector-state.json", AsyncMock())
         await host.sync_state_write(KEY, CHECKPOINT)
         store.flush()
-        relay = ready_relay(host)
+        acknowledged = asyncio.Queue()
 
-        assert await relay.load_checkpoint("native") == CHECKPOINT
-        # Without durable checkpoints the stored value is never read.
-        assert await ready_relay(host, durable=False).load_checkpoint("native") is None
-        await host.sync_state_write(KEY, {**CHECKPOINT, "projectionVersion": 99})
-        assert await relay.load_checkpoint("native") is None
-        await relay.delete_checkpoint("native")
-        assert await host.sync_state_read(KEY) is None
+        async def request(method, params=None):
+            if method == "runtime.sync.subscribe":
+                return {"streamId": "s", "projectionVersion": 3, "checkpointVersion": 1}
+            await acknowledged.put(params)
+
+        relay = SyncRelay(SimpleNamespace(request=request), host)
+        task = asyncio.create_task(relay.consume())
+        try:
+            for seq, expected in [(1, CHECKPOINT), (2, None)]:
+                if seq == 2:
+                    await host.sync_state_write(KEY, {**CHECKPOINT, "projectionVersion": 99})
+                await relay.accept({"streamId": "s", "batchSeq": seq, "projectionVersion": 3,
+                    "operations": [{"kind": "checkpoint.load", "externalSessionId": "native"}]})
+                ack = await asyncio.wait_for(acknowledged.get(), 1)
+                assert ack["checkpoint"] == expected
+            relay.durable_checkpoints = True
+            await relay.operation({"kind": "checkpoint.delete", "externalSessionId": "native"})
+            assert await host.sync_state_read(KEY) is None
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
     asyncio.run(run())
 
 
-def test_invalid_checkpoint_cannot_be_saved(tmp_path):
+def test_partial_snapshot_cannot_commit_checkpoint(tmp_path):
     async def run():
         host, store = bound_host(tmp_path / "connector-state.json", AsyncMock())
-        relay = ready_relay(host)
-        with pytest.raises(ValueError, match="Invalid DSH checkpoint"):
-            await relay.save_checkpoint("native", {**CHECKPOINT, "projectionVersion": 99})
+        relay = SyncRelay(SimpleNamespace(), host)
+        relay.durable_checkpoints = True
+        await relay.operation({"kind": "snapshot.begin", "sessionId": "session", "snapshotId": "partial",
+                               "throughSeq": 12, "meta": {"externalSessionId": "native"}})
+        with pytest.raises(ValueError, match="committed sync boundary"):
+            await relay.operation({"kind": "checkpoint.save", "externalSessionId": "native", "checkpoint": CHECKPOINT})
         assert await host.sync_state_read(KEY) is None
         assert not store.flush()
         await relay.close()
