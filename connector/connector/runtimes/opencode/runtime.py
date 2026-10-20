@@ -243,6 +243,21 @@ def _session_directory(session: Mapping[str, Any]) -> str | None:
     return str(nested or session.get("directory") or "") or None
 
 
+def _option_labels(options: Any) -> list[str]:
+    """Normalize option entries to labels.
+
+    The SSE path delivers options as ``[{label: ...}]`` mappings while the form
+    poll already flattens them to plain strings; both must render, and calling
+    ``.get`` on a string used to raise and silently drop the whole card.
+    """
+
+    return [
+        str(option.get("label") or option) if isinstance(option, Mapping) else str(option)
+        for option in (options or ())
+        if isinstance(option, (Mapping, str)) and (option or option == 0)
+    ]
+
+
 def _form_to_question_props(form: Mapping[str, Any]) -> dict[str, Any]:
     """Project a V2 form into the question-notice props.
 
@@ -2334,7 +2349,10 @@ class OpenCodeRuntime(AgentRuntime):
                 await self._client.reply_permission(
                     native_id, permission_id, response, directory=directory
                 )
-            elif interaction_type == "question":
+            elif interaction_type in {"question", "input_request"}:
+                # ``input_request`` is what the question notices are published
+                # as (the Server's accepted kinds); ``question`` stays accepted
+                # for notices raised by older builds.
                 question_id = str(context.get("questionId") or "")
                 reply = str((input_data or {}).get("reply") or "").strip()
                 if not question_id:
@@ -2512,6 +2530,16 @@ class OpenCodeRuntime(AgentRuntime):
                 continue
             recovered.append(native_id)
         for native_id in recovered:
+            if await self._has_pending_interactions(native_id):
+                # The turn blocks on the user, not on serve. Reconciling it to
+                # idle here would remove it from the interaction poll's target
+                # set before the question card was ever raised.
+                logger.info(
+                    "opencode reconcile deferred: platform={} native={} waits on a pending interaction",
+                    self._platform_id(native_id),
+                    native_id,
+                )
+                continue
             platform_id = self._platform_id(native_id)
             if native_id in self._active_turns or native_id in self._recently_ended:
                 logger.info(
@@ -2557,11 +2585,44 @@ class OpenCodeRuntime(AgentRuntime):
                 continue
             if native_id not in targets and self._directory_for(native_id):
                 targets.append(native_id)
+        # A turn this process never started (native TUI, or a connector restart
+        # mid-turn) blocks on a pending question exactly like a tracked one; ask
+        # serve which sessions it considers busy so those requests surface too.
+        try:
+            status_map = await self._client.session_status_map()
+        except OpenCodeClientError as exc:
+            logger.debug("opencode interaction poll skipped the busy scan: {}", exc)
+            status_map = {}
+        for native_id, entry in status_map.items():
+            if (
+                isinstance(entry, dict)
+                and entry.get("type") == "busy"
+                and native_id not in targets
+                and native_id in self._native_to_platform
+            ):
+                targets.append(native_id)
         for native_id in targets:
             with suppress(OpenCodeClientError):
                 await self._sync_pending_permissions(native_id)
             with suppress(OpenCodeClientError):
                 await self._sync_pending_forms(native_id)
+
+    async def _has_pending_interactions(self, native_id: str) -> bool:
+        """True when serve still holds an unanswered permission or form for the session.
+
+        Used by the turn reconciler: a session waiting on the user must not be
+        reconciled to idle, or the interaction card would be raised too late (or
+        never) while the composer opens early. A failed probe is treated as
+        "nothing pending" so a dead serve cannot freeze the session in running.
+        """
+
+        directory = self._directory_for(native_id)
+        try:
+            if await self._client.list_pending_permissions(native_id, directory):
+                return True
+            return bool(await self._client.list_pending_forms(native_id, directory))
+        except OpenCodeClientError:
+            return False
 
     async def _sync_pending_permissions(self, native_id: str) -> None:
         platform_id = self._platform_id(native_id)
@@ -3466,6 +3527,20 @@ class OpenCodeRuntime(AgentRuntime):
             ),
             metadata={"source": "opencode.permission"},
         )
+        # Record only after the Server accepted the notice: a notice stored
+        # before a failed upload would be deduped by the poll forever and the
+        # approval card would never appear.
+        try:
+            await self.host.notice_upsert(notice)
+        except Exception as error:  # noqa: BLE001 - the next poll tick re-raises it
+            logger.warning(
+                "opencode permission notice upload failed: platform={} native={} perm={} error_type={}",
+                platform_id,
+                native_id,
+                permission_id,
+                type(error).__name__,
+            )
+            return
         self._notices.setdefault(platform_id, {})[notice_id] = notice
         logger.info(
             "opencode permission asked: platform={} native={} perm={} action={}",
@@ -3481,8 +3556,6 @@ class OpenCodeRuntime(AgentRuntime):
                 status="waiting_approval",
                 external_session_id=native_id,
             )
-        with suppress(Exception):
-            await self.host.notice_upsert(notice)
 
     async def _handle_permission_replied(
         self, platform_id: str, native_id: str, props: dict[str, Any]
@@ -3541,21 +3614,13 @@ class OpenCodeRuntime(AgentRuntime):
                 text = str(
                     first.get("question") or first.get("text") or first.get("prompt") or text
                 )
-                first_options = [
-                    str(option.get("label") or option)
-                    for option in (first.get("options") or ())
-                    if isinstance(option, (Mapping, str))
-                ]
+                first_options = _option_labels(first.get("options"))
             else:
                 text = str(first)
         if isinstance(questions, list):
             for question in questions:
                 if isinstance(question, Mapping):
-                    options.extend(
-                        str(option.get("label") or option)
-                        for option in (question.get("options") or ())
-                        if isinstance(option, (Mapping, str))
-                    )
+                    options.extend(_option_labels(question.get("options")))
         body = text
         if first_options:
             body = f"{text}\n可选回复: {' / '.join(first_options)}"
@@ -3568,7 +3633,9 @@ class OpenCodeRuntime(AgentRuntime):
             title="OpenCode 向你提问",
             message=body or None,
             severity="info",
-            interaction_type="question",
+            # The Server only accepts the shared interaction kinds; "question"
+            # would be rejected and the card would never reach the client.
+            interaction_type="input_request",
             blocking={"scope": "session", "targetId": platform_id},
             response_required=True,
             source={"questionId": question_id},
@@ -3582,6 +3649,20 @@ class OpenCodeRuntime(AgentRuntime):
             ),
             metadata={"source": "opencode.question"},
         )
+        # Record only after the Server accepted the notice: a notice stored
+        # before a failed upload would be deduped by the poll forever and the
+        # question card would never appear.
+        try:
+            await self.host.notice_upsert(notice)
+        except Exception as error:  # noqa: BLE001 - the next poll tick re-raises it
+            logger.warning(
+                "opencode question notice upload failed: platform={} native={} que={} error_type={}",
+                platform_id,
+                native_id,
+                question_id,
+                type(error).__name__,
+            )
+            return
         self._notices.setdefault(platform_id, {})[notice_id] = notice
         logger.info(
             "opencode question asked: platform={} native={} que={}",
@@ -3599,8 +3680,6 @@ class OpenCodeRuntime(AgentRuntime):
                 status="waiting_approval",
                 external_session_id=native_id,
             )
-        with suppress(Exception):
-            await self.host.notice_upsert(notice)
 
     async def _handle_question_closed(
         self, platform_id: str, props: dict[str, Any]
