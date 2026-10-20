@@ -240,6 +240,9 @@ class FakeClient:
         self.permission_replies: list[tuple[str, str, str, str | None]] = []
         self.question_replies: list[tuple[str, str, str, str | None]] = []
         self.question_rejects: list[tuple[str, str, str | None]] = []
+        # Pollable pending interaction lists keyed by native session id.
+        self.pending_permissions: dict[str, list[dict[str, Any]]] = {}
+        self.pending_forms: dict[str, list[dict[str, Any]]] = {}
 
     def set_credentials(self, api_user: str, api_key: str) -> None:
         if api_key:
@@ -363,6 +366,18 @@ class FakeClient:
 
     async def session_status_map(self, directory: str | None = None) -> dict[str, Any]:
         return self.status
+
+    async def list_pending_permissions(
+        self, session_id: str, directory: str | None = None
+    ) -> list[dict[str, Any]]:
+        # Default: nothing pending. Tests exercising the approval poll set
+        # ``pending_permissions`` for a session.
+        return list(self.pending_permissions.get(session_id, []))
+
+    async def list_pending_forms(
+        self, session_id: str, directory: str | None = None
+    ) -> list[dict[str, Any]]:
+        return list(self.pending_forms.get(session_id, []))
 
     async def reply_permission(
         self,
@@ -2851,9 +2866,11 @@ def test_question_notice_lists_options_and_blocks_the_turn() -> None:
         assert ("plat_1", "waiting_approval") in host.state_updates
 
         notices = await runtime.get_session_notices("plat_1", native_id)
-        notice = next(n for n in notices if n.interaction_type == "question")
+        notice = next(n for n in notices if n.interaction_type == "input_request")
         # The selectable options have to reach the user, otherwise the notice
         # only says "OpenCode 向你提问" and cannot be answered sensibly.
+        # "input_request" is the Server's accepted kind; a "question" literal
+        # would be rejected by the notice whitelist and never reach the client.
         assert "PostgreSQL" in (notice.message or "")
         assert "SQLite" in (notice.message or "")
         assert notice.context.get("options") == ["PostgreSQL", "SQLite"]
@@ -2881,7 +2898,7 @@ def test_question_dismiss_uses_the_reject_route() -> None:
         notice = next(
             n
             for n in await runtime.get_session_notices("plat_1", native_id)
-            if n.interaction_type == "question"
+            if n.interaction_type == "input_request"
         )
         result = await runtime.respond_interaction(
             "plat_1", notice.notice_id, "reply", {"reply": "cancel"}
@@ -2923,6 +2940,100 @@ def test_question_closed_by_opencode_resolves_the_notice() -> None:
         )
         assert await runtime.get_session_notices("plat_1", native_id) == ()
         assert host.notices[-1].status == "resolved"
+
+    asyncio.run(run())
+
+
+def test_question_notice_is_only_recorded_after_a_successful_upload() -> None:
+    """A rejected upload must not be deduped forever by ``_notices``.
+
+    The old order (record, then publish with errors suppressed) meant one
+    failed notice ingest left the question invisible for the rest of the
+    process lifetime: the poll saw the stored notice and skipped it, while the
+    Server never had the card to show.
+    """
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        await runtime.create_and_start_session("plat_1", "hi", cwd="/work")
+        native_id = next(iter(client.sessions))
+        props = _question_event(native_id)["properties"]
+
+        async def reject(notice: Any) -> None:
+            raise RuntimeError("notice rejected")
+
+        original_upsert = host.notice_upsert
+        host.notice_upsert = reject
+        await runtime._handle_question_asked("plat_1", native_id, props)
+        assert runtime._notices == {}
+        assert host.notices == []
+
+        host.notice_upsert = original_upsert
+        await runtime._handle_question_asked("plat_1", native_id, props)
+        assert len(host.notices) == 1
+        assert host.notices[0].interaction_type == "input_request"
+        assert len(await runtime.get_session_notices("plat_1", native_id)) == 1
+
+    asyncio.run(run())
+
+
+def test_interaction_poll_surfaces_questions_from_untracked_busy_sessions() -> None:
+    """Questions raised outside this process still reach the platform.
+
+    A turn started from the native TUI (or surviving a connector restart) is
+    not in ``_active_turns``, so the poll used to never probe it; the busy scan
+    over ``/session/status`` is what closes that gap.
+    """
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        await runtime.create_and_start_session("plat_1", "hi", cwd="/work")
+        native_id = next(iter(client.sessions))
+        runtime._active_turns.discard(native_id)
+        client.status[native_id] = {"type": "busy"}
+        client.pending_forms[native_id] = [
+            {
+                "id": "frm_1",
+                "title": "Which database should I use?",
+                "fields": [{"key": "db", "title": "Pick one", "options": [{"label": "PostgreSQL"}]}],
+            }
+        ]
+        await runtime._poll_pending_interactions()
+        notices = await runtime.get_session_notices("plat_1", native_id)
+        assert len(notices) == 1
+        assert notices[0].interaction_type == "input_request"
+        assert notices[0].context["questionId"] == "frm_1"
+
+    asyncio.run(run())
+
+
+def test_reconcile_keeps_the_turn_while_an_interaction_is_pending() -> None:
+    """A session waiting on the user is not reconciled away.
+
+    serve drops a blocked session from the active map; finishing the turn then
+    would remove the session from the poll's target set before the question
+    card was ever raised, and open the composer early.
+    """
+    client, host = FakeClient(), FakeHost()
+    runtime = _make_runtime(client, host)
+
+    async def run() -> None:
+        result = await runtime.create_and_start_session("plat_r", "hi", selections=None)
+        native = result.result["externalSessionId"]
+        assert native in runtime._active_turns
+        del client.status[native]
+        client.pending_forms[native] = [{"id": "frm_1", "title": "Choose", "fields": []}]
+        await runtime._reconcile_active_turns()
+        assert native in runtime._active_turns
+        assert ("plat_r", "completed") not in host.turn_ended
+
+        # once the form is answered, the ordinary recovery path resumes
+        client.pending_forms.pop(native)
+        await runtime._reconcile_active_turns()
+        assert native not in runtime._active_turns
+        assert ("plat_r", "completed") in host.turn_ended
 
     asyncio.run(run())
 
