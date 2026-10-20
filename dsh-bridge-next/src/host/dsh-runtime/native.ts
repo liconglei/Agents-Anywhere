@@ -10,6 +10,7 @@ import { realpath, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, join } from 'node:path'
 import { canonicalJson, digest, userMessageId } from './identity.js'
 import { BridgeError, CreationNotStartedError } from './errors.js'
+import type { SessionProjection } from './history.js'
 import { ClientPresence } from './visibility.js'
 import { NativeSessionSource } from './sessions/source.js'
 import { record } from './types.js'
@@ -36,6 +37,15 @@ export type NativeChange = { type: 'stream', id: string, turn: number, step: num
 export interface NativeWorkspace { id: string, title: string, path: string, sessionIds: string[] }
 
 export const MAX_RETAINED_FACTS = 128
+
+/** A successfully published baseline, reusable when a resubscription finds the
+ * native log unchanged and the Connector's checkpoint still matches it. */
+export interface SyncBaseline {
+  revision: string
+  projection: SessionProjection
+  meta: Record<string, unknown>
+  turn: { active: boolean, endedKind: string | undefined, endedAt: number | undefined }
+}
 
 /** Configuration facts a session state read needs, without retaining the event log. */
 export interface SessionFacts {
@@ -77,6 +87,8 @@ export class NativeRuntime {
   private creations: CreationIntents
   readonly attachments: RuntimeAttachments
   private readonly facts = new Map<string, { revision: string, value: SessionFacts }>()
+  /** Published baselines a SyncFeed resubscription can reuse when nothing changed. */
+  readonly syncBaselines = new Map<string, SyncBaseline>()
 
   constructor(readonly ctx: Context, creationDirectory: string,
     readonly diagnostics = new RuntimeDiagnostics(),
