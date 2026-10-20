@@ -197,6 +197,9 @@ def test_old_bridge_remains_unavailable_with_upgrade_reason_and_no_command_rpc(t
     asyncio.run(run())
     assert not dsh_capabilities({"capabilities": []})["commands"]
     assert dsh_capabilities({"capabilities": [{"capabilityId": "session.commands", "supported": True, "available": True, "allowed": True}]})["commands"]
+    assert dsh_capabilities({"capabilities": []})["sessionNotices"] is True
+    assert not dsh_capabilities({"capabilities": []})["interactions"]
+    assert dsh_capabilities({"capabilities": [{"capabilityId": "session.interaction.approval", "supported": True, "available": True, "allowed": True}]})["interactions"]
 
 
 def test_public_native_error_is_not_success(tmp_path: Path) -> None:
