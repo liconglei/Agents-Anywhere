@@ -26,7 +26,8 @@ def item(item_id="one", session_id="session"):
 
 
 def host():
-    return SimpleNamespace(publish_runtime_notifications=AsyncMock(), sync_state_write=AsyncMock(), runtime_health_update=AsyncMock())
+    return SimpleNamespace(publish_runtime_notifications=AsyncMock(), sync_state_write=AsyncMock(),
+                           sync_state_read=AsyncMock(return_value=None), runtime_health_update=AsyncMock())
 
 
 def operation(kind, **values):
@@ -110,18 +111,18 @@ def test_relay_failure_resubscribes_without_closing_concurrent_rpc(reject, proje
         try:
             op = {"kind": "notifications", "notifications": [{"method": "session.state.updated", "params": {"sessionId": "session", "status": "idle"}}]}
             await asyncio.sleep(0)
-            relay.accept({"streamId": "stream-1", "batchSeq": 1, "projectionVersion": projection_version, "operations": [op]})
+            await relay.accept({"streamId": "stream-1", "batchSeq": 1, "projectionVersion": projection_version, "operations": [op]})
             await asyncio.wait_for(entered.wait(), 1)
             assert not acks
             release.set()
             if not reject:
                 await asyncio.wait_for(acknowledged.wait(), 1)
-                relay.accept({"streamId": "stream-1", "batchSeq": 3, "projectionVersion": projection_version, "operations": [op]})
+                await relay.accept({"streamId": "stream-1", "batchSeq": 3, "projectionVersion": projection_version, "operations": [op]})
             await asyncio.wait_for(resubscribed.wait(), 1)
             assert acks == ([] if reject else [1])
             acknowledged.clear()
             relay.restart("stream-1")  # A delayed old error cannot stop the new feed.
-            relay.accept({"streamId": "stream-2", "batchSeq": 1, "projectionVersion": projection_version, "operations": [op]})
+            await relay.accept({"streamId": "stream-2", "batchSeq": 1, "projectionVersion": projection_version, "operations": [op]})
             await asyncio.wait_for(acknowledged.wait(), 1)
             assert acks == ([1] if reject else [1, 1])
             client.writer.close.assert_not_called()
@@ -298,4 +299,95 @@ def test_inventory_does_not_report_healthy_while_delivery_is_pending_or_incomple
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             await relay.close()
+    asyncio.run(run())
+
+
+def test_accept_waits_for_capacity_and_restarts_only_after_the_timeout():
+    async def run():
+        relay = SyncRelay(Mock(), host(), retry_delay=0.01)
+        relay.accept_timeout = 0.05
+        try:
+            await relay.accept({"streamId": "stream", "batchSeq": 1})
+            await relay.accept({"streamId": "stream", "batchSeq": 2})
+            assert relay.queue.full()
+            # A third batch has to wait for the consumer; when nothing drains in
+            # time the feed is restarted instead of silently dropping the stream.
+            await relay.accept({"streamId": "stream", "batchSeq": 3})
+            drained = []
+            while not relay.queue.empty():
+                drained.append(relay.queue.get_nowait())
+            assert drained == [None]
+        finally:
+            await relay.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("already_complete", [False, True])
+def test_resubscription_reports_starting_only_until_the_first_inventory(already_complete):
+    async def run():
+        subscriptions = 0
+        subscribed, resubscribed = asyncio.Event(), asyncio.Event()
+
+        async def request(method, params=None):
+            nonlocal subscriptions
+            if method == "runtime.sync.subscribe":
+                subscriptions += 1
+                if subscriptions == 1:
+                    subscribed.set()
+                else:
+                    resubscribed.set()
+                return {"streamId": f"stream-{subscriptions}", "projectionVersion": 3, "checkpointVersion": 1}
+            return {}
+
+        health = []
+
+        async def health_update(status, detail=None):
+            health.append((status, (detail or {}).get("code")))
+
+        client = SimpleNamespace(request=request, connected=True)
+        relay = SyncRelay(client, SimpleNamespace(
+            publish_runtime_notifications=AsyncMock(), sync_state_read=AsyncMock(return_value=None),
+            runtime_health_update=health_update), retry_delay=0.01)
+        if already_complete:
+            await relay.publish_notification({"method": "session.inventory.complete",
+                                              "params": {"scanToken": "s", "complete": True, "sessions": []}})
+            health.clear()
+        relay.start()
+        try:
+            await asyncio.wait_for(subscribed.wait(), 1)
+            # An out-of-order batch forces the feed to fail and resubscribe once.
+            relay.queue.put_nowait({"streamId": "stream-1", "batchSeq": 99, "projectionVersion": 3, "operations": [{}]})
+            await asyncio.wait_for(resubscribed.wait(), 2)
+        finally:
+            await relay.close()
+        starting = [code for status, code in health if status == "starting"]
+        if already_complete:
+            # Recalibrating history after the instance is usable must not pull
+            # it back into "starting" (the client would show "读取中" forever).
+            assert starting == []
+        else:
+            assert starting and starting[0] == "runtime_initializing"
+    asyncio.run(run())
+
+
+def test_baseline_progress_is_reported_only_until_the_first_inventory_completes():
+    async def run():
+        receiver = host()
+        relay = SyncRelay(Mock(), receiver)
+        relay.durable_checkpoints = True
+
+        def starting_details():
+            return [call.args[1] for call in receiver.runtime_health_update.await_args_list
+                    if call.args and call.args[0] == "starting"]
+
+        await relay.operation({"kind": "checkpoint.load", "externalSessionId": "native-1"})
+        assert any("已同步 1" in detail["message"] for detail in starting_details())
+        # Throttled: a second baseline inside the window must not spam health.
+        await relay.operation({"kind": "checkpoint.load", "externalSessionId": "native-2"})
+        assert len(starting_details()) == 1
+        await relay.publish_notification({"method": "session.inventory.complete",
+                                          "params": {"complete": True, "sessions": []}})
+        count = len(starting_details())
+        await relay.operation({"kind": "checkpoint.load", "externalSessionId": "native-3"})
+        assert len(starting_details()) == count
     asyncio.run(run())

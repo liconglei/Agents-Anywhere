@@ -537,7 +537,7 @@ class DshRuntime(AgentRuntime):
                 models.timeline_item(params.get("item", params))
             )
         elif method == "runtime.sync.batch" and self._sync is not None:
-            self._sync.accept(params)
+            await self._sync.accept(params)
         elif method == "runtime.error" and self._sync is not None:
             data = params.get("data")
             stream_id = data.get("streamId") if isinstance(data, dict) else None

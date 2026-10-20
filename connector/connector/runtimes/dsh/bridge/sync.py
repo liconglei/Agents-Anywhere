@@ -4,6 +4,7 @@ import asyncio
 import pickle
 import sys
 import tempfile
+import time
 from collections.abc import Mapping
 from contextlib import ExitStack
 from typing import Any
@@ -52,11 +53,13 @@ class SyncRelay:
     Transport page ACKs alone never advance the Connector's persisted state.
     """
 
-    def __init__(self, client: BridgeClient, host: RuntimeHostClient, *, retry_delay: float = 1.0) -> None:
+    def __init__(self, client: BridgeClient, host: RuntimeHostClient, *, retry_delay: float = 1.0,
+                 accept_timeout: float = 30.0) -> None:
         self.client, self.host = client, host
         self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=2)
         self.stream_id: str | None = None
         self.retry_delay = retry_delay
+        self.accept_timeout = accept_timeout
         self.task: asyncio.Task[None] | None = None
         self.snapshot: dict[str, Any] | None = None
         self.file = None
@@ -66,14 +69,30 @@ class SyncRelay:
         self.item_ids: set[str] = set()
         self.durable_checkpoints = False
         self.loaded_checkpoint: dict[str, Any] | None = None
+        # First inventory latched running: resubscriptions after it must not pull
+        # the instance back into "starting" while history is recalibrated.
+        self._inventory_complete = False
+        self._baselines = 0
+        self._last_progress_at = 0.0
+        self._retry_attempt = 0
 
     def start(self) -> None:
         self.task = asyncio.create_task(self.run(), name="dsh-event-sync")
 
-    def accept(self, payload: Mapping[str, Any]) -> None:
+    async def accept(self, payload: Mapping[str, Any]) -> None:
+        # The feed ACKs each batch only after ingesting it, so a momentarily full
+        # queue is an ingest backlog, not a dead peer. Wait for capacity first;
+        # only a queue that stays blocked forces the resubscription.
+        batch = dict(payload)
         try:
-            self.queue.put_nowait(dict(payload))
+            self.queue.put_nowait(batch)
+            return
         except asyncio.QueueFull:
+            pass
+        try:
+            await asyncio.wait_for(self.queue.put(batch), self.accept_timeout)
+        except TimeoutError:
+            logger.warning("DSH sync batches stayed queued for {}s; resubscribing", self.accept_timeout)
             self.restart()
 
     def restart(self, stream_id: str | None = None) -> None:
@@ -107,6 +126,10 @@ class SyncRelay:
             key = f"dsh/sync/checkpoints/{external_id}"
             if kind == "checkpoint.load":
                 self.loaded_checkpoint = _checkpoint(await self.host.sync_state_read(key))
+                # Every durable-mode baseline begins with its checkpoint load,
+                # restored or republished; it is the one reliable progress count.
+                self._baselines += 1
+                await self._publish_progress_health()
             elif kind == "checkpoint.delete":
                 await self.host.sync_state_delete(key)
             else:
@@ -142,6 +165,11 @@ class SyncRelay:
                         "externalSessionId": meta["externalSessionId"], "items": items, "complete": True}},
                 ])
                 self.clear_snapshot()
+                if not self.durable_checkpoints:
+                    # Without checkpoints the committed capture is the only
+                    # observable baseline completion for the progress report.
+                    self._baselines += 1
+                    await self._publish_progress_health()
             else:
                 self.clear_snapshot()
         elif kind == "notifications":
@@ -172,8 +200,12 @@ class SyncRelay:
         if not notifications:
             return
         await self.host.publish_runtime_notifications("dsh", notifications)
-        if any(n["method"] == "session.inventory.complete" and n["params"].get("complete") is True for n in notifications):
-            await self.host.runtime_health_update("running")
+        for notice in notifications:
+            if notice["method"] == "session.inventory.begin":
+                self._baselines = 0
+            elif notice["method"] == "session.inventory.complete" and notice["params"].get("complete") is True:
+                self._inventory_complete = True
+                await self.host.runtime_health_update("running")
 
     async def store_items(self, items: list[dict[str, Any]]) -> None:
         self.item_bytes += object_bytes(items)
@@ -261,10 +293,26 @@ class SyncRelay:
             await self.host.permission_catalog_update(permission_catalog(params))
         elif method in {"session.inventory.begin", "session.inventory.complete"}:
             await self.host.publish_runtime_notifications("dsh", [notice])
-            if method == "session.inventory.complete" and params.get("complete") is True:
+            if method == "session.inventory.begin":
+                self._baselines = 0
+            elif params.get("complete") is True:
+                self._inventory_complete = True
                 await self.host.runtime_health_update("running")
         else:
             raise ValueError(f"Unsupported runtime notification: {method}")
+
+    async def _publish_progress_health(self) -> None:
+        if self._inventory_complete:
+            return
+        now = time.monotonic()
+        if now - self._last_progress_at < 1.0:
+            return
+        self._last_progress_at = now
+        await self.host.runtime_health_update("starting", {
+            "code": "runtime_initializing",
+            "message": f"正在同步 DSH 会话…（已同步 {self._baselines} 个会话）",
+            "retryable": True,
+        })
 
     async def run(self) -> None:
         try:
@@ -275,13 +323,17 @@ class SyncRelay:
                     raise
                 except Exception as error:  # noqa: BLE001 - isolate and recover a failed feed
                     logger.warning("DSH event sync interrupted; resubscribing for history calibration ({})", type(error).__name__)
-                    await self.host.runtime_health_update("starting", {
-                        "code": "runtime_sync_interrupted", "message": "DSH 会话同步中断，正在重试…", "retryable": True,
-                    })
+                    # After the first inventory the instance is already usable:
+                    # recalibrating history must not flip it back to "starting".
+                    if not self._inventory_complete:
+                        await self.host.runtime_health_update("starting", {
+                            "code": "runtime_sync_interrupted", "message": "DSH 会话同步中断，正在重试…", "retryable": True,
+                        })
                     if not self.client.connected:
                         return
                     self.clear_snapshot()
-                    await asyncio.sleep(self.retry_delay)
+                    await asyncio.sleep(min(self.retry_delay * 2**self._retry_attempt, 30.0))
+                    self._retry_attempt += 1
                     while not self.queue.empty():
                         self.queue.get_nowait()
         finally:
@@ -291,9 +343,10 @@ class SyncRelay:
         # Subscription replaces only this feed. Concurrent RPC requests keep
         # their connection and are never cancelled by an ingest/sync failure.
         try:
-            await self.host.runtime_health_update("starting", {
-                "code": "runtime_initializing", "message": "正在同步 DSH 会话…", "retryable": True,
-            })
+            if not self._inventory_complete:
+                await self.host.runtime_health_update("starting", {
+                    "code": "runtime_initializing", "message": "正在同步 DSH 会话…", "retryable": True,
+                })
             subscription = await self.client.request("runtime.sync.subscribe", {"checkpointVersion": 1})
             projection_version = subscription.get("projectionVersion")
             if projection_version not in (2, 3):
@@ -319,6 +372,9 @@ class SyncRelay:
                     ack["checkpoint"] = self.loaded_checkpoint
                 await self.client.request("runtime.sync.ack", ack)
                 expected += 1
+                # A delivered batch proves the resubscribe loop is making
+                # progress; the next interruption may retry fast again.
+                self._retry_attempt = 0
         finally:
             self.clear_snapshot()
 

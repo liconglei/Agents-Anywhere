@@ -37,7 +37,7 @@ def item_notification(text="streaming text"):
         "sessionId": "session", "runtime": "foreign", "runtimeId": "foreign", "item": item}}
 
 
-def start_relay(host, notifications):
+async def start_relay(host, notifications):
     acknowledged = asyncio.Event()
     acks = []
 
@@ -51,7 +51,7 @@ def start_relay(host, notifications):
     bridge = SimpleNamespace(request=request, writer=Mock())
     relay = SyncRelay(bridge, host)
     relay.start()
-    relay.accept({"streamId": "stream", "batchSeq": 1, "projectionVersion": 2,
+    await relay.accept({"streamId": "stream", "batchSeq": 1, "projectionVersion": 2,
         "operations": [{"kind": "notifications", "notifications": notifications}]})
     return relay, acknowledged, acks
 
@@ -73,7 +73,7 @@ def test_live_batch_uses_websocket_in_order_and_waits_for_send_before_ack(tmp_pa
             item_notification(),
             {"method": "session.state.updated", "params": {"sessionId": "session", "status": "running"}},
         ]
-        relay, acknowledged, acks = start_relay(host, notices)
+        relay, acknowledged, acks = await start_relay(host, notices)
         try:
             await asyncio.wait_for(entered.wait(), 1)
             assert acks == []
@@ -110,7 +110,7 @@ def test_live_events_reuse_the_existing_http_fallback_queue(tmp_path, transport)
 
         client._ingest.enqueue.side_effect = enqueue
         notice = item_notification("x" * CONNECTOR_WS_MAX_NOTIFICATION_BYTES if transport == "oversized" else "text")
-        relay, acknowledged, acks = start_relay(host, [notice,
+        relay, acknowledged, acks = await start_relay(host, [notice,
             {"method": "session.state.updated", "params": {"sessionId": "session", "status": "running"}},
         ])
         try:

@@ -59,7 +59,7 @@ def test_ingestion_precedes_checkpoint_and_ack_and_json_survives_restart(tmp_pat
         relay = SyncRelay(SimpleNamespace(request=request), host)
         task = asyncio.create_task(relay.consume())
         try:
-            relay.accept({"streamId": "stream", "batchSeq": 1, "projectionVersion": projection_version, "operations": [
+            await relay.accept({"streamId": "stream", "batchSeq": 1, "projectionVersion": projection_version, "operations": [
                 {"kind": "notifications", "notifications": [timeline_notice()]},
                 {"kind": "checkpoint.save", "externalSessionId": "native", "checkpoint": checkpoint},
             ]})
@@ -112,7 +112,7 @@ def test_load_ack_returns_checkpoint_and_invalid_version_falls_back(tmp_path):
             for seq, expected in [(1, CHECKPOINT), (2, None)]:
                 if seq == 2:
                     await host.sync_state_write(KEY, {**CHECKPOINT, "projectionVersion": 99})
-                relay.accept({"streamId": "s", "batchSeq": seq, "projectionVersion": 3,
+                await relay.accept({"streamId": "s", "batchSeq": seq, "projectionVersion": 3,
                     "operations": [{"kind": "checkpoint.load", "externalSessionId": "native"}]})
                 ack = await asyncio.wait_for(acknowledged.get(), 1)
                 assert ack["checkpoint"] == expected
