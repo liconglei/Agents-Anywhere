@@ -31,7 +31,7 @@ export function openInteractionEvents(wireStream: Context['typertGateway']['wire
   } else {
     throw new Error('Unsupported DSH interaction stream signature.')
   }
-  return Reflect.apply(open, wireStream, args)
+  return Reflect.apply(open, wireStream, args) as Promise<AsyncIterable<unknown>>
 }
 
 /** A local consumer of the official Remote stream, not a replacement answer provider. */
