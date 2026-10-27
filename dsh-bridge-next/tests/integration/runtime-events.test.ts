@@ -834,31 +834,28 @@ test('history-bearing batches keep their ACK budget beyond the liveness timeout'
   const fixture = await nativeRuntime(home)
   const native = fixture.ctx.agentsAnywhereRuntime.native
   const batches: SyncBatch[] = [], errors: unknown[] = []
-  const held = new Map<number, { batch: SyncBatch, resolve: () => void }>()
-  let holding = false
-  const feed = new SyncFeed(native, 'test', randomUUID(), {
-    async ingestBatch(batch, _signal) {
-      batches.push(batch)
-      if (holding && batch.operations.some(op => op.kind === 'checkpoint.save')) {
-        await new Promise<void>(resolve => { held.set(batch.batchSeq, { batch, resolve }) })
-      }
-    },
+  const heldSnapshots = new Map<string, { resolve: () => void }>()
+  let holdingSnapshot = false
+  const transport: SyncTransport = {
+    async ingestBatch(batch) { batches.push(batch) },
     async loadCheckpoint() { return null },
     async saveCheckpoint() { },
     async deleteCheckpoint() { },
-    async ingestSnapshot() { return { accepted: true } as SnapshotResult },
-  }, error => errors.push(error), true, 120, 30_000)
+    async ingestSnapshot(request) { if (holdingSnapshot) { await new Promise<void>(resolve => { heldSnapshots.set(String(request.sessionId), { resolve }) }); } return { accepted: true } as SnapshotResult },
+  }
+  const feed = new SyncFeed(native, 'test', randomUUID(), transport, error => errors.push(error), true, 120, 30_000)
   const notes = () => notifications(batches.flatMap(b => b.operations))
   try {
+    holdingSnapshot = true
     feed.start()
-    await until(() => notes().some(n => n.method === 'session.inventory.complete'), 'baseline with ordinary acks')
-    holding = true
-    fixture.session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'checkpoint save is heavy' }] }), { surfaceOp: 'append' })
-    await until(() => held.size > 0, 'a checkpoint.save batch is held')
+    await until(() => heldSnapshots.size > 0, 'the history-bearing snapshot is held')
     await delay(400)
-    assert.deepEqual(errors, [], 'the heavy batch must survive well past the light ACK timeout')
-    for (const entry of held.values()) entry.resolve()
-    held.clear()
+    assert.deepEqual(errors, [], 'the heavy snapshot must survive well past the light ACK timeout')
+    for (const entry of heldSnapshots.values()) entry.resolve()
+    heldSnapshots.clear()
+    holdingSnapshot = false
+    await until(() => notes().some(n => n.method === 'session.inventory.complete'), 'baseline completes after the heavy acknowledgement')
+    fixture.session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'checkpoint save is heavy' }] }), { surfaceOp: 'append' })
     await until(() => notes().some(n => n.method === 'timeline.itemUpsert' && JSON.stringify(n.params.item).includes('checkpoint save is heavy')), 'the feed continues after the heavy acknowledgement')
     assert.deepEqual(errors, [])
   } finally { feed.close(); await fixture.ctx.fiber.dispose(); await rm(home, { recursive: true, force: true }) }
