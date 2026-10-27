@@ -79,6 +79,7 @@ export interface ConnectorProcess {
   readonly lastError?: string | null
   readonly logsPath?: string | null
   onState(listener: (state: ConnectorState) => void): () => void
+  onUnexpectedStop?(listener: () => void): () => void
   prepare(settings?: ConnectorSettings): Promise<void>
   start(binding: BoundDevice, apiBaseUrl: string, signal: AbortSignal): Promise<void>
   stop(): Promise<void>
@@ -123,6 +124,8 @@ export class SourceConnector implements ConnectorProcess {
   private state: ConnectorState = { running: false, authFailed: false }
   private listeners = new Set<(state: ConnectorState) => void>()
   private readonly closed = new WeakSet<ChildProcessWithoutNullStreams>()
+  private unexpectedStop = new Set<() => void>()
+  private pending = new Map<string, { timer: ReturnType<typeof setTimeout>; resolve: () => void; reject: (error: Error) => void }>()
   private readonly logs: ConnectorLogs
   private readonly logOutput: RpcLogOutput
   private readonly diagnostics: RuntimeDiagnostics

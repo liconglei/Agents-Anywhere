@@ -147,6 +147,8 @@ export class OnboardingManager {
   get logsPath(): string | null { return this.connector.logsPath ?? null }
   get pluginLogOutput(): RpcLogOutput { return this.logOutput }
 
+  hasRuntimeLogs(): boolean { return this.connector.hasRuntimeLogs?.() ?? false }
+
   async readRuntimeLogs(query?: RuntimeLogQuery): Promise<RuntimeLogPage> {
     if (this.connector.readRuntimeLogs && this.connector.hasRuntimeLogs?.()) {
       return this.connector.readRuntimeLogs(query)
@@ -636,6 +638,13 @@ export class OnboardingManager {
     })
     this.resumeTask = task
     return task
+  }
+
+  private cancelReconnect(): void {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
+    this.reconnectTask = null
+    this.reconnectAttempts = 0
   }
 
   private cancelResume(): void {

@@ -13,10 +13,8 @@ export type InteractionOutcome = { kind: 'next' } | { kind: 'result', value: unk
   | { kind: 'rejected', error: { name: string, code: string, message: string } }
 
 /** Connection renamed its local owner from operator to browserPeer in 0.2.1. */
-export function interactionPeer(connection: { readonly operator?: PeerScope, readonly browserPeer?: PeerScope }): PeerScope {
-  const peer = connection.browserPeer ?? connection.operator
-  if (!peer) throw new Error('DSH Connection does not provide a local owner Peer.')
-  return peer
+export function interactionPeer(connection: { readonly operator?: PeerScope, readonly browserPeer?: PeerScope }): PeerScope | undefined {
+  return connection.browserPeer ?? connection.operator
 }
 
 /** Older Gateways omit uplink and peer; current ones require an explicit owner. */

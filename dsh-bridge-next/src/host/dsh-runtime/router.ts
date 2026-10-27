@@ -10,8 +10,8 @@ import { parseSelections } from './selections.js'
 import { projectHistoryAsync } from './history.js'
 import { sessionId, nativeSessionId } from './identity.js'
 import type { NativeRuntime } from './native.js'
-import { lastTurnEndKind, turnPhase } from './native.js'
-import { SyncFeed, type SyncTransport, type SyncBatch } from './sync.js'
+import { turnPhase } from './native.js'
+import { SyncFeed, type SyncTransport } from './sync.js'
 import type { TimelineItem } from './types.js'
 
 export interface SessionReader {

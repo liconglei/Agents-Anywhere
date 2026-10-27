@@ -37,7 +37,6 @@ test('repeated connection failures do not publish unchanged capabilities; recove
     assert.equal(stream.available, false)
     assert.equal(changes, 2, 'a real loss of capability is still published')
   } finally { await stream.close(); await ctx.fiber.dispose() }
-  }
 })
 
 function ownerPeer(id: string) {
