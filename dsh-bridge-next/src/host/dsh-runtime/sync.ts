@@ -316,6 +316,17 @@ export class SyncFeed {
         this.failedSessions.set(id, { availability: 'unavailable', reason: (result.reason ?? 'sync_failed') as string, observedAt: new Date().toISOString() })
         this.native.diagnostics.log('warn', 'snapshot.quarantined', { streamId: this.id, sessionId: id, reason: result.reason ?? undefined })
       }
+      this.failedSessions.delete(id)
+      projection.drain()
+      this.projections.set(id, projection)
+      this.checkpointDirty.add(id)
+      this.published.set(id, platformId)
+      this.sourceAvailability.set(id, 'available')
+      if (revision !== undefined) this.native.syncBaselines.set(id, { revision, projection, meta, turn })
+      await this.notices(id)
+      await this.state(id, log)
+      await this.turnEnded(id, log.events)
+      this.native.diagnostics.log('info', 'snapshot.completed', { streamId: this.id, sessionId: id, items: snapshotItems.length, elapsedMs: Math.round(performance.now() - start) })
     } finally {
       this.native.source.release(id)
     }
