@@ -88,11 +88,13 @@ test('startup invalidation bursts stay bounded and state reads and messaging rem
       'startup state changes and inventory completion share a bounded transport batch')
     const params = { sessionId: sessionId('test', 'persisted-only'), externalSessionId: 'persisted-only' }
     assert.equal((await request('getSessionState', params) as { status: string }).status, 'idle')
+    const sentAt = new Date().toISOString()
     const sent = await request('startTurn', { ...params, content: '继续对话', clientMessageId: 'startup-send' })
     assert.equal((sent as { accepted: boolean }).accepted, true, JSON.stringify(sent))
     await until(() => !!adapter.release, 'message reaches the official Agent loop')
     adapter.release!()
-    await until(() => notes().some(n => n.method === 'session.turnEnded'), 'reply and turn completion reach the sync feed')
+    await until(() => delivered(stream, '你好'), 'reply reaches the sync feed')
+    await until(() => notes().some(n => n.method === 'session.turnEnded' && String(n.params.sourceObservedAt) > sentAt), 'reply and turn completion reach the sync feed')
     // A live projection can recalibrate with a capture (for example when DSH
     // appends a session marker only at restore time); either path delivers the reply.
     assert.ok(JSON.stringify([notes(), stream.captures]).includes('你好'))
