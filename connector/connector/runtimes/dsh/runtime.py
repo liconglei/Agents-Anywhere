@@ -553,12 +553,6 @@ class DshRuntime(AgentRuntime):
             await self.host.timeline_item_upsert(
                 models.timeline_item(params.get("item", params))
             )
-        elif method == "runtime.sync.batch" and self._sync is not None:
-            await self._sync.accept(params)
-        elif method == "runtime.error" and self._sync is not None:
-            data = params.get("data")
-            stream_id = data.get("streamId") if isinstance(data, dict) else None
-            self._sync.restart(stream_id if isinstance(stream_id, str) else None)
 
     async def _restart_relay(self, failed: SyncRelay) -> None:
         await asyncio.sleep(RELAY_RESTART_DELAY_SECONDS)

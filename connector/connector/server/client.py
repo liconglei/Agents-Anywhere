@@ -455,7 +455,7 @@ class BackendRpcClient:
             # it instead: the runtime can mark the item failed and tell the user.
             logger.opt(lazy=True).exception(
                 "timeline notification undeliverable on every channel method={}",
-                method,
+                lambda: method,
             )
             raise
 

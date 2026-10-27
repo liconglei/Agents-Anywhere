@@ -305,11 +305,11 @@ class ConnectorRpcChannel:
                 logger.opt(lazy=True).warning(
                     "connector websocket frame too large before send type={} method={} "
                     "request_id={} bytes={} max_bytes={}; content trimmed to fit",
-                    frame_type,
-                    method,
-                    request_id,
-                    encoded_bytes,
-                    max_frame_bytes,
+                    lambda: frame_type,
+                    lambda: method,
+                    lambda: request_id,
+                    lambda: encoded_bytes,
+                    lambda: max_frame_bytes,
                 )
                 payload = bounded
                 encoded = json.dumps(payload, ensure_ascii=False)

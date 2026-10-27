@@ -3,11 +3,15 @@ import os
 import pytest
 
 from connector.core import runtime_owner
+from connector.paths import DATA_DIR_ENV
 
 
 @pytest.fixture(autouse=True)
 def isolated_runtime_home(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime_owner, "system_home", lambda: tmp_path / "runtime-home")
+    # Keep tests off the user's real ~/.agents-anywhere: a live Connector holds
+    # that directory, and its chmod then fails outright on Windows.
+    monkeypatch.setenv(DATA_DIR_ENV, str(tmp_path / "connector-data"))
     # In-process controller fixtures run inside pytest, not a Connector CLI.
     # Real subprocess tests exercise the unmodified process identification.
     inspect_pid = runtime_owner._pid_alive
