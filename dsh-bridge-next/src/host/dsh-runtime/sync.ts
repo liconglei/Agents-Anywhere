@@ -315,6 +315,7 @@ export class SyncFeed {
         // Permanently refused: the Connector already published the session as unavailable.
         this.failedSessions.set(id, { availability: 'unavailable', reason: (result.reason ?? 'sync_failed') as string, observedAt: new Date().toISOString() })
         this.native.diagnostics.log('warn', 'snapshot.quarantined', { streamId: this.id, sessionId: id, reason: result.reason ?? undefined })
+        return
       }
       this.failedSessions.delete(id)
       projection.drain()
