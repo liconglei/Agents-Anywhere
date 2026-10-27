@@ -50,7 +50,10 @@ class FakeConnector implements ConnectorProcess {
   stops = 0
   logsPath: string | null = '/connector-returned/logs'
   listeners = new Set<(state: ConnectorState) => void>()
+  unexpectedStopListeners = new Set<() => void>()
   onState(listener: (state: ConnectorState) => void) { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
+  onUnexpectedStop(listener: () => void) { this.unexpectedStopListeners.add(listener); return () => { this.unexpectedStopListeners.delete(listener) } }
+  crash() { for (const listener of this.unexpectedStopListeners) listener() }
   expire() { this.running = false; for (const listener of this.listeners) listener({ running: false, authFailed: true }) }
   async prepare() {}
   startError: Error | null = null
@@ -90,7 +93,6 @@ async function fixture(overrides: { resumeScheduleMs?: number[] } = {}) {
     },
   })
   let manager = create()
-  return {
   return {
     root, api, connector, checkedServers, openedPaths, checkedAt,
     get manager() { return manager },

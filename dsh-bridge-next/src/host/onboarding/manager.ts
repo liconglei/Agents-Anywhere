@@ -575,6 +575,8 @@ export class OnboardingManager {
     if (fromCrash && this.connectedAt && Date.now() - this.connectedAt >= this.reconnectStableMs) this.reconnectAttempts = 0
     if (this.reconnectAttempts >= this.reconnectMaxAttempts) {
       this.reconnectAttempts = 0
+      // The fallback is a manual start, so the exhausted supervisor retires the child it left running.
+      void this.connector.stop().catch(() => undefined)
       this.setProgress('error', '本机连接已多次断开，自动重试已停止。请在设置页手动启动 Connector。')
       return
     }

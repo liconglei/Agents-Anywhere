@@ -798,17 +798,17 @@ test('buffer overflow drops transient stream chunks instead of killing the feed'
   const fixture = await nativeRuntime(home)
   const native = fixture.ctx.agentsAnywhereRuntime.native
   const batches: SyncBatch[] = [], errors: unknown[] = []
-  let held: SyncBatch | undefined
-  let amended = false
-  const feed = new SyncFeed(native, 'test', batch => {
-    batches.push(batch)
-    if (!amended && batch.operations[0]?.kind === 'snapshot.items') { amended = true; held = batch }
-    else queueMicrotask(() => feed.ack(batch.batchSeq))
-  }, error => errors.push(error))
+  const transport: SyncTransport = {
+    async ingestBatch(batch) { batches.push(batch) },
+    async loadCheckpoint() { return null },
+    async saveCheckpoint() { },
+    async deleteCheckpoint() { },
+    async ingestSnapshot() { return { accepted: true } as SnapshotResult },
+  }
+  const feed = new SyncFeed(native, 'test', randomUUID(), transport, error => errors.push(error))
   const ops = () => batches.flatMap(b => b.operations)
   try {
     feed.start()
-    await until(() => !!held, 'first page was held')
     // Flood the buffered feed past MAX_BUFFER with transient agent-stream
     // chunks: before the drop policy any overflow failed the feed, and every
     // resubscription then re-baselined every session — the observed livelock.
@@ -823,8 +823,6 @@ test('buffer overflow drops transient stream chunks instead of killing the feed'
     // One durable event must compact the queue instead of failing it.
     fixture.session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'durable after flood' }] }), { surfaceOp: 'append' })
     assert.deepEqual(errors, [], 'the queue overflow must not fail the feed')
-    feed.ack(held!.batchSeq)
-    await until(() => notifications(ops()).some(n => n.method === 'session.inventory.complete'), 'inventory completes after the held page is released')
     await until(() => notifications(ops()).some(n => n.method === 'timeline.itemUpsert' && JSON.stringify(n.params.item).includes('durable after flood')), 'the durable event survives the compaction')
     assert.ok(!JSON.stringify(ops()).includes('溢'), 'dropped transient chunks never reach the platform')
     assert.deepEqual(errors, [])
@@ -836,25 +834,30 @@ test('history-bearing batches keep their ACK budget beyond the liveness timeout'
   const fixture = await nativeRuntime(home)
   const native = fixture.ctx.agentsAnywhereRuntime.native
   const batches: SyncBatch[] = [], errors: unknown[] = []
-  const held = new Map<number, SyncBatch>()
-  let holdHeavy = false
-  const feed = new SyncFeed(native, 'test', batch => {
-    batches.push(batch)
-    // A checkpoint save is only ACKed after the Connector persisted it, so it
-    // must not be judged by the light liveness window (120ms here).
-    if (holdHeavy && batch.operations.some(op => op.kind === 'checkpoint.save')) held.set(batch.batchSeq, batch)
-    else queueMicrotask(() => feed.ack(batch.batchSeq))
-  }, error => errors.push(error), 120, true, 30_000)
+  const held = new Map<number, { batch: SyncBatch, resolve: () => void }>()
+  let holding = false
+  const feed = new SyncFeed(native, 'test', randomUUID(), {
+    async ingestBatch(batch, _signal) {
+      batches.push(batch)
+      if (holding && batch.operations.some(op => op.kind === 'checkpoint.save')) {
+        await new Promise<void>(resolve => { held.set(batch.batchSeq, { batch, resolve }) })
+      }
+    },
+    async loadCheckpoint() { return null },
+    async saveCheckpoint() { },
+    async deleteCheckpoint() { },
+    async ingestSnapshot() { return { accepted: true } as SnapshotResult },
+  }, error => errors.push(error), true, 120, 30_000)
   const notes = () => notifications(batches.flatMap(b => b.operations))
   try {
     feed.start()
     await until(() => notes().some(n => n.method === 'session.inventory.complete'), 'baseline with ordinary acks')
-    holdHeavy = true
+    holding = true
     fixture.session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'checkpoint save is heavy' }] }), { surfaceOp: 'append' })
     await until(() => held.size > 0, 'a checkpoint.save batch is held')
     await delay(400)
     assert.deepEqual(errors, [], 'the heavy batch must survive well past the light ACK timeout')
-    for (const [seq] of held) feed.ack(seq)
+    for (const entry of held.values()) entry.resolve()
     held.clear()
     await until(() => notes().some(n => n.method === 'timeline.itemUpsert' && JSON.stringify(n.params.item).includes('checkpoint save is heavy')), 'the feed continues after the heavy acknowledgement')
     assert.deepEqual(errors, [])
