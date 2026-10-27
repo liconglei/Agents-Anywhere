@@ -798,17 +798,25 @@ test('buffer overflow drops transient stream chunks instead of killing the feed'
   const fixture = await nativeRuntime(home)
   const native = fixture.ctx.agentsAnywhereRuntime.native
   const batches: SyncBatch[] = [], errors: unknown[] = []
+  const heldSnapshots = new Map<string, { resolve: () => void }>()
+  let holdingSnapshot = false
   const transport: SyncTransport = {
     async ingestBatch(batch) { batches.push(batch) },
     async loadCheckpoint() { return null },
     async saveCheckpoint() { },
     async deleteCheckpoint() { },
-    async ingestSnapshot() { return { accepted: true } as SnapshotResult },
+    async ingestSnapshot(request) { if (holdingSnapshot) { await new Promise<void>(resolve => { heldSnapshots.set(String(request.sessionId), { resolve }) }); } return { accepted: true } as SnapshotResult },
   }
   const feed = new SyncFeed(native, 'test', randomUUID(), transport, error => errors.push(error))
   const ops = () => batches.flatMap(b => b.operations)
   try {
+    holdingSnapshot = true
     feed.start()
+    await until(() => heldSnapshots.size > 0, 'the first history-bearing snapshot is held')
+    for (const entry of heldSnapshots.values()) entry.resolve()
+    heldSnapshots.clear()
+    holdingSnapshot = false
+    await until(() => notifications(ops()).some(n => n.method === 'session.inventory.complete'), 'inventory completes before the flood')
     // Flood the buffered feed past MAX_BUFFER with transient agent-stream
     // chunks: before the drop policy any overflow failed the feed, and every
     // resubscription then re-baselined every session — the observed livelock.
