@@ -670,7 +670,7 @@ test('checkpoint mismatches and active turns recalibrate only the affected sessi
     // stored hash, so the resubscription reuses it instead of recalibrating.
     stream.feed.close()
     checkpoints.set('native-main', { ...checkpoints.get('native-main') as object, settled: false })
-    stream = follow(native, checkpoints)
+    stream = follow(native, { checkpoints })
     await until(complete, 'unsettled matching checkpoint reuses the cached baseline')
     assert.equal(stream.ops().filter(op => op.kind === 'snapshot.begin').length, 0,
       'an unsettled but hash-matching checkpoint must not re-publish the snapshot')
@@ -766,14 +766,14 @@ test('an unchanged resubscription reuses cached baselines without re-reading nat
   const reads: string[] = []
   const read = native.read.bind(native)
   native.read = async (id: SessionId) => { reads.push(String(id)); return read(id) }
-  let stream = follow(native, checkpoints)
+  let stream = follow(native, { checkpoints })
   const complete = () => notifications(stream.ops()).some(n => n.method === 'session.inventory.complete')
   try {
     await until(complete, 'first inventory')
     assert.deepEqual(new Set(reads), new Set(['native-main', 'persisted-only']), 'the first inventory reads every visible session')
     stream.feed.close()
     reads.length = 0
-    stream = follow(native, checkpoints)
+    stream = follow(native, { checkpoints })
     await until(complete, 'reconnected inventory')
     assert.deepEqual(reads, [], 'an unchanged resubscription replays no native log at all')
     assert.equal(stream.ops().filter(op => op.kind === 'snapshot.begin').length, 0)
@@ -785,7 +785,7 @@ test('an unchanged resubscription reuses cached baselines without re-reading nat
     fixture.session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'only one session changed' }] }), { surfaceOp: 'append' })
     await fixture.ctx.sessions.flush(fixture.session)
     reads.length = 0
-    stream = follow(native, checkpoints)
+    stream = follow(native, { checkpoints })
     await until(complete, 'partially changed inventory')
     assert.deepEqual(reads, ['native-main'], 'only the changed session pays for a full log read')
     assert.ok(notifications(stream.ops()).some(n => n.method === 'timeline.itemUpsert' && JSON.stringify(n.params.item).includes('only one session changed')))
