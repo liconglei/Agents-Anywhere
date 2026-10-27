@@ -58,6 +58,7 @@
 - 内容哈希按实际传输的 JSON 计算，插件和 Connector 两侧算出的结果一致。（[#373](https://github.com/anywhere-labs/Agents-Anywhere/pull/373)）
 - 插件所选的 PyPI 镜像缺少的包会自动从官方 PyPI 补齐，选清华、中科大、北外镜像时不再必然安装失败，与 Desktop 的处理方式一致。（[#451](https://github.com/anywhere-labs/Agents-Anywhere/pull/451)）
 - 插件「设置 → 维护」新增「重装依赖环境」：依赖下载中断或环境损坏时一键删除并重新安装，进行中的安装会被中断，账号、设备连接和设置都保留。（[#452](https://github.com/anywhere-labs/Agents-Anywhere/pull/452)）
+- 历史被服务端拒绝后，运行时不再把会话发布成可用，会保留不可用标记，退避重试成功后才恢复同步（[c1576d6b](https://github.com/anywhere-labs/Agents-Anywhere/commit/c1576d6b)）。
 
 ### Desktop
 
