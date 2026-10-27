@@ -592,13 +592,17 @@ export class OnboardingManager {
       try {
         if (!this.canRetryConnector()) return
         // stop() clears a latched failure and the dead child before a fresh start.
->>>>>>> 99280316 (fix(dsh): keep retrying ownership conflicts and surface silent disconnects)
         await this.connector.stop()
-        throw error
-      }
-      await this.connector.stop()
-      if (this.desktop.status !== 'absent') throw new Error(this.desktop.message)
-    } finally { if (this.controller === controller) this.controller = null }
+        if (!this.canRetryConnector()) return
+        await this.startConnector()
+      } catch { failed = true }
+      finally { if (this.reconnectTask === task) this.reconnectTask = null }
+      // Without this the chain would die here: startConnector already reported
+      // the failure, so no further crash event will arrive to schedule the next attempt.
+      if (failed) this.scheduleReconnect(false)
+    })
+    this.reconnectTask = task
+    return task
   }
 
   private canResumeServer(): boolean {

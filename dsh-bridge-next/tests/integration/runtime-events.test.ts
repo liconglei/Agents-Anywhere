@@ -13,12 +13,8 @@ import { LocalRouter, Mesh, Router } from 'meshcall'
 import { bridgePath, nativeRuntime } from '../fixtures/native-runtime.js'
 import { corruptHistory } from '../fixtures/corrupt-history.js'
 import { mountAgents, TextAdapter, initialSelections } from '../fixtures/agent-runtime.js'
-<<<<<<< HEAD
-import { MAX_RETAINED_PROJECTIONS, SyncFeed, SYNC_FLUSH_MS, type SyncOperation, type SyncTransport } from '../../src/host/dsh-runtime/sync.js'
+import { MAX_RETAINED_PROJECTIONS, SyncFeed, SYNC_FLUSH_MS, MAX_BUFFER, type SyncBatch, type SyncOperation, type SyncTransport } from '../../src/host/dsh-runtime/sync.js'
 import type { SnapshotRequest, SnapshotResult } from '../../src/host/generated/dsh-sync.js'
-=======
-import { SyncFeed, SYNC_FLUSH_MS, MAX_BUFFER, type SyncBatch, type SyncOperation } from '../../src/host/dsh-runtime/sync.js'
->>>>>>> 95b07564 (fix(dsh): 插件 baseline 复用、缓冲溢出降级与重 ACK 预算（插件侧）)
 import { projectHistory } from '../../src/host/dsh-runtime/history.js'
 import { nativeSessionId, sessionId } from '../../src/host/dsh-runtime/identity.js'
 import { RuntimeRouter } from '../../src/host/dsh-runtime/router.js'

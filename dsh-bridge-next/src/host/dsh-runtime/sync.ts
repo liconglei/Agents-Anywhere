@@ -70,17 +70,11 @@ export class SyncFeed {
   private bufferedBytes = 0
   private checkpointDirty = new Set<string>()
 
-<<<<<<< HEAD
   get retainedProjectionCount(): number { return this.projections.size }
 
   constructor(private native: NativeRuntime, private namespace: string, readonly id: string,
     private transport: SyncTransport, private failed: (error: unknown) => void,
-    private durableCheckpoints = false) {
-=======
-  constructor(private native: NativeRuntime, private namespace: string,
-    private notify: (batch: SyncBatch) => void, private failed: (error: unknown) => void,
-    private ackTimeoutMs = 60_000, private durableCheckpoints = false, private heavyAckTimeoutMs = 600_000) {
->>>>>>> 95b07564 (fix(dsh): 插件 baseline 复用、缓冲溢出降级与重 ACK 预算（插件侧）)
+    private durableCheckpoints = false, private ackTimeoutMs = 60_000, private heavyAckTimeoutMs = 600_000) {
     this.unwatch = native.watch(change => {
       if (this.closed) return
       // These events invalidate current facts; replaying every invalidation
@@ -168,45 +162,6 @@ export class SyncFeed {
       await delay(Math.ceil(SYNC_FLUSH_MS - (performance.now() - this.lastSentAt)), undefined, { signal: this.abort.signal })
     }
     this.abort.signal.throwIfAborted()
-<<<<<<< HEAD
-    const batch: WireBatch = { subscriptionId: this.id, batchSeq: ++this.batchSeq, projectionVersion: PROJECTION_VERSION, operations }
-    if (jsonBytes(batch) > MAX_BYTES) throw new Error('DSH sync batch exceeds the transport limit')
-    this.lastSentAt = performance.now()
-    this.native.diagnostics.log('debug', 'sync.batch', { streamId: this.id, batchSeq: batch.batchSeq, operations: operations.length, kinds: operations.map(op => op.kind).join(',') })
-    try {
-      // No deadline: a slow upload is a slow answer, and MeshCall keepalives watch the connection.
-      await this.transport.ingestBatch(batch, this.abort.signal)
-    } catch (error) {
-      throw new SyncTransportError('DSH event delivery failed', { cause: error })
-    }
-    this.native.diagnostics.log('debug', 'sync.ack', { streamId: this.id, batchSeq: batch.batchSeq, elapsedMs: Math.round(performance.now() - this.lastSentAt) })
-=======
-    const batch: SyncBatch = { streamId: this.id, batchSeq: ++this.batchSeq, projectionVersion: PROJECTION_VERSION, operations }
-    if (jsonBytes(batch) > 7 * 1024 * 1024) throw new Error('DSH sync batch exceeds frame size')
-    // History-bearing batches are ACKed only after the Connector synchronously
-    // ingests them, so a large session can take well past the liveness window.
-    // Judge by content, not batchSeq, so a big commit still gets its budget.
-    const heavy = operations.some(op => op.kind === 'snapshot.commit' || op.kind === 'checkpoint.save')
-    const timeoutMs = heavy ? this.heavyAckTimeoutMs : this.ackTimeoutMs
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.waitAck = undefined
-        reject(new SyncTransportError('DSH event acknowledgement timed out'))
-      }, timeoutMs)
-      timer.unref()
-      this.waitAck = { seq: batch.batchSeq,
-        resolve: () => { clearTimeout(timer); resolve() },
-        reject: error => { clearTimeout(timer); reject(error) } }
-      this.lastSentAt = performance.now()
-      try {
-        this.native.diagnostics.log('debug', 'sync.batch', { streamId: this.id, batchSeq: batch.batchSeq, operations: operations.length, kinds: operations.map(op => op.kind).join(',') })
-        this.notify(batch)
-      } catch (error) {
-        clearTimeout(timer); this.waitAck = undefined
-        reject(new SyncTransportError('DSH event delivery failed', { cause: error }))
-      }
-    })
->>>>>>> 95b07564 (fix(dsh): 插件 baseline 复用、缓冲溢出降级与重 ACK 预算（插件侧）)
   }
   private async notification(method: string, params: Record<string, unknown>): Promise<void> {
     await this.send([{ kind: 'notifications', notifications: [{ method, params }] }])
@@ -291,7 +246,6 @@ export class SyncFeed {
       await this.unavailable(id)
       return
     }
-<<<<<<< HEAD
     const platformId = sessionId(this.namespace, id)
     try {
       const projection = createProjection(id, platformId, this.durableCheckpoints)
@@ -324,42 +278,6 @@ export class SyncFeed {
           this.native.diagnostics.log('info', 'sync.checkpoint_restored', { streamId: this.id, sessionId: id })
           return
         }
-=======
-    const projection = createProjection(id, platformId, this.durableCheckpoints)
-    let resumed = false
-    if (checkpoint !== undefined && Number.isSafeInteger(checkpoint.throughSeq) && Number(checkpoint.throughSeq) >= -1) {
-      await replayHistory(projection, log, this.abort.signal, Number(checkpoint.throughSeq))
-      resumed = matchesCheckpoint(checkpoint, projection)
-      if (resumed) projection.drain()
-    }
-    await replayHistory(projection, log, this.abort.signal)
-    const title = log.events.findLast(event => event.type === 'session/title')
-    const meta = { externalSessionId: id, title: title?.type === 'session/title' ? title.data.title : null,
-      sourceState: await this.native.source.state(id), cwd: log.session.cwd ?? null,
-      lastActivityAt: new Date(log.events.at(-1)?.time ?? log.session.createdAt).toISOString() }
-    // The memo's identity is the exact log cut the projection was replayed from,
-    // never a freshly read one; a missing revision simply disables reuse.
-    const revision = log.bridgeRevision ?? await this.native.source.freshRevisionOf(id)
-    const lastTurnEnd = log.events.findLast(event => event.type === 'turn/end')
-    const turn = { active: turnPhase(log.events).active,
-      endedKind: lastTurnEnd?.type === 'turn/end' ? lastTurnEnd.data.reason.kind : undefined,
-      endedAt: lastTurnEnd?.time }
-    if (resumed) {
-      const delta = projection.drain()
-      if (!delta.removed.length && await this.native.visible(id)) {
-        this.projections.set(id, projection)
-        this.published.set(id, platformId)
-        this.sourceAvailability.set(id, 'available')
-        await this.notification('session.meta.upsert', { sessionId: platformId, ...meta })
-        await this.items('timeline.upsert', id, delta.items)
-        this.checkpointDirty.add(id)
-        await this.notices(id)
-        await this.state(id, log)
-        await this.turnEnded(id, log.events)
-        if (revision !== undefined) this.native.syncBaselines.set(id, { revision, projection, meta, turn })
-        this.native.diagnostics.log('info', 'sync.checkpoint_restored', { streamId: this.id, sessionId: id })
-        return
->>>>>>> 95b07564 (fix(dsh): 插件 baseline 复用、缓冲溢出降级与重 ACK 预算（插件侧）)
       }
       if (!await this.native.visible(id)) return
       this.native.diagnostics.log('debug', 'snapshot.started', { streamId: this.id, sessionId: id })
@@ -378,8 +296,6 @@ export class SyncFeed {
     } finally {
       this.native.source.release(id)
     }
-<<<<<<< HEAD
-=======
     const snapshotId = randomUUID()
     if (!await this.native.visible(id)) return
     this.native.diagnostics.log('debug', 'snapshot.started', { streamId: this.id, sessionId: id })
@@ -406,7 +322,6 @@ export class SyncFeed {
     await this.state(id, log)
     await this.turnEnded(id, log.events)
     this.native.diagnostics.log('info', 'snapshot.completed', { streamId: this.id, sessionId: id, items: snapshotItems.length, elapsedMs: Math.round(performance.now() - start) })
->>>>>>> 95b07564 (fix(dsh): 插件 baseline 复用、缓冲溢出降级与重 ACK 预算（插件侧）)
   }
   /** A baseline imports history without replaying live turn/end changes, so the
    * last finished turn must be announced or the platform keeps showing turn one. */

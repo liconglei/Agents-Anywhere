@@ -67,11 +67,8 @@ async function fixture(overrides: { resumeScheduleMs?: number[] } = {}) {
   const api = new FakeApi('https://api.example.test')
   const connector = new FakeConnector()
   const checkedServers: string[] = []
-<<<<<<< HEAD
   const openedPaths: string[] = []
-=======
   const checkedAt: number[] = []
->>>>>>> 99280316 (fix(dsh): keep retrying ownership conflicts and surface silent disconnects)
   let healthError: Error | null = null
   let detection: DesktopDetection = { status: 'absent', message: 'not registered' }
   let localIds: string[] = []
@@ -82,12 +79,8 @@ async function fixture(overrides: { resumeScheduleMs?: number[] } = {}) {
   }, {
     systemLanguages: async () => ['en-US'],
     api: base => base === api.baseUrl ? api : new FakeApi(base), connector, detect: async () => { detections++; return detection },
-<<<<<<< HEAD
-    checkServer: async (base) => { checkedServers.push(base); if (healthError) throw healthError },
-    openFolder: async (target) => { openedPaths.push(target) },
-=======
     checkServer: async (base) => { checkedServers.push(base); checkedAt.push(Date.now()); if (healthError) throw healthError },
->>>>>>> 99280316 (fix(dsh): keep retrying ownership conflicts and surface silent disconnects)
+    openFolder: async (target) => { openedPaths.push(target) },
     onlineTimeoutMs: 5000, pollIntervalMs: 10,
     reconnectScheduleMs: [5], reconnectMaxAttempts: 3,
     resumeScheduleMs: [5],
@@ -98,11 +91,8 @@ async function fixture(overrides: { resumeScheduleMs?: number[] } = {}) {
   })
   let manager = create()
   return {
-<<<<<<< HEAD
-    root, api, connector, checkedServers, openedPaths,
-=======
-    root, api, connector, checkedServers, checkedAt,
->>>>>>> 99280316 (fix(dsh): keep retrying ownership conflicts and surface silent disconnects)
+  return {
+    root, api, connector, checkedServers, openedPaths, checkedAt,
     get manager() { return manager },
     get detections() { return detections },
     setDesktop(value: DesktopDetection) { detection = value },
@@ -965,14 +955,6 @@ test('an unexpected Connector exit restarts itself until the retry budget runs o
   } finally { await h.close() }
 })
 
-<<<<<<< HEAD
-test('manual stops, the off switch and expired credentials never auto-restart', async () => {
-  const h = await fixture()
-  h.api.online = true
-  try {
-    await callback((await h.manager.begin()).url)
-    await until(async () => (await h.manager.inspect()).stage === 'ready')
-=======
   test('a burst of stop events while the Connector runs restarts exactly once', async () => {
     const h = await fixture()
     h.api.online = true
@@ -1016,7 +998,6 @@ test('manual stops, the off switch and expired credentials never auto-restart', 
     try {
       await callback((await h.manager.begin()).url)
       await until(async () => (await h.manager.inspect()).stage === 'ready')
->>>>>>> 99280316 (fix(dsh): keep retrying ownership conflicts and surface silent disconnects)
 
     await h.manager.controlConnector('stop')
     const stopped = h.connector.starts
