@@ -74,15 +74,15 @@ test('a finished turn ignores a stale live agent status still saying running', {
     const request = (method: string, params: Record<string, unknown>) => stuck.request(method, params, new AbortController().signal)
     const params = { sessionId: sessionId('instance', 'native-main'), externalSessionId: 'native-main' }
 
-    const ended = await request('session.getState', params) as StateResult
+    const ended = await request('getSessionState', params) as StateResult
     assert.equal(ended.status, 'idle', 'a completed turn reports idle while the agent still says running')
 
     f.session.append('turn/start', { turn: 2 })
-    const active = await request('session.getState', params) as StateResult
+    const active = await request('getSessionState', params) as StateResult
     assert.equal(active.status, 'running', 'an open turn follows the live agent status')
 
     f.session.append('turn/end', { turn: 2, reason: { kind: 'error' } })
-    const failed = await request('session.getState', params) as StateResult
+    const failed = await request('getSessionState', params) as StateResult
     assert.equal(failed.status, 'error', 'a failed turn reports error while the agent still says running')
     stuck.close()
   } finally { await f.close() }
