@@ -267,11 +267,11 @@ export class SyncFeed {
     try {
       const projection = createProjection(id, platformId, this.durableCheckpoints)
       let resumed = false
-      if (restore && this.durableCheckpoints) {
-        const checkpoint = record(await this.delivery(() => this.transport.loadCheckpoint(id)) ?? {})
-        if (Number.isSafeInteger(checkpoint.throughSeq) && Number(checkpoint.throughSeq) >= -1) {
-          await replayHistory(projection, log, this.abort.signal, Number(checkpoint.throughSeq))
-          resumed = matchesCheckpoint(checkpoint, projection)
+      if (restore && this.durableCheckpoints && checkpoint) {
+        const loaded = checkpoint
+        if (Number.isSafeInteger(loaded.throughSeq) && Number(loaded.throughSeq) >= -1) {
+          await replayHistory(projection, log, this.abort.signal, Number(loaded.throughSeq))
+          resumed = matchesCheckpoint(loaded, projection)
           if (resumed) projection.drain()
         }
       }
