@@ -10,6 +10,7 @@ import * as StorageJson from '@deepseek-ai/dsh-storage-json'
 import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import WorkspaceRegistry from '@deepseek-ai/dsh-workspace'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import os from 'node:os'
 import { syncBuiltinESMExports } from 'node:module'
 import { readFile } from 'node:fs/promises'
@@ -91,7 +92,7 @@ export async function nativeRuntime(home: string, beforeHost?: (ctx: Context) =>
       if (entry.name === '@agents-anywhere/dsh-bridge-next') entry.name = new URL('../../lib/index.js', import.meta.url).href
     }
     const plugin = ctx.get('loader')
-      ? ctx.plugin(Include, { path: join(home, 'test-host.cordis.yml'), initial: [], patches: [
+      ? ctx.plugin(Include, { path: pathToFileURL(join(home, 'test-host.cordis.yml')).href, initial: [], patches: [
         ...patches, { id: 'agents-anywhere-bridge-next', config },
       ] }) : ctx.plugin(host, config)
     await plugin.await()
