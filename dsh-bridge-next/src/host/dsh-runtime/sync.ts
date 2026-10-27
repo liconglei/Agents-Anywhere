@@ -69,7 +69,6 @@ export class SyncFeed {
   private bufferedOperations: SyncOperation[] | undefined
   private bufferedBytes = 0
   private checkpointDirty = new Set<string>()
-  private capture: { id: string, snapshotId: string } | undefined
   private waitAck: { seq: number, resolve: () => void, reject: (error: unknown) => void } | undefined
 
   get retainedProjectionCount(): number { return this.projections.size }
@@ -164,7 +163,7 @@ export class SyncFeed {
       await delay(Math.ceil(SYNC_FLUSH_MS - (performance.now() - this.lastSentAt)), undefined, { signal: this.abort.signal })
     }
     this.abort.signal.throwIfAborted()
-    const batch: WireBatch = { streamId: this.id, batchSeq: ++this.batchSeq, projectionVersion: PROJECTION_VERSION, operations }
+    const batch: WireBatch = { subscriptionId: this.id, batchSeq: ++this.batchSeq, projectionVersion: PROJECTION_VERSION, operations }
     if (jsonBytes(batch) > 7 * 1024 * 1024) throw new Error('DSH sync batch exceeds frame size')
     const heavy = operations.some(op => op.kind === 'snapshot.commit' || op.kind === 'checkpoint.save')
     const timeoutMs = heavy ? this.heavyAckTimeoutMs : this.ackTimeoutMs
@@ -174,9 +173,11 @@ export class SyncFeed {
       this.waitAck = { seq: batch.batchSeq, resolve: () => { clearTimeout(timer); resolve() }, reject: error => { clearTimeout(timer); reject(error) } }
       this.lastSentAt = performance.now()
       void this.transport.ingestBatch(batch, this.abort.signal).then(() => {
-        if (this.waitAck?.seq === batch.batchSeq) { this.waitAck = undefined; this.waitAck.resolve() }
+        const ack = this.waitAck
+        if (ack && ack.seq === batch.batchSeq) { this.waitAck = undefined; ack.resolve() }
       }).catch(error => {
-        if (this.waitAck?.seq === batch.batchSeq) { this.waitAck = undefined; this.waitAck.reject(error) }
+        const ack = this.waitAck
+        if (ack && ack.seq === batch.batchSeq) { this.waitAck = undefined; ack.reject(error) }
       })
     })
   }
@@ -225,7 +226,7 @@ export class SyncFeed {
     let checkpoint: Record<string, unknown> | undefined
     if (restore && this.durableCheckpoints) {
       await this.send([{ kind: 'checkpoint.load', externalSessionId: id }])
-      checkpoint = record(this.receivedCheckpoint)
+      checkpoint = record(await this.delivery(() => this.transport.loadCheckpoint(id)) ?? {})
       const cached = this.native.syncBaselines.get(id)
       // No new events since the last baseline and the Connector still holds
       // exactly this projection: reuse the live projection and re-publish only
@@ -296,6 +297,7 @@ export class SyncFeed {
           await this.notices(id)
           await this.state(id, log)
           await this.turnEnded(id, log.events)
+          if (revision !== undefined) this.native.syncBaselines.set(id, { revision, projection, meta, turn })
           this.native.diagnostics.log('info', 'sync.checkpoint_restored', { streamId: this.id, sessionId: id })
           return
         }
@@ -317,32 +319,6 @@ export class SyncFeed {
     } finally {
       this.native.source.release(id)
     }
-    const snapshotId = randomUUID()
-    if (!await this.native.visible(id)) return
-    this.native.diagnostics.log('debug', 'snapshot.started', { streamId: this.id, sessionId: id })
-    this.capture = { id, snapshotId }
-    await this.send([{ kind: 'snapshot.begin', sessionId: platformId, snapshotId,
-      meta,
-      throughSeq: projection.throughSeq }])
-    const snapshotItems = contentItems(projection.snapshot())
-    await this.items('snapshot.items', id, snapshotItems, snapshotId)
-    if (!await this.native.visible(id)) {
-      await this.send([{ kind: 'snapshot.abort', sessionId: platformId, snapshotId }]); this.capture = undefined; return
-    }
-    await this.send([{ kind: 'snapshot.commit', sessionId: platformId, snapshotId,
-      totalItems: snapshotItems.length, throughSeq: projection.throughSeq }])
-    this.capture = undefined
-    this.failedSessions.delete(id)
-    projection.drain()
-    this.projections.set(id, projection)
-    this.checkpointDirty.add(id)
-    this.published.set(id, platformId)
-    this.sourceAvailability.set(id, 'available')
-    if (revision !== undefined) this.native.syncBaselines.set(id, { revision, projection, meta, turn })
-    await this.notices(id)
-    await this.state(id, log)
-    await this.turnEnded(id, log.events)
-    this.native.diagnostics.log('info', 'snapshot.completed', { streamId: this.id, sessionId: id, items: snapshotItems.length, elapsedMs: Math.round(performance.now() - start) })
   }
   /** A baseline imports history without replaying live turn/end changes, so the
    * last finished turn must be announced or the platform keeps showing turn one. */
