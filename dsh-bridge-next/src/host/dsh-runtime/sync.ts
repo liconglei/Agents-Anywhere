@@ -69,6 +69,8 @@ export class SyncFeed {
   private bufferedOperations: SyncOperation[] | undefined
   private bufferedBytes = 0
   private checkpointDirty = new Set<string>()
+  private capture: { id: string, snapshotId: string } | undefined
+  private waitAck: { seq: number, resolve: () => void, reject: (error: unknown) => void } | undefined
 
   get retainedProjectionCount(): number { return this.projections.size }
 
@@ -162,6 +164,21 @@ export class SyncFeed {
       await delay(Math.ceil(SYNC_FLUSH_MS - (performance.now() - this.lastSentAt)), undefined, { signal: this.abort.signal })
     }
     this.abort.signal.throwIfAborted()
+    const batch: WireBatch = { streamId: this.id, batchSeq: ++this.batchSeq, projectionVersion: PROJECTION_VERSION, operations }
+    if (jsonBytes(batch) > 7 * 1024 * 1024) throw new Error('DSH sync batch exceeds frame size')
+    const heavy = operations.some(op => op.kind === 'snapshot.commit' || op.kind === 'checkpoint.save')
+    const timeoutMs = heavy ? this.heavyAckTimeoutMs : this.ackTimeoutMs
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => { this.waitAck = undefined; reject(new Error('DSH event acknowledgement timed out')) }, timeoutMs)
+      timer.unref()
+      this.waitAck = { seq: batch.batchSeq, resolve: () => { clearTimeout(timer); resolve() }, reject: error => { clearTimeout(timer); reject(error) } }
+      this.lastSentAt = performance.now()
+      void this.transport.ingestBatch(batch, this.abort.signal).then(() => {
+        if (this.waitAck?.seq === batch.batchSeq) { this.waitAck = undefined; this.waitAck.resolve() }
+      }).catch(error => {
+        if (this.waitAck?.seq === batch.batchSeq) { this.waitAck = undefined; this.waitAck.reject(error) }
+      })
+    })
   }
   private async notification(method: string, params: Record<string, unknown>): Promise<void> {
     await this.send([{ kind: 'notifications', notifications: [{ method, params }] }])
@@ -246,7 +263,6 @@ export class SyncFeed {
       await this.unavailable(id)
       return
     }
-    const platformId = sessionId(this.namespace, id)
     try {
       const projection = createProjection(id, platformId, this.durableCheckpoints)
       let resumed = false
@@ -263,6 +279,11 @@ export class SyncFeed {
       const meta = { externalSessionId: id, title: title?.type === 'session/title' ? title.data.title : null,
         sourceState: await this.native.source.state(id), cwd: log.session.cwd ?? null,
         lastActivityAt: new Date(log.events.at(-1)?.time ?? log.session.createdAt).toISOString() }
+      const revision = log.bridgeRevision ?? await this.native.source.freshRevisionOf(id)
+      const lastTurnEnd = log.events.findLast(event => event.type === 'turn/end')
+      const turn = { active: turnPhase(log.events).active,
+        endedKind: lastTurnEnd?.type === 'turn/end' ? lastTurnEnd.data.reason.kind : undefined,
+        endedAt: lastTurnEnd?.time }
       if (resumed) {
         const delta = projection.drain()
         if (!delta.removed.length && await this.native.visible(id)) {
