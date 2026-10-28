@@ -13,7 +13,7 @@ import { acquireManagerLock } from '../storage/files.js'
 import { BridgeService } from './bridge-service.js'
 import { quietDiagnostics, type RuntimeDiagnostics } from './diagnostics.js'
 import type { SessionReader } from './router.js'
-import type { SyncCheckpoint, SyncTransport } from './sync.js'
+import { SyncTransportError, type SyncCheckpoint, type SyncTransport } from './sync.js'
 import { record } from './types.js'
 
 /** What the Connector publishes for this plugin (contracts/dsh-bridge/2.0). */
@@ -44,26 +44,41 @@ export function parseRendezvous(text: string): Rendezvous | undefined {
 export class ConnectorSync implements SyncTransport {
   constructor(private readonly client: SyncServiceClient, private readonly subscriptionId: string) {}
 
+  /**
+   * A call rejected by the Connector means the batch boundary moved without the
+   * feed knowing. Continuing would send the next sequence into a relay that
+   * still expects the rejected one, so every later batch fails as out-of-order;
+   * the feed must stop and resubscribe instead. The per-session refusals that
+   * are meant to stay local answer with a result instead of throwing.
+   */
+  private async delivery<T>(operation: () => Promise<T>): Promise<T> {
+    try { return await operation() }
+    catch (error) {
+      if (error instanceof SyncTransportError || error instanceof Error && error.name === 'AbortError') throw error
+      throw new SyncTransportError('DSH event delivery failed', { cause: error })
+    }
+  }
+
   async ingestBatch(batch: WireBatch, signal: AbortSignal): Promise<void> {
     // The key lets the Router dedupe a retried delivery of the same batch.
-    await this.client.ingestBatch(batch, { signal, idempotencyKey: `dsh-${batch.subscriptionId}-${batch.batchSeq}`.slice(0, 128) })
+    await this.delivery(() => this.client.ingestBatch(batch, { signal, idempotencyKey: `dsh-${batch.subscriptionId}-${batch.batchSeq}`.slice(0, 128) }))
   }
 
   async loadCheckpoint(externalSessionId: string): Promise<Record<string, unknown> | null> {
-    const result: CheckpointResult = await this.client.loadCheckpoint(this.subscriptionId, externalSessionId)
+    const result: CheckpointResult = await this.delivery(() => this.client.loadCheckpoint(this.subscriptionId, externalSessionId))
     return result.checkpoint ?? null
   }
 
   async saveCheckpoint(externalSessionId: string, checkpoint: SyncCheckpoint): Promise<void> {
-    await this.client.saveCheckpoint(this.subscriptionId, externalSessionId, checkpoint as unknown as Record<string, unknown>)
+    await this.delivery(() => this.client.saveCheckpoint(this.subscriptionId, externalSessionId, checkpoint as unknown as Record<string, unknown>))
   }
 
   async deleteCheckpoint(externalSessionId: string): Promise<void> {
-    await this.client.deleteCheckpoint(this.subscriptionId, externalSessionId)
+    await this.delivery(() => this.client.deleteCheckpoint(this.subscriptionId, externalSessionId))
   }
 
   async ingestSnapshot(request: SnapshotRequest, pages: AsyncIterable<SnapshotPage>, signal: AbortSignal): Promise<SnapshotResult> {
-    return this.client.ingestSnapshot(request, pages, { signal })
+    return this.delivery(() => this.client.ingestSnapshot(request, pages, { signal }))
   }
 }
 

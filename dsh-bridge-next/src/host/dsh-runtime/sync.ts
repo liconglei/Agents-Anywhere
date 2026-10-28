@@ -49,7 +49,7 @@ function turnOutcome(kind: string): string {
   return ['aborted', 'interrupted'].includes(kind) ? 'interrupted' : 'completed'
 }
 
-class SyncTransportError extends Error {}
+export class SyncTransportError extends Error {}
 
 /** One ordered subscription. A batch's delivery call returns only after the Connector ingested it. */
 export class SyncFeed {
@@ -225,7 +225,6 @@ export class SyncFeed {
     const platformId = sessionId(this.namespace, id)
     let checkpoint: Record<string, unknown> | undefined
     if (restore && this.durableCheckpoints) {
-      await this.send([{ kind: 'checkpoint.load', externalSessionId: id }])
       checkpoint = record(await this.delivery(() => this.transport.loadCheckpoint(id)) ?? {})
       const cached = this.native.syncBaselines.get(id)
       // No new events since the last baseline and the Connector still holds
