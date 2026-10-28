@@ -22,7 +22,7 @@
 
    以上命令使用该环境的 `AGENT_SERVER_DB_URL`。当前目标应为 `v2_44`；以后升级时，以待部署源码的 `CURRENT_SCHEMA_REVISION` 为准。
 4. 启动同一版本的 Server/Web，检查 `/api/v2/health/ready`，再恢复入口流量和 Connector。验证账号登录、设备连接、会话恢复、消息、审批、文件和终端。
-5. 使用 [2.0.3 下载入口](../README.md#下载与入口)升级客户端。当前安装包没有可用的应用内下载地址，需手动分发。
+5. 按需升级客户端：下载入口见 [README 下载表](../README.md#下载与入口)，各端最低配套版本与安装包记录见 [2.1.0 发布说明](releases/2.1.0.md)。Web 与 Desktop 必须和 Server 同版本（管理看板接口已删除）。从 2.1.0 起 Desktop（macOS、Windows）和 Android 的「立即更新」会从官网下载最新安装包；2.0.3 及更早版本的应用内更新地址是占位配置，需手动分发安装包。
 
 Compose 的 `migrate-next` 会在新 Server 前执行迁移，但不会停止另一个 Compose 项目、旧容器或外部写入者。部署者需要先停止旧写入进程。不要把代码分支切换当成数据库迁移。
 
