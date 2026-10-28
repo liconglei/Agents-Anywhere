@@ -21,6 +21,7 @@
 - 修复退出登录后迟到的创建响应、后台创建成功时抢占当前页面，以及附件预览的生命周期问题。（[#368](https://github.com/anywhere-labs/Agents-Anywhere/pull/368)）
 - 附件下载失败时，会话里会列出没送到的文件名；正文和其他附件照常发送，即使这条提醒本身发送失败也不影响任务。（[#270](https://github.com/anywhere-labs/Agents-Anywhere/pull/270)）
 - 下载端断开或传输过期后释放上传任务，修复本地文件中转永久阻塞。（[#270](https://github.com/anywhere-labs/Agents-Anywhere/pull/270)）
+- 通过 API 新建会话、发送消息，或在一轮回复中途追加消息时，可以不再提供消息去重标识，Server 会自动补上；DSH 不再因为缺少标识而拒绝请求。（[91f150c9](https://github.com/anywhere-labs/Agents-Anywhere/commit/91f150c9)）
 
 ### Codex 与 Claude
 
@@ -59,6 +60,7 @@
 - 插件所选的 PyPI 镜像缺少的包会自动从官方 PyPI 补齐，选清华、中科大、北外镜像时不再必然安装失败，与 Desktop 的处理方式一致。（[#451](https://github.com/anywhere-labs/Agents-Anywhere/pull/451)）
 - 插件「设置 → 维护」新增「重装依赖环境」：依赖下载中断或环境损坏时一键删除并重新安装，进行中的安装会被中断，账号、设备连接和设置都保留。（[#452](https://github.com/anywhere-labs/Agents-Anywhere/pull/452)）
 - 历史被服务端拒绝后，运行时不再把会话发布成可用，会保留不可用标记，退避重试成功后才恢复同步（[c1576d6b](https://github.com/anywhere-labs/Agents-Anywhere/commit/c1576d6b)）。
+- DSH 重启后，已有会话不再一直停在「启动中 · 正在同步」：同步会正常恢复，历史保留，也可以继续发消息。（[f79bd689](https://github.com/anywhere-labs/Agents-Anywhere/commit/f79bd689)）
 
 ### Desktop
 
@@ -79,6 +81,7 @@
 - 插件和 Desktop 的日志页统一读取集中日志，可以按来源筛选、分页查看，并展示结构化的异常信息；Connector 还没启动时也能看到本次的启动诊断。（[#361](https://github.com/anywhere-labs/Agents-Anywhere/pull/361)、[#365](https://github.com/anywhere-labs/Agents-Anywhere/pull/365)、[#369](https://github.com/anywhere-labs/Agents-Anywhere/pull/369)）
 - 日志损坏时自动恢复，日志目录不可用时改为只在内存中记录，日志问题不再阻止 Connector 启动；日志中的 token 和认证头会被脱敏。（[#353](https://github.com/anywhere-labs/Agents-Anywhere/pull/353)）
 - 修复代理环境下 `NO_PROXY` 里 IPv6 回环地址的兼容问题。（[#373](https://github.com/anywhere-labs/Agents-Anywhere/pull/373)）
+- Connector 重启后会自动接管仍在运行的 OpenCode，不再显示认证失败，也不需要先手动结束本机 OpenCode 进程。（[f2d2fbe5](https://github.com/anywhere-labs/Agents-Anywhere/commit/f2d2fbe5)）
 
 ### Web 与 Desktop 界面
 
