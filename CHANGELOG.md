@@ -2,9 +2,9 @@
 
 按版本记录用户能感知到的变化，最新版本在最前，每项一句话。接口变化、各端最低配套版本、数据库迁移和安装包记录见各版本的[发布说明](docs/releases/)。
 
-## 2.1.0（未发布）
+## 2.1.0（2026-10-28）
 
-[发布说明](docs/releases/2.1.0.md) · [与 2.0.3 的差异](https://github.com/anywhere-labs/Agents-Anywhere/compare/v2.0.3...main)
+[发布说明](docs/releases/2.1.0.md) · [与 2.0.3 的差异](https://github.com/liconglei/Agents-Anywhere/compare/v2.0.3...v2.1.0)
 
 ### 升级须知
 
@@ -21,7 +21,7 @@
 - 修复退出登录后迟到的创建响应、后台创建成功时抢占当前页面，以及附件预览的生命周期问题。（[#368](https://github.com/anywhere-labs/Agents-Anywhere/pull/368)）
 - 附件下载失败时，会话里会列出没送到的文件名；正文和其他附件照常发送，即使这条提醒本身发送失败也不影响任务。（[#270](https://github.com/anywhere-labs/Agents-Anywhere/pull/270)）
 - 下载端断开或传输过期后释放上传任务，修复本地文件中转永久阻塞。（[#270](https://github.com/anywhere-labs/Agents-Anywhere/pull/270)）
-- 通过 API 新建会话、发送消息，或在一轮回复中途追加消息时，可以不再提供消息去重标识，Server 会自动补上；DSH 不再因为缺少标识而拒绝请求。（[a132b1ea](https://github.com/anywhere-labs/Agents-Anywhere/commit/a132b1ea)）
+- 通过 API 新建会话、发送消息，或在一轮回复中途追加消息时，可以不再提供消息去重标识，Server 会自动补上；DSH 不再因为缺少标识而拒绝请求。（[a132b1ea](https://github.com/liconglei/Agents-Anywhere/commit/a132b1ea)）
 
 ### Codex 与 Claude
 
@@ -37,6 +37,11 @@
 - Codex 的异步提问显示为可以作答的表单，答案只投递一次，Connector 重启后仍保持已回答状态。（[#439](https://github.com/anywhere-labs/Agents-Anywhere/pull/439)）
 - 实时消息和历史记录中的同一条目不再出现两次（例如搜索）；新一轮开始时就关闭上一轮的失败卡片。（[#433](https://github.com/anywhere-labs/Agents-Anywhere/pull/433)、[#351](https://github.com/anywhere-labs/Agents-Anywhere/pull/351)）
 - Claude 的模型名显示实际版本和上下文窗口，兼容 Bedrock、Vertex 等模型 ID；没有标题的会话名会压缩空白、截到 48 字。（[#289](https://github.com/anywhere-labs/Agents-Anywhere/pull/289)、[#219](https://github.com/anywhere-labs/Agents-Anywhere/pull/219)）
+
+### OpenCode
+
+- 新增 OpenCode 支持：可以新建 OpenCode 会话、实时看到回复和工具过程、在回合进行中追问或中断、发送附件，并按 OpenCode 自己的目录选择模型、推理强度和权限档位。（[7f279f51](https://github.com/liconglei/Agents-Anywhere/commit/7f279f51)、[eb4b73e9](https://github.com/liconglei/Agents-Anywhere/commit/eb4b73e9)、[69a7d176](https://github.com/liconglei/Agents-Anywhere/commit/69a7d176)、[1519b661](https://github.com/liconglei/Agents-Anywhere/commit/1519b661)）
+- OpenCode 会话里 Agent 的提问显示为可以作答的表单，需要批准的操作可以直接同意或拒绝，不必回到 OpenCode 自己的界面处理。（[0c59235c](https://github.com/liconglei/Agents-Anywhere/commit/0c59235c)）
 
 ### DSH 同步
 
@@ -59,8 +64,8 @@
 - 内容哈希按实际传输的 JSON 计算，插件和 Connector 两侧算出的结果一致。（[#373](https://github.com/anywhere-labs/Agents-Anywhere/pull/373)）
 - 插件所选的 PyPI 镜像缺少的包会自动从官方 PyPI 补齐，选清华、中科大、北外镜像时不再必然安装失败，与 Desktop 的处理方式一致。（[#451](https://github.com/anywhere-labs/Agents-Anywhere/pull/451)）
 - 插件「设置 → 维护」新增「重装依赖环境」：依赖下载中断或环境损坏时一键删除并重新安装，进行中的安装会被中断，账号、设备连接和设置都保留。（[#452](https://github.com/anywhere-labs/Agents-Anywhere/pull/452)）
-- 历史被服务端拒绝后，运行时不再把会话发布成可用，会保留不可用标记，退避重试成功后才恢复同步（[c1576d6b](https://github.com/anywhere-labs/Agents-Anywhere/commit/c1576d6b)）。
-- DSH 重启后，已有会话不再一直停在「启动中 · 正在同步」：同步会正常恢复，历史保留，也可以继续发消息。（[675e1454](https://github.com/anywhere-labs/Agents-Anywhere/commit/675e1454)）
+- 历史被服务端拒绝后，运行时不再把会话发布成可用，会保留不可用标记，退避重试成功后才恢复同步（[c1576d6b](https://github.com/liconglei/Agents-Anywhere/commit/c1576d6b)）。
+- DSH 重启后，已有会话不再一直停在「启动中 · 正在同步」：同步会正常恢复，历史保留，也可以继续发消息。（[675e1454](https://github.com/liconglei/Agents-Anywhere/commit/675e1454)）
 
 ### Desktop
 
@@ -81,7 +86,7 @@
 - 插件和 Desktop 的日志页统一读取集中日志，可以按来源筛选、分页查看，并展示结构化的异常信息；Connector 还没启动时也能看到本次的启动诊断。（[#361](https://github.com/anywhere-labs/Agents-Anywhere/pull/361)、[#365](https://github.com/anywhere-labs/Agents-Anywhere/pull/365)、[#369](https://github.com/anywhere-labs/Agents-Anywhere/pull/369)）
 - 日志损坏时自动恢复，日志目录不可用时改为只在内存中记录，日志问题不再阻止 Connector 启动；日志中的 token 和认证头会被脱敏。（[#353](https://github.com/anywhere-labs/Agents-Anywhere/pull/353)）
 - 修复代理环境下 `NO_PROXY` 里 IPv6 回环地址的兼容问题。（[#373](https://github.com/anywhere-labs/Agents-Anywhere/pull/373)）
-- Connector 重启后会自动接管仍在运行的 OpenCode，不再显示认证失败，也不需要先手动结束本机 OpenCode 进程。（[99fbb293](https://github.com/anywhere-labs/Agents-Anywhere/commit/99fbb293)）
+- Connector 重启后会自动接管仍在运行的 OpenCode，不再显示认证失败，也不需要先手动结束本机 OpenCode 进程。（[99fbb293](https://github.com/liconglei/Agents-Anywhere/commit/99fbb293)）
 
 ### Web 与 Desktop 界面
 
