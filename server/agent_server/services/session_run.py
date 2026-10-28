@@ -6,6 +6,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 from agent_server.core.api_namespace import api_v2_path
 from agent_server.core.capabilities import (
@@ -91,6 +92,17 @@ SESSION_SOURCE_ERROR_CODES = {
     "deleted": "session_deleted",
     "missing": "session_missing",
 }
+
+
+def _message_client_id(value: str | None) -> str:
+    """A stable id for one user message.
+
+    DSH refuses a turn without one, and clients that only care about rendering
+    the reply may omit it. Generating it here keeps the runtime contract
+    satisfied while still giving the timeline a correlation id.
+    """
+
+    return value or f"msg_{uuid4().hex}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +214,7 @@ class SessionRunService:
             )
 
         selections = _selections_from_mapping(payload.selections)
+        payload.clientMessageId = _message_client_id(payload.clientMessageId)
         session = await self._store.create_session(
             connector_id=payload.connectorId,
             project_id=project_id,
@@ -228,8 +241,7 @@ class SessionRunService:
             params["selections"] = selections
         if payload.runtimeOptions:
             params["runtimeOptions"] = dict(payload.runtimeOptions)
-        if payload.clientMessageId:
-            params["clientMessageId"] = payload.clientMessageId
+        params["clientMessageId"] = payload.clientMessageId
         persisted_attachment_refs: list[dict[str, Any]] = []
         if payload.attachments:
             persisted_attachments = await self._persist_inline_attachments(
@@ -491,6 +503,7 @@ class SessionRunService:
             SESSION_SEND_MESSAGE,
             user_id=user_id,
         )
+        payload.clientMessageId = _message_client_id(payload.clientMessageId)
         params: dict[str, Any] = {
             "sessionId": session_id,
             "runtime": session.runtime,
@@ -501,8 +514,7 @@ class SessionRunService:
             params["cwd"] = session.cwd
         if session.externalSessionId:
             params["externalSessionId"] = session.externalSessionId
-        if payload.clientMessageId:
-            params["clientMessageId"] = payload.clientMessageId
+        params["clientMessageId"] = payload.clientMessageId
         if payload.attachments:
             attachment_payloads = await self._attachment_payloads(
                 session_id=session_id,
@@ -751,6 +763,7 @@ class SessionRunService:
             user_id=user_id,
         )
 
+        payload.clientMessageId = _message_client_id(payload.clientMessageId)
         params: dict[str, Any] = {
             "sessionId": session_id,
             "runtime": session.runtime,
@@ -762,8 +775,7 @@ class SessionRunService:
             params["externalSessionId"] = external_session_id
         if session.cwd:
             params["cwd"] = session.cwd
-        if payload.clientMessageId:
-            params["clientMessageId"] = payload.clientMessageId
+        params["clientMessageId"] = payload.clientMessageId
         if payload.attachments:
             attachment_payloads = await self._attachment_payloads(
                 session_id=session_id,
