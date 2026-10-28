@@ -811,28 +811,45 @@ class OpenCodeRuntime(AgentRuntime):
         # OPENCODE_SERVER_USERNAME) out of the environment it inherits; with no
         # password set, opencode 2.x invents one the connector can never learn,
         # so every request — including the health probe — answers 401 and the
-        # runtime never comes up. Inherit the user's password when there is one
-        # and generate one otherwise, so the child and the client always agree.
+        # runtime never comes up. Inherit the user's password when there is one,
+        # reuse the one an earlier connector generated for this port (its serve
+        # may still be running), and generate one otherwise, so the child and
+        # the client always agree.
         if not self._client.api_key:
             env_user, env_password = serve_process.environment_server_credentials(
                 self._serve_env
             )
-            if env_password:
-                self._client.set_credentials(env_user, env_password)
+            password = env_password
+            if password:
                 logger.info("opencode auto-start: inherited serve Basic auth user={}", env_user)
             else:
-                env_user, generated = serve_process.generated_server_credentials(
-                    self._serve_env
-                )
-                self._client.set_credentials(env_user, generated)
-                logger.info(
-                    "opencode auto-start: generated serve Basic auth user={} "
-                    "(no OPENCODE_SERVER_PASSWORD in the environment)",
-                    env_user,
-                )
+                stored = serve_process.load_serve_credentials(server_url)
+                if stored is not None:
+                    env_user, password = stored
+                    serve_process.apply_server_credentials(
+                        self._serve_env, env_user, password
+                    )
+                    logger.info(
+                        "opencode auto-start: reused saved serve Basic auth user={} "
+                        "(a serve left by an earlier connector can be adopted)",
+                        env_user,
+                    )
+                else:
+                    env_user, password = serve_process.generated_server_credentials(
+                        self._serve_env
+                    )
+                    serve_process.save_serve_credentials(
+                        server_url, env_user, password
+                    )
+                    logger.info(
+                        "opencode auto-start: generated serve Basic auth user={} "
+                        "(no OPENCODE_SERVER_PASSWORD in the environment)",
+                        env_user,
+                    )
+            self._client.set_credentials(env_user, password)
             # Discovery probes this URL without a runtime instance; without the
             # password it would 401 and report a healthy serve as unavailable.
-            serve_process.register_serve_credentials(server_url, env_user, env_password or generated)
+            serve_process.register_serve_credentials(server_url, env_user, password)
         # A concurrent recovery pass may already have brought serve up. A 401
         # here means a serve is already listening with credentials we do not
         # have; spawning another instance would only die on the shared log

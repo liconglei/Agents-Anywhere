@@ -13,6 +13,7 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import secrets
@@ -380,6 +381,72 @@ def registered_serve_credentials(server_url: str) -> tuple[str | None, str]:
 
     username, password = _SERVE_CREDENTIALS.get(server_url.rstrip("/"), ("", ""))
     return (username or None), password
+
+
+# Generated Basic-auth passwords outlive the process that made them: a connector
+# killed without stopping its child leaves a healthy serve behind, and a
+# restarted connector that does not know the password only sees 401. The file is
+# private to the connector data directory and keyed by server URL (one serve per
+# port).
+_SERVE_CREDENTIALS_FILE = "credentials.json"
+
+
+def _serve_credentials_path() -> Path:
+    return connector_data_dir() / "opencode-serve" / _SERVE_CREDENTIALS_FILE
+
+
+def load_serve_credentials(server_url: str) -> tuple[str, str] | None:
+    """The pair this connector generated for ``server_url`` in an earlier run."""
+
+    try:
+        raw = json.loads(_serve_credentials_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    entry = raw.get(server_url.rstrip("/")) if isinstance(raw, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    password = entry.get("password")
+    if not isinstance(password, str) or not password:
+        return None
+    username = entry.get("username")
+    if not isinstance(username, str) or not username:
+        username = SERVE_BASIC_USER
+    return username, password
+
+
+def save_serve_credentials(server_url: str, username: str, password: str) -> None:
+    """Remember a generated pair so the next connector can adopt this serve."""
+
+    if not password:
+        return
+    path = _serve_credentials_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = {}
+    entries = raw if isinstance(raw, dict) else {}
+    entries[server_url.rstrip("/")] = {"username": username, "password": password}
+    try:
+        # opencode's isolated data directory lives here too; keep both private.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with suppress(OSError):
+            path.parent.chmod(0o700)
+        temporary = path.with_name(f"{path.name}.tmp")
+        temporary.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        with suppress(OSError):
+            temporary.chmod(0o600)
+        os.replace(temporary, path)
+    except OSError as exc:
+        logger.warning("opencode serve credentials could not be saved: {}", exc)
+
+
+def apply_server_credentials(
+    environment: dict[str, str], username: str, password: str
+) -> None:
+    """Pin a serve spawned with ``environment`` to an existing credential pair."""
+
+    environment["OPENCODE_SERVER_PASSWORD"] = password
+    environment["OPENCODE_SERVER_USERNAME"] = username
 
 
 _LAUNCHER_SUFFIXES = (".cmd", ".bat", ".ps1")

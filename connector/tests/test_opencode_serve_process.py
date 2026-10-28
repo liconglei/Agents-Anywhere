@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -271,6 +272,51 @@ def test_registered_serve_credentials_let_discovery_authenticate() -> None:
     # Empty credentials are never registered.
     serve_process.register_serve_credentials("http://127.0.0.1:4197", "opencode", "")
     assert serve_process.registered_serve_credentials("http://127.0.0.1:4197") == (None, "")
+
+
+def test_saved_serve_credentials_survive_the_process_that_generated_them(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A connector killed without stopping its child must recover on restart.
+
+    The generated Basic-auth password only lived in memory, so the next
+    connector probed the orphan serve, got 401 and reported the runtime as
+    broken. Persisting it per URL lets that connector authenticate and adopt.
+    """
+
+    monkeypatch.setenv("AGENT_CONNECTOR_DATA_DIR", str(tmp_path / "connector"))
+    url = "http://127.0.0.1:4198"
+    assert serve_process.load_serve_credentials(url) is None
+
+    serve_process.save_serve_credentials(url + "/", "opencode", "saved-password")
+    assert serve_process.load_serve_credentials(url) == ("opencode", "saved-password")
+    # A second URL keeps the first entry instead of replacing the file.
+    serve_process.save_serve_credentials("http://127.0.0.1:4199", "opencode", "other")
+    assert serve_process.load_serve_credentials(url) == ("opencode", "saved-password")
+    assert serve_process.load_serve_credentials("http://127.0.0.1:4199") == (
+        "opencode",
+        "other",
+    )
+
+    path = serve_process._serve_credentials_path()
+    assert path.is_file()
+    assert json.loads(path.read_text(encoding="utf-8"))[url]["password"] == "saved-password"
+
+    # An empty password is not a credential.
+    serve_process.save_serve_credentials("http://127.0.0.1:4200", "opencode", "")
+    assert serve_process.load_serve_credentials("http://127.0.0.1:4200") is None
+    # A corrupted file is treated as "none", never as a startup failure.
+    path.write_text("{not json", encoding="utf-8")
+    assert serve_process.load_serve_credentials(url) is None
+
+
+def test_apply_server_credentials_pins_both_sides_of_the_spawn() -> None:
+    env: dict[str, str] = {"OPENCODE_SERVER_USERNAME": "licon"}
+    serve_process.apply_server_credentials(env, "opencode", "pw")
+    assert env["OPENCODE_SERVER_PASSWORD"] == "pw"
+    # serve ignores any other username, so the child must be pinned too.
+    assert env["OPENCODE_SERVER_USERNAME"] == "opencode"
+    assert serve_process.environment_server_credentials(env) == ("opencode", "pw")
 
 
 def test_isolate_data_home_is_stable_per_tag_and_mirrors_credentials(
