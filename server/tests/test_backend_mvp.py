@@ -705,6 +705,57 @@ def test_session_create_and_start_preallocates_session_and_passes_selections(tmp
     assert "turnId" not in active
 
 
+def test_session_create_and_start_generates_client_message_id_when_omitted(tmp_path):
+    app = create_app()
+    client = TestClient(app)
+    headers = auth_headers(client)
+    connector_response = client.post("/connectors", headers=headers, json={"name": "dev"})
+    connector_id = connector_response.json()["connector"]["id"]
+
+    class FakeCreateAndStartRpc:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, dict[str, Any]]] = []
+
+        async def is_online(self, requested_connector_id: str) -> bool:
+            return requested_connector_id == connector_id
+
+        async def request(
+            self,
+            requested_connector_id: str,
+            method: str,
+            params: dict[str, Any],
+            *,
+            timeout: float = 30,
+        ) -> dict[str, str]:
+            self.requests.append((method, params))
+            return {
+                "sessionId": params["sessionId"],
+                "externalSessionId": "ext_generated_client_message",
+            }
+
+    fake_rpc = FakeCreateAndStartRpc()
+    app.state.rpc = fake_rpc
+
+    response = client.post(
+        "/sessions/create-and-start",
+        headers=headers,
+        json={
+            "connectorId": connector_id,
+            "projectId": _create_test_project(client, headers, connector_id),
+            "runtime": "codex",
+            "cwd": "/repo",
+            "content": "hello",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    _, create_params = next(
+        request for request in fake_rpc.requests if request[0] == "session.create"
+    )
+    assert create_params["clientMessageId"].startswith("msg_")
+    assert len(create_params["clientMessageId"]) == len("msg_") + 32
+
+
 def test_session_state_reads_runtime_status_over_stale_db_status(tmp_path):
     client = make_client(tmp_path)
     connector_id, _, session_id, headers = create_connector_and_session(client)
@@ -5182,6 +5233,26 @@ def test_send_message_forwards_client_message_id_to_connector(tmp_path):
     assert response.status_code == 200, response.text
     params = wait_for_rpc_method(fake_rpc, "session.send_message")[2]
     assert params["clientMessageId"] == "opt_abc"
+
+
+def test_send_message_generates_client_message_id_when_omitted(tmp_path):
+    client = make_client(tmp_path)
+    connector_id, _, session_id, headers = create_connector_and_session(client)
+    fake_rpc = FakeLocalRpc()
+    client.app.state.rpc = fake_rpc
+    asyncio.run(client.app.state.store.set_connector_status(connector_id, "online"))
+    client.post(f"/sessions/{session_id}/takeover", headers=headers).raise_for_status()
+
+    response = client.post(
+        f"/sessions/{session_id}/runtime/messages",
+        headers=headers,
+        json={"content": "hi"},
+    )
+
+    assert response.status_code == 200, response.text
+    params = wait_for_rpc_method(fake_rpc, "session.send_message")[2]
+    assert params["clientMessageId"].startswith("msg_")
+    assert len(params["clientMessageId"]) == len("msg_") + 32
 
 
 @pytest.mark.parametrize("cached_allowed, live_allowed", [(False, True), (True, False)])
