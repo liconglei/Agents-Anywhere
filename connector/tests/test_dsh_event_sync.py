@@ -227,6 +227,35 @@ def test_legacy_workspace_inventory_does_not_write_projects_or_local_state():
     asyncio.run(exercise())
 
 
+def test_checkpoint_load_batch_opens_a_restored_baseline():
+    """The plugin marks a restored baseline with ``checkpoint.load``.
+
+    The value itself arrives through ``Sync.loadCheckpoint`` right after this
+    batch is acknowledged. The connector once rejected the marker as unsupported,
+    so the plugin failed the feed and resubscribed; every new feed replayed the
+    same marker and the runtime never left "starting".
+    """
+
+    async def exercise():
+        receiver = host()
+        receiver.sync_state_read = AsyncMock(return_value=None)
+        relay = ready_relay(receiver)
+        try:
+            await ingest(relay, {"kind": "checkpoint.load", "externalSessionId": "native"})
+            assert relay.expected_batch == 2
+            # The read is the load's data path, and it counts the baseline for the
+            # progress heartbeat.
+            assert await relay.load_checkpoint("native") is None
+            receiver.sync_state_read.assert_awaited_once()
+
+            relay.durable_checkpoints = False
+            with pytest.raises(ValueError, match="committed sync boundary"):
+                await ingest(relay, {"kind": "checkpoint.load", "externalSessionId": "native"})
+        finally:
+            await relay.close()
+    asyncio.run(exercise())
+
+
 def test_fresh_source_state_waits_for_ingestion_and_archive_send_returns_standard_error(tmp_path):
     async def exercise():
         entered, release = asyncio.Event(), asyncio.Event()

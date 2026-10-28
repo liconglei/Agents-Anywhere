@@ -224,6 +224,18 @@ class SyncRelay:
             # Older plugin builds sent native project facts. Ignore those batches;
             # all project grouping and naming use the existing session cwd path.
             return
+        elif kind == "checkpoint.load":
+            # Opens a restored baseline. The value itself is fetched through the
+            # ``Sync.loadCheckpoint`` call that follows this batch (that call also
+            # counts the baseline for the progress heartbeat), so the operation is
+            # only the ordering marker that keeps the checkpoint read behind every
+            # notification already published for this subscription.
+            if not self.durable_checkpoints or self.snapshot is not None:
+                raise ValueError("Checkpoint operation outside a committed sync boundary")
+            external_id = op.get("externalSessionId")
+            if not isinstance(external_id, str) or not external_id:
+                raise ValueError("Checkpoint requires an external session identity")
+            return
         else:
             raise ValueError(f"Unsupported bridge operation: {kind}")
 

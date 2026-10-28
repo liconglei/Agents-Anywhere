@@ -49,7 +49,7 @@ function turnOutcome(kind: string): string {
   return ['aborted', 'interrupted'].includes(kind) ? 'interrupted' : 'completed'
 }
 
-class SyncTransportError extends Error {}
+export class SyncTransportError extends Error {}
 
 /** One ordered subscription. A batch's delivery call returns only after the Connector ingested it. */
 export class SyncFeed {
