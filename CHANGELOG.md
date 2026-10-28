@@ -2,15 +2,22 @@
 
 按版本记录用户能感知到的变化，最新版本在最前，每项一句话。接口变化、各端最低配套版本、数据库迁移和安装包记录见各版本的[发布说明](docs/releases/)。
 
+## 未发布
+
+### 会话创建与消息交付
+
+- Connector 上报的时间线条目序号超出范围时只拒绝这条上报，同批其他消息照常保存，不再让整个会话之后的消息都存不进数据库；升级前已经积压的条目会按原顺序排到时间线末尾保存，持续写入失败的会话也不再每秒重试刷屏日志。（[#464](https://github.com/anywhere-labs/Agents-Anywhere/pull/464)）
+
 ## 2.1.0（2026-10-28）
 
-[发布说明](docs/releases/2.1.0.md) · [与 2.0.3 的差异](https://github.com/liconglei/Agents-Anywhere/compare/v2.0.3...v2.1.0)
+[发布说明](docs/releases/2.1.0.md) · [GitHub Release](https://github.com/liconglei/Agents-Anywhere/releases/tag/v2.1.0) · [与 2.0.3 的差异](https://github.com/liconglei/Agents-Anywhere/compare/v2.0.3...v2.1.0)
 
 ### 升级须知
 
 - **本机三端一起升级**：Desktop、Connector 和 DSH 插件之间的本机通道改用 MeshCall，2.0.x 与 2.1.0 互不兼容。只升级一端时，2.0.x Connector 会一直停在「等待 DSH」。（[#353](https://github.com/anywhere-labs/Agents-Anywhere/pull/353)）
 - **数据库迁移**：Server 需要执行迁移 `v2_42`–`v2_44`。`/api/v2/admin/dashboard/*` 已删除，2.0.x 的 Web / Desktop 打开看板会得到 404。（[#296](https://github.com/anywhere-labs/Agents-Anywhere/pull/296)、[#299](https://github.com/anywhere-labs/Agents-Anywhere/pull/299)、[#290](https://github.com/anywhere-labs/Agents-Anywhere/pull/290)）
 - **移除 SQLite 和 v1 导入工具**：Server 不再支持 SQLite 后端，也去掉了 v1 导入工具。仍在 v1 的部署要先用 2.0.x 完成导入；部署配置里的 `AGENT_SERVER_DB_BACKEND` 可以删除。（[#299](https://github.com/anywhere-labs/Agents-Anywhere/pull/299)）
+- **单独安装的 Connector CLI 和 DSH 插件**：PyPI 的 `anywhere-cli` 和 npm 的 `@agents-anywhere/dsh-bridge-next` 同步发布 2.1.0，在 Linux 上用 CLI 或手动安装插件的用户要一起升级。
 - **手机端**：Android 和 iOS 的 2.0.3 仍然可以使用，但登录续期、按供应商分组模型、「未同步」状态等需要 2.1.0。
 
 ### 会话创建与消息交付
@@ -100,7 +107,7 @@
 - 管理页和设置页改为侧栏导航，公告、身份认证、邮件和服务配置各自成页；这两类页面不再加载工作区和推送数据。（[#317](https://github.com/anywhere-labs/Agents-Anywhere/pull/317)）
 - 在主页和管理 / 设置之间切换时，侧栏左右并排滑动。（[#317](https://github.com/anywhere-labs/Agents-Anywhere/pull/317)）
 - 身份认证页按手机和桌面客户端分组，并修正 OAuth 回调地址。（[#317](https://github.com/anywhere-labs/Agents-Anywhere/pull/317)）
-- 有多个供应商时，模型列表按供应商分组，同名模型也能分清来源。（[#411](https://github.com/anywhere-labs/Agents-Anywhere/pull/411)）
+- 有多个供应商时，模型列表按供应商分组，同名模型也能分清来源；从 2.0.x 升级的 Server 也会显示分组，Connector 上报的模型目录不再被当作冲突拒绝。（[#411](https://github.com/anywhere-labs/Agents-Anywhere/pull/411)、[#463](https://github.com/anywhere-labs/Agents-Anywhere/pull/463)）
 - 修复回复已经结束却一直显示「正在工作」。（[#393](https://github.com/anywhere-labs/Agents-Anywhere/pull/393)）
 - 长会话的流式输出更流畅，减少整页重绘和输入卡顿。（[#394](https://github.com/anywhere-labs/Agents-Anywhere/pull/394)）
 - 多个任务并行输出时，侧栏里的项目不再反复跳动。（[#311](https://github.com/anywhere-labs/Agents-Anywhere/pull/311)）
